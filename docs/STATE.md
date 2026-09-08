@@ -236,6 +236,14 @@ The `reviewer` pass found 2 high, 7 medium and 11 low. Fixed before commit:
   garbage JWT, an `alg:none` forged JWT, a spoofed `x-ledgerly-sub`, and a
   spoofed `Cf-Access-Authenticated-User-Email` all return the same 403 —
   D-24 and D-06 hold against a live request, not just in unit tests.
+- **CI docker job fixed.** The first-ever push to `main` exposed a Phase 2
+  defect in `.github/workflows/ci.yml`: the job sets `cache-to: type=gha`
+  but never ran `docker/setup-buildx-action`, so `build-push-action` used
+  the default `docker` driver and failed with "Cache export is not
+  supported for the docker driver". The job is gated on
+  `github.ref == 'refs/heads/main' && github.event_name == 'push'`, so no
+  pull-request or branch run could ever have caught it — worth remembering
+  when adding any other `main`-only job.
 - **gitleaks finally run** (it was blocked in Phase 2 by the same Docker
   fault): full history clean, `no leaks found`. A working-tree scan reports
   one hit, `.env:16`, which is a gitignored file that is supposed to hold
