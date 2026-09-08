@@ -18,6 +18,11 @@ env:
   # notes — the same reason apps/web/next.config.ts's build needs them).
   DATABASE_URL: postgres://ledgerly:ledgerly@localhost:5432/ledgerly
   TEST_DATABASE_URL: postgres://ledgerly:ledgerly@localhost:5432/ledgerly_test
+  # Phase 5: a dedicated redis service container below, the same throwaway-
+  # per-run pattern as postgres above (scripts/test-redis.sh does the local
+  # equivalent). No logical-db split needed here — unlike local dev, nothing
+  # in the CI run connects on plain REDIS_URL, only TEST_REDIS_URL.
+  TEST_REDIS_URL: redis://localhost:6379
   MASTER_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
   ANTHROPIC_API_KEY: ci-placeholder-key
   CF_ACCESS_AUD: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -40,6 +45,15 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U ledgerly -d ledgerly"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
