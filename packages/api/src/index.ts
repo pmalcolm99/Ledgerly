@@ -12,5 +12,5 @@ export {
   createCallerFactory,
 } from "./trpc";
 export type { Context } from "./trpc";
-export { scopedProjects } from "./scope";
-export type { ScopeLevel } from "./scope";
+export { lockScopedProject, scopedProjects } from "./scope";
+export type { ProjectIdScope, ScopeLevel } from "./scope";

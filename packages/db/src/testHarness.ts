@@ -133,3 +133,95 @@ export async function withCleanDatabase(): Promise<void> {
   await pool.query(`TRUNCATE TABLE ${TABLES_IN_FK_SAFE_ORDER.join(", ")} RESTART IDENTITY CASCADE`);
   await seed(drizzle(pool, { schema }));
 }
+
+// ---------------------------------------------------------------------------
+// Fixture factories (Phase 4) — shared by scope.test.ts-style suites that
+// use withCleanDatabase(). Before this, packages/api/src/scope.test.ts and
+// trpc.test.ts each carried their own local `mkUser`; Phase 4 adds a third
+// and fourth consumer (projects/members/permissions tests), which is the
+// point past which that duplication is worth breaking. Kept here rather
+// than in packages/api because fixture rows are a database concern, not an
+// API-specific one — reusable by any package's tests.
+// ---------------------------------------------------------------------------
+
+export type TestUserRow = typeof schema.users.$inferSelect;
+export type TestProjectRow = typeof schema.projects.$inferSelect;
+
+/** Creates a `users` row with the same shape `scope.test.ts`'s local
+ * `mkUser` factory already used. Returns the full row rather than the
+ * narrower `AuthUser` type from `@ledgerly/auth/types` — importing that
+ * type here would make `packages/db` depend on `packages/auth`, which
+ * itself depends on `packages/db` (ARCHITECTURE.md §2.1's one-way
+ * dependency direction). `typeof schema.users.$inferSelect` is the exact
+ * same shape `AuthUser` is defined as, so callers can use this
+ * interchangeably. */
+export async function mkTestUser(
+  database: NodePgDatabase<typeof schema>,
+  key: string,
+  role: "owner" | "user" = "user",
+): Promise<TestUserRow> {
+  const [row] = await database
+    .insert(schema.users)
+    .values({
+      cfAccessSub: `sub-${key}`,
+      email: `${key}@example.com`,
+      firstName: "T",
+      lastName: "User",
+      onboardedAt: new Date(),
+      role,
+    })
+    .returning();
+  if (!row) throw new Error(`mkTestUser: failed to create user ${key}`);
+  return row;
+}
+
+/** Creates a project owned by a fresh `ownerKey` user (with the owner's
+ * `project_members` row at `full`, matching what `projects.create`
+ * guarantees in production), plus one fresh user per entry in `members`,
+ * each added to `project_members` at the given permission. Returns every
+ * created user keyed by the `key` passed in, so callers can look up
+ * `users.readMember`, `users.fullMember`, etc. */
+export async function createTestProjectWithMembers(
+  database: NodePgDatabase<typeof schema>,
+  opts: {
+    ownerKey: string;
+    members: Array<{ key: string; permission: "read" | "read_add" | "full" }>;
+    name?: string;
+    status?: "active" | "archived";
+  },
+): Promise<{ project: TestProjectRow; users: Record<string, TestUserRow> }> {
+  const users: Record<string, TestUserRow> = {};
+  const owner = await mkTestUser(database, opts.ownerKey);
+  users[opts.ownerKey] = owner;
+
+  const [project] = await database
+    .insert(schema.projects)
+    .values({
+      ownerId: owner.id,
+      name: opts.name ?? `project-${opts.ownerKey}-${Math.random().toString(36).slice(2, 8)}`,
+      status: opts.status ?? "active",
+      archivedAt: opts.status === "archived" ? new Date() : null,
+    })
+    .returning();
+  if (!project) throw new Error("createTestProjectWithMembers: failed to create project");
+
+  await database.insert(schema.projectMembers).values({
+    projectId: project.id,
+    userId: owner.id,
+    permission: "full",
+    grantedBy: owner.id,
+  });
+
+  for (const member of opts.members) {
+    const user = await mkTestUser(database, member.key);
+    users[member.key] = user;
+    await database.insert(schema.projectMembers).values({
+      projectId: project.id,
+      userId: user.id,
+      permission: member.permission,
+      grantedBy: owner.id,
+    });
+  }
+
+  return { project, users };
+}

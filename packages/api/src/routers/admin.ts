@@ -5,11 +5,14 @@ import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { auditLog, users } from "@ledgerly/db/schema";
 
+import { isUniqueViolation } from "../errors";
 import { ownerProcedure, router } from "../trpc";
 
 /**
  * packages/api/src/routers/admin.ts — owner-only actions (task 3.7).
  */
+
+const CF_ACCESS_SUB_UNIQUE_INDEX = "users_cf_access_sub_key";
 
 export const adminRouter = router({
   /**
@@ -73,11 +76,7 @@ export const adminRouter = router({
           // Another transaction claimed this sub between the check above
           // and here. Surface it as CONFLICT rather than letting a raw
           // constraint name escape.
-          if (
-            typeof error === "object" &&
-            error !== null &&
-            (error as { code?: unknown }).code === "23505"
-          ) {
+          if (isUniqueViolation(error, CF_ACCESS_SUB_UNIQUE_INDEX)) {
             throw new TRPCError({
               code: "CONFLICT",
               message: "That identity is already linked to a different account.",

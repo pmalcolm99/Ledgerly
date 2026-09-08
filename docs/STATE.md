@@ -4,8 +4,58 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 3 — Auth & identity. **Complete.** Reviewed (task 3.12), findings
-triaged and fixed, committed.
+Phase 4 — Projects & permissions. **Complete.** Reviewed twice (task 4.8 —
+an initial pass and a follow-up verifying the fixes), findings triaged and
+fixed, committed.
+
+## Task 4.8 review — what was found and what was done
+
+The initial `reviewer` pass found 1 high, 7 medium, and 4 low. A follow-up
+review of the fixes themselves found one more medium (in the H-1 fix's own
+first draft) and confirmed everything else held. All fixed before commit
+except the three explicitly deferred items noted at the end.
+
+| #       | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Fix                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **H-1** | Composing `scopedProjects(user, level)` into the SAME statement as a `SELECT ... FOR UPDATE` lock is unsafe: Postgres's EvalPlanQual only re-evaluates quals against the _locked relation's_ substituted tuple on wake-up, but the membership subquery is commonly planned as an InitPlan — evaluated once, before the lock wait, never re-run. A member revoked by the very transaction being waited on could still land a write. Proven empirically: reverting the fix let a revoked `full` member's concurrent `projects.archive` call succeed. | `packages/api/src/scope.ts` gained `lockScopedProject(tx, projectId, user, level)`: lock the bare row, then re-check `scopedProjects` as a separate, freshly-planned statement. `projects.ts`'s `update`/`archive`/`unarchive`/`delete` and `members.ts`'s `loadManageContext` now go through it instead of composing scope into their own locking `SELECT`. Two regression tests hold a revoking transaction open on a raw connection and race a real router call against it — one via `members.add`, one via `projects.archive` (chosen because it has no secondary check that could incidentally mask the bug). |
+| **M-1** | (Consequence of H-1.) Writes reaching `projects` by raw id (`WHERE eq(projects.id, row.id)`) with no scope of their own.                                                                                                                                                                                                                                                                                                                                                                                                                           | Resolved by the H-1 fix: these writes now happen only after `lockScopedProject`'s fresh check, while still holding the lock.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **M-2** | `projects.update` with a patch touching only one of `startDate`/`endDate` could violate `projects_date_order` against the row's _existing_ other date, surfacing as a raw 500 — the zod refine only fires when both dates are supplied together.                                                                                                                                                                                                                                                                                                   | `update` now validates the merged (patch ?? existing) date pair before writing, throwing `BAD_REQUEST`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **M-3** | `members.add` with a nonexistent `userId` hit a raw FK violation (23503), surfacing as a 500.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | New `isForeignKeyViolation` in `packages/api/src/errors.ts`, caught to throw `NOT_FOUND` — same 404-not-403 reasoning as everywhere else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **M-4** | `docs/SCHEMA.md` says archived projects are read-only; `projects.update` could still edit one.                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `update` throws `FORBIDDEN` when `row.status === "archived"`. `members.*` deliberately stay reachable on archived projects — `scope.ts`'s own rationale is that an archived project must remain manageable.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **M-5** | An instance owner renaming a project they don't own produced zero audit rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `update` now writes a `project.updated` row plus `owner_override.performed` when the override applies (and still nothing for an ordinary edit by the project's own owner) — a follow-up review caught that the first version referenced `underlyingAction: "project.updated"` without ever writing that row.                                                                                                                                                                                                                                                                                                       |
+| **M-6** | No way to read a project's membership through the API at all.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | New `members.list`, gated at `scopedProjects(user, "read")` — visibility isn't the privileged action management is.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **M-7** | Nothing constrained `users.role='owner'` to one row (carried forward from Phase 3 as L-4), and it is now load-bearing: every `isInstanceOwner` check in `members.ts`/`scope.ts` trusts it unconditionally, unbounded, across every project.                                                                                                                                                                                                                                                                                                        | `packages/db/src/schema/users.ts` gained `users_single_owner_key`, a partial unique index on `role` filtered to `role = 'owner'`. Migration `0001_happy_titanium_man.sql`, applied to the test database. Required fixing one Phase 3 test (`provision.test.ts`'s "never downgrades a role") whose fixture manually created two simultaneous owners — a state the system was never designed to support.                                                                                                                                                                                                             |
+| **L-1** | `loadManageContext`'s `callerLevel` silently defaulted to `"read"` on a missing membership row — exactly the shape H-1's race could produce, masked rather than surfaced.                                                                                                                                                                                                                                                                                                                                                                          | Throws `INTERNAL_SERVER_ERROR` instead; `lockScopedProject`'s fresh check makes this branch a true "should never happen."                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **L-2** | Re-archiving/re-deleting a project was not idempotent: duplicate audit rows, overwritten timestamps.                                                                                                                                                                                                                                                                                                                                                                                                                                               | `archive`/`unarchive` now return the current row unchanged if already in the target state. `delete`'s idempotency falls out of `lockScopedProject` for free — `scopedProjects`'s liveness predicate always requires `deletedAt IS NULL`.                                                                                                                                                                                                                                                                                                                                                                           |
+| **L-4** | `formatMoney` used `Number.isInteger`, which passes for values like `2**60` where the cents math is no longer provably exact.                                                                                                                                                                                                                                                                                                                                                                                                                      | `Number.isSafeInteger`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **L-5** | `addMoney`/`formatMoney` had no `numeric(12,2)` range guard; an overflowing sum only failed at DB-insert time.                                                                                                                                                                                                                                                                                                                                                                                                                                     | New `assertWithinNumeric12_2` helper in `money.ts`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **L-8** | The money property test was unseeded `Math.random()` — a failure it found would be unreproducible.                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Table-driven boundary cases added, and the two random sweeps now run against a seeded `mulberry32` PRNG.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| —       | Follow-up review, found in the H-1 fix's own first draft: `lockScopedProject` locked the bare row with NO scope predicate at all before checking authorization, so an unauthorized caller queued on whatever transaction held the lock before being told "no" — a timing oracle (measured: 12ms unauthenticated-against-nonexistent-id vs. 724ms unauthenticated-against-contended-id) and a connection-pool amplification vector.                                                                                                                 | Restructured to check → lock → re-check: an unlocked `scopedProjects` pre-check rejects unauthorized callers before any lock is taken; the post-lock re-check remains the sole source of truth. Regression test asserts an unauthorized call against a contended row returns in well under the lock hold time.                                                                                                                                                                                                                                                                                                     |
+| —       | Constraint-agnostic violation classifiers (`isUniqueViolation`/`isForeignKeyViolation`) mapped _every_ violation of a SQLSTATE to the same client error, correct only while each call site has exactly one plausible constraint.                                                                                                                                                                                                                                                                                                                   | Both now take the expected constraint name, matching `packages/auth/src/provision.ts`'s existing convention. Each call site names its constraint (`projects_owner_name_live_key`, `project_members_project_id_user_id_pk`, `project_members_user_id_users_id_fk`, `users_cf_access_sub_key`).                                                                                                                                                                                                                                                                                                                      |
+
+**Deliberately not fixed — carried forward:**
+
+- **L-3** — `trpc.ts`'s `errorFormatter` shapes only the HTTP adapter path; a
+  future server action invoking a procedure via `createCallerFactory` (as
+  `/welcome` already does) and rendering a caught error's `.message`
+  directly would bypass it. Not exercised by anything Phase 4 ships; a
+  Phase 7 concern once server actions call `projects`/`members`.
+- **L-6** — `money.ts` has no quantity × unit_price primitive.
+  `receipt_items.quantity` is `numeric(12,3)`, one more fractional digit
+  than `parseMoney`'s regex accepts, and nothing in Phase 4 needs it yet.
+  Phase 5's concern when `receipt_items` ships.
+- **L-7** — member audit rows use `entityType: "project_member"` with
+  `entityId` set to the _project's_ id (not a member-row id, since
+  `project_members` has a composite PK). Judged an intentional, defensible
+  convention on review, not a bug — noted so a future reader doesn't assume
+  `entityId` names a `project_members` row elsewhere in the log.
+- Informational: `instance_state.owner_id` and `users.role='owner'` are two
+  sources of truth for instance ownership. M-7's index constrains only the
+  latter, which is correct — `instance_state.owner_id` is read solely as
+  the first-owner election latch (`provision.ts`), never for authorization.
+  The `provision.test.ts` fixture fix for M-7 deliberately creates drift
+  between the two mid-test; worth knowing so nobody assumes they're meant
+  to track.
 
 ## Task 3.12 review — what was found and what was done
 
@@ -258,13 +308,86 @@ The `reviewer` pass found 2 high, 7 medium and 11 low. Fixed before commit:
   `vitest.shared.ts` now lifts that one key from the repo-root `.env` (real
   environment first, so CI still wins).
 
+**Phase 4 (2026-09-08)**
+
+- Two ambiguities in the phase brief resolved before writing code (see
+  `docs/private/` if a fuller writeup exists, otherwise this is the record):
+  the prose said "only the project owner or instance owner can manage
+  members," but the matrix table gives `full` members `Y` on manage-members,
+  matching the already-built, already-tested
+  `scopedProjects(user, "manage")` floor of `full` — the matrix and existing
+  code govern, `scope.ts` is untouched. And the add-receipt/edit-receipt
+  matrix columns are tested directly against `scopedProjects(user, "add")`
+  (`permissions.test.ts`), not through a receipts router — receipts don't
+  ship until Phase 5.
+- `packages/shared/src/money.ts` — `parseMoney`/`formatMoney`/`addMoney`,
+  the sole `numeric(12,2)` <-> integer-cents boundary (D-21). Pure,
+  isomorphic, zero new dependencies. Property-tested against a seeded PRNG
+  plus a table-driven boundary-case suite (0, 1 cent, the `numeric(12,2)`
+  limits, negatives).
+- `packages/api/src/audit.ts` — `recordAudit(tx, entry)`, generalizing the
+  inline pattern `admin.ts`'s `relinkAccount` used before this file existed.
+  Always takes the caller's transaction; never opens its own.
+- `packages/api/src/errors.ts` — `isUniqueViolation`/`isForeignKeyViolation`,
+  both requiring the expected constraint name (matching
+  `packages/auth/src/provision.ts`'s existing convention), so a future,
+  unrelated violation on the same SQLSTATE surfaces honestly instead of
+  silently becoming the wrong client error.
+- `packages/api/src/routers/projects.ts` — create/get/list/update/archive/
+  unarchive/delete. `create` inserts the project and the owner's `full`
+  `project_members` row in one transaction. `get`/`update` compose
+  `scopedProjects` (or `lockScopedProject`, for writes) directly into their
+  own query so a nonexistent id and an unauthorized id are indistinguishable
+  (404, never 403). `delete` is gated at `"delete"`, not `"manage"` — a
+  `full` member can archive but not delete, per `scope.ts`'s existing,
+  untouched semantics. `unarchive` and archived-projects-are-read-only (on
+  `update`) were added beyond the phase brief's literal text; both flagged
+  as judgment calls, not silent scope creep.
+- `packages/api/src/routers/members.ts` — `list`/`add`/`updatePermission`/
+  `remove`. Every mutation's entry gate is `scopedProjects(user, "manage")`;
+  the escalation guards (self-target, owner-row protection, above-own-level)
+  are checks _beyond_ that gate, since `scopedProjects` deliberately doesn't
+  reach into which row within an authorized project gets touched. The
+  above-own-level guard is currently unreachable through the public API
+  (the `manage` gate already requires `full`, which has no ceiling) — kept
+  as insurance per `docs/SCHEMA.md`'s escalation-guard paragraph, with a
+  comment at the guard site rather than a test pretending to exercise it.
+- `packages/db/src/testHarness.ts` gained `mkTestUser` and
+  `createTestProjectWithMembers` — shared fixture factories, replacing what
+  would have been a third and fourth copy of `scope.test.ts`/`trpc.test.ts`'s
+  local `mkUser`. First expansion of this file's role beyond harness
+  plumbing.
+- Test suite: `projects.test.ts` (26), `members.test.ts` (16),
+  `permissions.test.ts` (29, the task 4.4 matrix acceptance artifact —
+  every cell of the phase brief's matrix, positive and negative, plus the
+  non-member 404-not-403 case, self-escalation, owner-row protection,
+  immediate revocation on removal, and `owner_override.performed` audited
+  distinctly), `money.test.ts` (46 including `packages/shared`'s existing
+  suite). `scope.test.ts`/`trpc.test.ts` untouched and still passing —
+  `scope.ts`'s authorization logic was never modified, only extended.
+- `scope.ts` gained a branded `ProjectIdScope` return type (L-6, picked up
+  as the last step once every Phase 4 call site existed) and
+  `lockScopedProject` — see the task 4.8 review section above for why the
+  latter exists and what it fixes.
+- `packages/db/src/schema/users.ts` / migration `0001_happy_titanium_man.sql`
+  — `users_single_owner_key` (M-7, this phase's pickup of Phase 3's
+  carried-forward L-4). Applied to the test database; **the running
+  `webapp` container's image has not been rebuilt, so this migration has
+  not yet reached the dev/prod `ledgerly` database** — it will apply on the
+  next image rebuild via the entrypoint's `node migrate.cjs`, same as any
+  other pending migration. Not a release blocker for this phase (Phase 4
+  ships no schema the app itself reads yet), but worth remembering before
+  Phase 5 assumes the constraint is live everywhere.
+- **205 tests passing** across all 8 packages (`api` 88, `auth` 52,
+  `shared` 46, `config` 17, `db` 2). `pnpm lint` and `pnpm typecheck` clean
+  repo-wide.
+- Reviewed twice — see "Task 4.8 review" above. The second (follow-up) pass
+  independently re-ran the full suite rather than trusting the first pass's
+  fix claims, and found one more real bug in the H-1 fix's own first draft.
+
 ## Next
 
-1. **Task 3.12** — `reviewer` subagent over the whole Phase 2 + Phase 3
-   diff. `CLAUDE.md` requires this before any auth work is committed.
-2. Commit, push, and verify the Actions run (`gh run watch`).
-
-Then Phase 4 — Projects & permissions, minus task 4.1 (already done).
+Phase 5 — Ingest pipeline (parallel-safe with Phase 7).
 
 ### Running the database tests locally
 

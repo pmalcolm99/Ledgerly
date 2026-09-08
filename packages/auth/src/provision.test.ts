@@ -164,12 +164,19 @@ describe("JIT provisioning and refresh (task 3.5)", () => {
 
   // --- 26 ------------------------------------------------------------
   it("never downgrades a role from the auth layer", async () => {
-    await resolveUserForIdentity(db, identity(), NO_RELINK);
+    const firstOwner = await resolveUserForIdentity(db, identity(), NO_RELINK);
     const promoted = await resolveUserForIdentity(
       db,
       identity({ sub: "cf-sub-bob", email: "bob@example.com" }),
       NO_RELINK,
     );
+    // Demote the first-owner-election winner before manually promoting bob:
+    // `users_single_owner_key` (Phase 4 task 4.8 review finding M-7) now
+    // enforces at most one `role='owner'` row at the database level, and
+    // this instance was never designed to support two simultaneous owners
+    // — only this test's fixture briefly created that state to exercise
+    // the "no downgrade" behavior below.
+    await db.update(users).set({ role: "user" }).where(eq(users.id, firstOwner.user.id));
     await db.update(users).set({ role: "owner" }).where(eq(users.id, promoted.user.id));
 
     const revisit = await resolveUserForIdentity(

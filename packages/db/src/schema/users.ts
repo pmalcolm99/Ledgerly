@@ -28,5 +28,17 @@ export const users = pgTable(
     // statement is hand-appended there per docs/SCHEMA.md §Migration
     // strategy, and this comment is the pointer back to it.
     uniqueIndex("users_email_lower_key").on(sql`lower(${t.email})`),
+    // Phase 4 task 4.8 review finding M-7 (docs/STATE.md's carried-forward
+    // L-4): nothing previously constrained `role='owner'` to a single row,
+    // yet both `scopedProjects`'s instance-owner short-circuit and every
+    // `ownerProcedure`/`isInstanceOwner` check trust `role='owner'` alone
+    // to mean "unbounded authority over every project." A partial unique
+    // index on `role` filtered to the owner value permits any number of
+    // `role='user'` rows (unconstrained) but at most one `role='owner'`
+    // row — enforced by the database, not by an insert-time check that
+    // could be bypassed by any future write path.
+    uniqueIndex("users_single_owner_key")
+      .on(t.role)
+      .where(sql`${t.role} = 'owner'`),
   ],
 );
