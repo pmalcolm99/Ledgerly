@@ -371,13 +371,17 @@ The `reviewer` pass found 2 high, 7 medium and 11 low. Fixed before commit:
   latter exists and what it fixes.
 - `packages/db/src/schema/users.ts` / migration `0001_happy_titanium_man.sql`
   — `users_single_owner_key` (M-7, this phase's pickup of Phase 3's
-  carried-forward L-4). Applied to the test database; **the running
-  `webapp` container's image has not been rebuilt, so this migration has
-  not yet reached the dev/prod `ledgerly` database** — it will apply on the
-  next image rebuild via the entrypoint's `node migrate.cjs`, same as any
-  other pending migration. Not a release blocker for this phase (Phase 4
-  ships no schema the app itself reads yet), but worth remembering before
-  Phase 5 assumes the constraint is live everywhere.
+  carried-forward L-4). Applied to the test database, and confirmed live
+  on the dev `ledgerly` database too after a full `docker compose build` +
+  `up` — the rebuilt image's entrypoint ran `migrate.cjs` cleanly
+  (`[migrate] done.`), reseeded idempotently, and `\d users` on the running
+  `db` container shows `users_single_owner_key UNIQUE, btree (role) WHERE
+role = 'owner'`.
+- **Full-stack Docker verification** (not just the throwaway test DB):
+  `docker compose build webapp` from current source, then `docker compose
+up -d`. All three containers healthy; `webapp`'s `next-server` runs as
+  UID 1000 (`node`), not root; `db`/`redis` publish no ports; `webapp`
+  bound to `127.0.0.1:3000` only; `/api/v1/health` returns 200.
 - **205 tests passing** across all 8 packages (`api` 88, `auth` 52,
   `shared` 46, `config` 17, `db` 2). `pnpm lint` and `pnpm typecheck` clean
   repo-wide.
