@@ -1,0 +1,523 @@
+# Ledgerly — Decisions
+
+Every significant choice, with the reason. `CLAUDE.md` requires that any
+deviation from Forkd's stack, structure, or naming be recorded here.
+
+Format: **decision**, **context**, **why**, **consequence**. Decisions are
+append-only. If one is reversed, the entry stays and gains a `Superseded by`
+line, because the reasoning that led to a reversal is worth as much as the
+reversal.
+
+Status legend: **Settled** — decided in Phase 1. **Provisional** — decided, but
+a named Phase must confirm it against reality before it hardens.
+
+---
+
+## D-01 — tRPC, not Express or Fastify. **Settled.**
+
+**Context.** `docs/Ledgerly_Project_Plan.md` §1.1 lists "Express or Fastify" as
+the API layer, flagged as an assumption to confirm against Forkd. Forkd uses
+tRPC 11 + TanStack Query + superjson running inside Next.js
+(`docs/reference/FORKD_STACK.md` §2). There is no separate API server.
+
+**Why tRPC.** The plan's own ground rule is that Forkd wins on stack. Beyond
+that: adding Express would mean a second process to supervise, a second place to
+integrate Cloudflare Access verification, a second CORS surface, and
+hand-maintained request/response types where tRPC infers them. Forkd's
+`protectedProcedure` / `ownerProcedure` middleware ladder is the exact shape
+Ledgerly's permission model needs, and it transfers with no translation.
+
+**Consequence.** All mutations and queries are tRPC procedures in
+`packages/api/src/routers/`. The two exceptions are byte-streaming endpoints
+that do not fit RPC — upload (`multipart`) and image serving — which are Next.js
+Route Handlers, and which perform the same `scopedProjects` composition.
+
+---
+
+## D-02 — PostgreSQL 17. **Settled.**
+
+**Context.** Open decision #1 in the brief: Postgres or SQLite. The brief notes
+SQLite is defensible for a personal app. `docs/STATE.md` had already resolved
+this in Phase 0.
+
+**Why Postgres 17.** Forkd runs `postgres:17-alpine`; matching it makes the
+Drizzle schema, the drizzle-kit migration tooling, and the
+`pg_dump --format=custom` backup path inheritable rather than reinvented. The
+brief also specifies SQLite at version 16 in one place and Postgres in another —
+17 resolves both. SQLite would have made backups simpler but would have cost the
+entire backup/restore design in `docs/reference/FORKD_INFRA.md`, plus
+`SELECT ... FOR UPDATE`, which the atomic first-owner transaction depends on.
+
+**Consequence.** `postgres:17-alpine`, Drizzle ORM 0.41, drizzle-kit 0.31, `pg`
+8.x with `pg.Pool`. `postgresql17-client` in the runner image for
+`pg_dump`/`pg_restore`.
+
+---
+
+## D-03 — No session layer. Verify the Access JWT on every request. **Settled.**
+
+**Context.** Forkd verifies the Access JWT in edge middleware, then provisions a
+Better Auth session row and a `forkd.session_token` cookie signed with
+`MASTER_KEY`; every subsequent request trusts the cookie and does not re-verify
+the JWT (`docs/reference/FORKD_AUTH.md` §4). The brief §1.4 describes per-request
+JWT verification and never mentions a session.
+
+**Why no session.** Three of the most expensive incidents in
+`docs/reference/FORKD_LESSONS.md` trace directly to that cookie:
+
+1. An infinite redirect loop between Access and the sync route, fixed only by
+   exempting the sync route from its own cookie check — a security-critical
+   exception that has to be remembered forever.
+2. Cloudflare Cache Rules stripping `Set-Cookie`, forcing the sync route to
+   return a 200 with `<meta http-equiv="refresh">` instead of a 302.
+3. Session tokens signed with `MASTER_KEY` (`FORKD_AUTH.md` finding #4,
+   "CRITICAL"): a key leak forges a session for any user.
+
+None of that buys anything Ledgerly needs. Access already authenticates every
+single request — the JWT is present on all of them. Re-verifying it costs one
+in-memory JWKS lookup (jose caches keys for roughly an hour). The only real cost
+of dropping the cookie is a `users` row read per request, and Forkd already
+found the fix for that: wrap the resolution in React's `cache()` so it runs at
+most once per request (`FORKD_LESSONS.md` §"Session resolution called multiple
+times per request").
+
+**Consequence.** No `session` table, no `account` table, no `verification`
+table, no `better-auth` dependency, no cookie signing, no sync route. Three bug
+classes and one critical secret dependency are removed by construction.
+`MASTER_KEY` is still required, but only for `app_config` encryption, which
+shrinks its blast radius from "forge any identity" to "read stored settings".
+
+**Consequence, accepted.** If Cloudflare's JWKS endpoint is unreachable for
+longer than jose's cache TTL, every user is locked out rather than only new
+sessions. `FORKD_AUTH.md` finding #3 assesses this as low risk given the
+endpoint is Cloudflare's own CDN; Ledgerly accepts the same assessment, and it
+was already true for new logins under Forkd's design.
+
+---
+
+## D-04 — Sign-out is a Route Handler that redirects to Access logout. **Settled.**
+
+**Context.** Two Forkd lessons converge: Next.js 15 forbids cookie writes in
+Server Components (Forkd's sign-out page silently failed to delete the cookie),
+and clearing only the app session leaves `CF_Authorization` valid so the user is
+silently re-authenticated on the next visit.
+
+**Why.** Under D-03 there is no app session to clear, so sign-out is *only* the
+redirect to `https://<team>/cdn-cgi/access/logout`. That is also the only thing
+that ever actually logged a Forkd user out.
+
+**Consequence.** `apps/web/src/app/api/auth/sign-out/route.ts`, a GET Route
+Handler. The nav uses a plain `<a href>`, not `<Link>`, so the browser issues a
+real navigation. Phase 3 acceptance: close the browser, revisit, and be
+challenged by Access again.
+
+---
+
+## D-05 — `DEV_AUTH_BYPASS` fails at startup, not per-request. **Settled.**
+
+**Context.** Forkd's dev bypass is guarded by two independent runtime
+comparisons in different files: `CF_ACCESS_ENABLED !== "true"` in `proxy.ts` and
+`NODE_ENV !== "production"` in the dev pages. `FORKD_AUTH.md` finding #1 rates it
+low risk but notes that a single wrong env var in production exposes it.
+
+**Why change it.** A guard that is checked per-request in two places can be
+bypassed by any code path that forgets one of them. A guard that is checked once
+at startup cannot: the process does not exist in the unsafe state. The brief also
+demands exactly this — "fail loud, at startup, not at request time."
+
+**Consequence.** The invariant lives in the Zod env schema in
+`packages/config`: `DEV_AUTH_BYPASS === true && NODE_ENV === "production"`
+throws and the process exits non-zero. Phase 3 tests the refusal.
+
+---
+
+## D-06 — Identity is the `sub` claim, not email. **Settled.**
+
+**Context.** Forkd looks users up by the lowercased `email` claim and stores
+`sub` only for audit (`FORKD_AUTH.md` §5). Its own finding #2 flags this: two
+IdPs returning the same email collapse into one user, and no `sub` uniqueness is
+enforced. The brief §1.4 requires `sub`.
+
+**Why.** Emails change; `sub` does not. Keying on email means an IdP-side email
+change silently creates a second account and orphans the first user's projects.
+
+**Consequence.** `users.cf_access_sub` is unique and not null. `email` is stored,
+kept in sync from the JWT on each visit, and used only for display and for the
+admin re-link action — never as a join key.
+
+**Consequence, accepted and mitigated.** Changing the Access identity provider
+changes `sub`, so returning users would be provisioned as new accounts. An
+owner-only **re-link account** admin action reassigns a `cf_access_sub` onto an
+existing `users` row matched by email, writing an `audit_log` entry. Built in
+Phase 3, task 3.7.
+
+---
+
+## D-07 — Keep Forkd's pnpm + Turbo monorepo. **Settled** (user decision).
+
+**Context.** Forkd is a pnpm workspace with 8 packages orchestrated by Turbo.
+`docs/STATE.md` carried this as an open question because
+`docs/reference/FORKD_LESSONS.md` traces several expensive bugs to the structure:
+`node:crypto` bleeding into the client bundle, `playwright-core` missing from the
+Next.js standalone output, and the subpath-export gymnastics needed to work
+around static file tracing. A single Next.js app was the alternative.
+
+**Why monorepo.** Chosen by the user in Phase 1. It makes every pattern in
+`docs/reference/` map one-to-one onto Ledgerly's tree, which is worth real time
+across nine remaining phases, and it gives package-level boundaries that make the
+client/server split explicit rather than conventional.
+
+**Consequence, and the cost being accepted.** The client-bundle bleed is the
+failure mode that comes with the structure. `ARCHITECTURE.md` §2.1 states the
+rule up front: `packages/shared` is imported by Client Components and must never
+export `node:*` built-ins, server-only libraries, or anything over ~10 KB.
+`import "server-only"` goes at the top of every server-only module. Phase 2 adds
+an ESLint `no-restricted-imports` rule enforcing the dependency direction, so
+this is a build failure rather than a code review responsibility.
+
+Two of the three bugs cited do not apply at all: Ledgerly has no Playwright, no
+Chromium, and no yt-dlp, so the standalone-tracing problem has no large
+dynamically-imported library to bite. Phase 2 still verifies `sharp`, `bullmq`,
+and `ioredis` are present in `.next/standalone/node_modules` as an explicit
+acceptance criterion.
+
+---
+
+## D-08 — BullMQ + Redis for background jobs. **Settled** (user decision).
+
+**Context.** Receipt extraction takes 5–30s and cannot run inside the upload
+request. Forkd uses BullMQ on Redis, a fourth container. The alternative
+considered was a Postgres `jobs` table polled with
+`SELECT ... FOR UPDATE SKIP LOCKED`, which would have dropped Redis entirely and
+put job state inside `pg_dump` backups.
+
+**Why BullMQ.** Chosen by the user. Retries, exponential backoff, concurrency
+caps, and repeatable jobs for the nightly backup all come for free and are
+already proven in Forkd; `docs/reference/FORKD_INFRA.md` documents the working
+configuration. The Postgres option would have meant writing and testing that
+machinery from scratch in a pipeline where a lost job is a lost financial record.
+
+**Consequence.** A `redis` service and a `redis_data` volume. Three queues:
+`receipt-extract`, `backup`, `export`. Redis also backs the per-user upload rate
+limiter, which it now makes free.
+
+**Consequence, accepted.** Queue state lives outside the database backup. A
+restore therefore recovers all receipts but not in-flight extraction jobs. The
+mitigation is that `receipts.extraction_status` is the source of truth, not the
+queue: a `pending` receipt with no live job is re-enqueued by a reconciliation
+sweep at worker startup. Phase 6, task 6.8.
+
+---
+
+## D-09 — `RETAIN_ORIGINALS` defaults to false. **Settled.**
+
+**Context.** Open decision #2 in the brief.
+
+**Why.** The display render targets under 300 KB, roughly 3,500 receipts per GB.
+Retaining originals grows storage roughly tenfold, and a modern phone HEIC is
+3–6 MB. For the tax and reporting purpose the app exists to serve, the 1600px
+WebP is legible and sufficient; the original adds nothing a reader needs.
+
+**Consequence.** `RETAIN_ORIGINALS=false` in `.env.example`. `SETUP.md`
+documents the storage cost of `true` so the choice is informed rather than
+default-accepted. The `receipts.original_key` column exists either way, so
+enabling it later requires no migration — only new uploads gain originals.
+
+---
+
+## D-10 — PDF receipts: first page only in v1. **Settled.**
+
+**Context.** Open decision #5 in the brief.
+
+**Why.** A receipt that spans pages is rare; a PDF whose second page is a terms-
+and-conditions boilerplate is common. Rasterising page 1 covers nearly every real
+case at a fraction of the complexity, and multi-page would multiply the AI cost
+per receipt by the page count with almost no extraction gain.
+
+**Consequence.** `pdftoppm -f 1 -l 1 -r 200 -png`. The schema needs no change for
+multi-page later, because a multi-page PDF is still one receipt — only the image
+pipeline and the render columns would change. Recorded as a v1.1 candidate.
+
+---
+
+## D-11 — `sharp` + libheif for HEIC; `poppler-utils` for PDF. **Settled.**
+
+**Context.** The brief §1.1 lists `sharp` + `heic-convert`.
+
+**Why.** Forkd's runner image already installs `vips` and `libheif`
+(`docs/reference/FORKD_INFRA.md`), so `sharp` decodes HEIC with no additional
+dependency and no second decode path to maintain. `heic-convert` would be a
+redundant pure-JS decoder alongside a native one that already works.
+
+`sharp` genuinely cannot rasterise PDF, so `poppler-utils` is a real addition to
+the runner image — the only package Ledgerly adds that Forkd does not have.
+
+**Consequence.** Runner installs `vips`, `libheif`, `poppler-utils`,
+`postgresql17-client`, `tar`, `su-exec`. It drops Forkd's `ffmpeg`, `python3`,
+and `yt-dlp`, and the `chrome-headless` service entirely.
+
+---
+
+## D-12 — Two-pass Haiku 4.5 -> Sonnet 5 extraction ladder. **Provisional — Phase 6 confirms.**
+
+**Context.** The brief §1.6 specifies the ladder. `docs/STATE.md` carried "AI
+model default" as open, because Forkd pins `AI_MODEL=claude-opus-4-7`, which is
+stale.
+
+**Why the ladder.** Most receipts are legible and extract correctly on the cheap
+model; escalating only the ones that fail concrete criteria avoids paying the
+expensive model's rate on the majority. The escalation triggers are objective
+(null `total`, null `transaction_date`, zero items, self-reported confidence
+below threshold), not vibes.
+
+**Corrections to the brief's numbers.**
+
+- The model ID is `claude-haiku-4-5`, not `claude-haiku-4-5-20251001`. Current
+  model IDs carry no date suffix.
+- **Sonnet 5 is $3.00 / $15.00 per MTok, not $2.00 / $10.00.** The lower figures
+  were an introductory rate that expired 2026-08-31, a week before this decision
+  was written. Haiku 4.5 is unchanged at $1.00 / $5.00.
+- Revised cost: roughly **$0.006 per receipt** on pass 1 alone, roughly **$0.024**
+  when it escalates.
+- The brief's "if escalation exceeds ~30%, go Sonnet-first" threshold was
+  computed against the expired pricing. At the corrected 3x spread the crossover
+  is nearer **45%**. The admin view tracks the rate; the threshold is a prompt to
+  reconsider, not an automatic switch.
+
+**Why not Opus 5 by default.** Receipt extraction is a bounded, well-specified
+vision-extraction task with a strict output schema — the tier where the cheaper
+models are reliable. Both passes are env-tunable (`AI_MODEL_PASS1`,
+`AI_MODEL_PASS2`), so re-pointing either at `claude-opus-5` is a config change,
+not a code change, if Phase 6's accuracy measurement justifies it.
+
+**Request shape differs by model, and this is not optional.** Haiku 4.5 rejects
+`output_config.effort` and uses the older `thinking: {type:"enabled",
+budget_tokens:N}` form. Sonnet 5 uses `thinking: {type:"adaptive"}` and supports
+`effort`. The pipeline builds each request from a per-model capability table
+rather than sending one shape to both.
+
+**Structured output.** One tool, `record_receipt`, with `strict: true`,
+`additionalProperties: false`, and an explicit `required` list — stronger than
+the brief's plain tool-use, because strict mode guarantees the input validates
+against the schema and removes the parse-and-repair step. The `category` enum is
+generated at call time from the live `categories` table so user-added categories
+are selectable (see D-20).
+
+**What makes this Provisional.** Phase 6 must confirm strict mode accepts the
+brief's `"type": ["string","null"]` union types. If it does not, the fallback is
+non-strict tool use with Zod validation of the tool input, and that outcome is
+appended here rather than filed as a new decision. Phase 6 also measures
+extraction accuracy over 10 real receipts, which is what settles whether the
+pass-1 model is the right one.
+
+---
+
+## D-13 — gitleaks in CI alongside secretlint in pre-commit. **Settled.**
+
+**Context.** Forkd uses secretlint 8 in lint-staged. The brief asks for gitleaks
+in CI and as a pre-commit hook. Open decision #3 (public or private repo) was
+resolved to **public** in Phase 0, and the repo is already published.
+
+**Why both.** They cover different moments. secretlint in lint-staged blocks a
+secret before it becomes a commit — the cheapest possible interception. gitleaks
+in CI scans **full history**, which catches anything that got in before the hook
+existed or via a path that bypassed it (`git commit --no-verify`, a merge, a
+rebase).
+
+**Consequence.** The brief's checklist item "full git history scanned for secrets
+before the repo goes public" is past tense — the repo is public already. It
+converts to a standing full-history gitleaks job on every CI run, which is
+strictly stronger than a one-time gate. Phase 2 wires it; Phase 10 verifies it is
+green as a v1.0.0 blocker.
+
+---
+
+## D-14 — Zod env validation at startup. **Settled.**
+
+**Context.** Forkd's `packages/config/src/index.ts` is `export {}`; env vars are
+read via bare `process.env` throughout with no startup validation. Both the stack
+and the auth analyses flagged this independently (`docs/STATE.md`).
+
+**Why.** Misconfiguration currently surfaces as an unrelated runtime error at
+whatever moment the variable is first touched — potentially days later, in
+production, as a 500 on one route. A startup schema turns that into a refusal to
+boot with a complete list of what is wrong.
+
+**Consequence.** `packages/config/src/env.ts` is a real module: a Zod schema
+covering every variable, parsed once at import, throwing with the full error list
+on failure. It is also where cross-field invariants live (D-05, the `MASTER_KEY`
+length check, the production requirement for `CF_ACCESS_AUD` and
+`CF_ACCESS_TEAM_DOMAIN`). Only an explicitly whitelisted public subset is
+re-exported to the client.
+
+---
+
+## D-15 — Deep healthcheck. **Settled.**
+
+**Context.** Forkd's `/api/v1/health` returns `{status:"ok"}` without touching
+the database, so a container reports healthy while every query fails
+(`docs/STATE.md`).
+
+**Why.** A healthcheck that cannot fail is not a healthcheck. Its entire purpose
+is to let Docker restart a container that is up but not working.
+
+**Consequence.** The endpoint runs `SELECT 1` against the pool and pings Redis,
+returning 503 if either fails. It stays exempt from the auth middleware. The
+route returns no version, no hostname, and no error detail — a 503 with a
+generic body, because it is the one endpoint reachable without authentication.
+
+---
+
+## D-16 — `APP_PORT` and `APP_HOSTNAME`. **Settled.**
+
+**Context.** Forkd uses `PORT` and `AUTH_URL`. `CLAUDE.md` states as a hard
+convention that port and hostname come from `APP_PORT` and `APP_HOSTNAME` and
+are never hardcoded.
+
+**Why.** `CLAUDE.md` is the governing document for this repo and states it as a
+rule, not a preference. `APP_PORT` is also less likely to collide with a
+platform-injected `PORT`, and `APP_HOSTNAME` names the thing it holds, where
+`AUTH_URL` is a leftover from Better Auth — which Ledgerly does not use (D-03).
+
+**Consequence.** `.env`, `docker-compose.yml`, and the Dockerfile all use
+`APP_PORT`. Changing it still requires updating the tunnel's ingress `service:`
+URL in `/etc/cloudflared/config.yml`, which `DEPLOYMENT.md` calls out — that
+coupling is a property of the tunnel, not of the naming.
+
+---
+
+## D-17 — Multi-currency: column present, UI deferred. **Settled.**
+
+**Context.** Open decision #4 in the brief.
+
+**Why.** `receipts.currency` costs nothing to carry and everything to add later
+once rows exist without it. A picker, per-currency formatting, and mixed-currency
+project totals are real work with no current use.
+
+**Consequence.** `receipts.currency` is `char(3)` not null, defaulting from
+`DEFAULT_CURRENCY` (USD). No UI in v1. Project totals sum without regard to
+currency, which is correct while every row shares one. If a second currency ever
+appears, the dashboard must be revisited before the totals mean anything — noted
+in `docs/SCHEMA.md`.
+
+---
+
+## D-18 — Isolated test database. **Settled.**
+
+**Context.** Forkd's tests run against `DATABASE_URL`, shared with dev, with no
+isolation and no rollback (`docs/reference/FORKD_STACK.md` §5,
+`docs/STATE.md`).
+
+**Why.** Tests that mutate the dev database are tests people stop running. Worse,
+they pass or fail depending on data left by the last run.
+
+**Consequence.** CI runs a throwaway `postgres:17` service container. Locally,
+`TEST_DATABASE_URL` points at a separate `ledgerly_test` database. Each test that
+touches the database runs inside a transaction that is rolled back in teardown.
+Phase 2 establishes the harness before there is anything to test, so no test is
+ever written against the other pattern.
+
+---
+
+## D-19 — Rewrite the receipt pipeline; port only its scaffolding. **Settled.**
+
+**Context.** `docs/STATE.md` carried this as open. Forkd already has a receipt
+pipeline: `packages/queue/src/receiptWorker.ts` plus `pipeline/`, BullMQ-driven,
+using `@anthropic-ai/sdk`. Ledgerly is specialising an existing pipeline rather
+than starting from nothing.
+
+**Why split it.** The scaffolding and the pipeline have different amounts in
+common with Forkd. The scaffolding — `queue.ts`, `redis.ts` (URL parsing),
+`worker.ts`, the BullMQ connection options, backoff configuration, graceful
+shutdown — is generic and battle-tested, so it ports essentially verbatim.
+
+The pipeline body has almost nothing in common. Forkd extracts a restaurant bill
+to split among people. Ledgerly extracts a receipt for tax reporting: every field
+nullable, unreadable fields collected into `missing_fields[]`, line items with
+per-item categories drawn from a live enum, a Luhn scrub before persistence, four
+arithmetic sanity checks, and a two-model escalation ladder. Adapting Forkd's
+body to that contract means replacing all of it while carrying its assumptions
+forward, which is more work than writing it against the contract directly and
+carries the risk of inheriting a behaviour nobody chose.
+
+**Consequence.** `packages/queue/src/{queue,redis,worker}.ts` follow Forkd's
+shapes closely. `packages/queue/src/pipeline/extract.ts` is new. Phase 6 does not
+read the Forkd repo to do this — `docs/reference/` is the standing substitute
+(`CLAUDE.md`).
+
+---
+
+## D-20 — Categories: seeded global list, user-extensible, instance-wide. **Settled** (user decision).
+
+**Context.** The brief requires per-item categories usable for filtering and
+export, and specifies the taxonomy is instance-wide, not per-project, with 13
+seeded values. The alternatives were a fixed list with no additions, or
+per-project taxonomies.
+
+**Why.** A fixed list is wrong the first time a project does not fit it.
+Per-project taxonomies break exactly the thing categories exist for: filtering
+and cross-project reporting cannot aggregate when "Lumber" in one project is
+unrelated to "Lumber" in another.
+
+**Consequence.** The 13 seeded categories are `is_system = true` and cannot be
+deleted or renamed, so an export's meaning is stable over time. Users may add
+categories, which are also instance-wide. The extraction tool schema's `category`
+enum is generated at call time from the live table, so a category added today is
+selectable by the model tomorrow — this is why the enum cannot be a compile-time
+constant. Deleting a user category requires reassigning its items first; the
+schema uses `ON DELETE RESTRICT` to make that a database guarantee rather than an
+application convention.
+
+---
+
+## D-21 — Money is `numeric(12,2)`, never a float. **Settled.**
+
+**Context.** The brief's schema sketch does not name types for `subtotal`,
+`sales_tax`, `tip`, `total`, `unit_price`, or `line_total`. The `reviewer` agent
+checks explicitly for float rounding in money handling.
+
+**Why.** IEEE-754 cannot represent 0.10 exactly. A `double precision` column
+turns the brief's own sanity check — `|subtotal + sales_tax - total| > 0.02` —
+into a test that fails on correct data. This is a tax record; the arithmetic has
+to be exact.
+
+**Consequence.** All money columns are `numeric(12,2)`. Drizzle reads `numeric`
+as a **string**, which is the desired behaviour: the application layer converts
+to integer cents for all arithmetic and formats back exactly once, at the display
+or export boundary. `docs/SCHEMA.md` states this, and a `packages/shared/money.ts`
+helper is the only place the conversion is written. Phase 4 adds a unit test that
+`19.99 + 0.01` reconciles.
+
+---
+
+## D-22 — Soft deletes use partial unique indexes. **Settled.**
+
+**Context.** `docs/reference/FORKD_LESSONS.md` documents a production crash:
+a full-table `UNIQUE` constraint plus a `deleted_at` soft-delete column means a
+re-insert collides with a row the user believes is gone.
+
+**Why.** The constraint should express "unique among live rows", which is what a
+partial index says and what a full-table constraint does not.
+
+**Consequence.** Every uniqueness rule on a soft-deleted table is written
+`CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL`, and every duplicate-detection
+query filters `deleted_at IS NULL` so it never short-circuits on deleted history.
+`docs/SCHEMA.md` marks each one.
+
+---
+
+## D-23 — Storage paths are UUID-derived; images are never static. **Settled.**
+
+**Context.** The brief §1.5 requires UUID-derived filenames and authenticated
+image serving. The `reviewer` agent checks both.
+
+**Why.** Path traversal is not a validation problem if no user-supplied string
+ever reaches the filesystem — it becomes unrepresentable rather than guarded.
+Serving images as static files would make every receipt photo readable by anyone
+who learns a URL, defeating the entire permission model.
+
+**Consequence.** `${UPLOADS_DIR}/<project_id>/<receipt_id>/{display,thumb,original}.<ext>`,
+every segment a server-generated UUID. `UPLOADS_DIR` is a named volume outside
+`public/`. `/api/images/[...key]` resolves the receipt, composes with
+`scopedProjects(user)`, and returns **404** rather than 403 on a permission
+failure, so the endpoint is not an existence oracle for other users' receipts.
