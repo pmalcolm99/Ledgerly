@@ -1,0 +1,51 @@
+# Secrets and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+cert.pem
+
+# Cloudflare tunnel credentials
+.cloudflared/
+tunnel-*.json
+
+# Application data -- receipts live here, never in git
+data/
+uploads/
+backups/
+*.sqlite
+*.sqlite3
+*.db
+
+# Private working notes -- AARs, retros, threat models, real hostnames
+docs/private/
+*AAR*.md
+*aar*.md
+*RETRO*.md
+NOTES.md
+SCRATCH.md
+TODO-private.md
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+.next/
+coverage/
+*.tsbuildinfo
+
+# OS and editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Claude Code per-machine settings (agents/ and commands/ ARE tracked)
+.claude/settings.local.json
