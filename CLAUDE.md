@@ -1,7 +1,8 @@
 # Ledgerly
 
 Receipt capture and spend tracking. Self-hosted PWA behind Cloudflare Tunnel
-+ Cloudflare Access, with Claude-powered receipt extraction.
+
+- Cloudflare Access, with Claude-powered receipt extraction.
 
 Architecturally modeled on Forkd (`/Users/pmalcolm/Documents/Forkd`).
 
@@ -48,6 +49,8 @@ never in logs, never in an error message.
 ## Workflow
 
 - One phase per session. Update `docs/STATE.md` before committing.
+- Commit and push directly to `main`. No feature branches, no pull
+  requests — this is a solo repo and the extra step buys nothing.
 - After pushing, verify the GitHub Actions run passes (`gh run watch`).
 - Dispatch the `reviewer` subagent over the diff before committing any
   auth, upload, or AI-integration work.
