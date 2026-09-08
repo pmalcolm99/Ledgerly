@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Non-secret, structurally-valid placeholders — never real values. Startup
+  # validation (packages/config/src/env.ts, D-14) requires these to be
+  # present and well-formed even where nothing actually connects with them;
+  # CF_ACCESS_AUD/TEAM_DOMAIN are required because CI builds run with
+  # NODE_ENV=production semantics for `next build` (see task 2.8's build
+  # notes — the same reason apps/web/next.config.ts's build needs them).
+  DATABASE_URL: postgres://ledgerly:ledgerly@localhost:5432/ledgerly
+  TEST_DATABASE_URL: postgres://ledgerly:ledgerly@localhost:5432/ledgerly_test
+  MASTER_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  ANTHROPIC_API_KEY: ci-placeholder-key
+  CF_ACCESS_AUD: "0000000000000000000000000000000000000000000000000000000000000000"
+  CF_ACCESS_TEAM_DOMAIN: ci-placeholder.cloudflareaccess.com
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # A throwaway service container, not a shared dev database — every
+        # migration is applied from empty on each run (D-18, docs/SCHEMA.md
+        # §Testing).
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ledgerly
+          POSTGRES_PASSWORD: ledgerly
+          POSTGRES_DB: ledgerly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledgerly -d ledgerly"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — gitleaks scans it below, not just the tip
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm typecheck
+
+      - name: Create the test database
+        run: |
+          PGPASSWORD=ledgerly psql -h localhost -U ledgerly -d ledgerly \
+            -c "CREATE DATABASE ledgerly_test;"
+
+      - name: Apply migrations to the test database
+        working-directory: packages/db
+        run: pnpm exec tsx src/migrate.ts
+        env:
+          DATABASE_URL: postgres://ledgerly:ledgerly@localhost:5432/ledgerly_test
+
+      - run: pnpm test
+
+      - run: pnpm build
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, per D-13 — not just the tip
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [ci, gitleaks]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/ledgerly:latest
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

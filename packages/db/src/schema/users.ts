@@ -1,0 +1,32 @@
+import { sql } from "drizzle-orm";
+import { pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+
+import { userRoleEnum } from "./enums";
+
+// docs/SCHEMA.md §users.
+export const users = pgTable(
+  "users",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    cfAccessSub: text("cf_access_sub").notNull(),
+    email: text("email").notNull(),
+    firstName: text("first_name"),
+    lastName: text("last_name"),
+    displayName: text("display_name"),
+    role: userRoleEnum("role").notNull().default("user"),
+    theme: text("theme").notNull().default("dark"),
+    onboardedAt: timestamp("onboarded_at", { withTimezone: true }),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("users_cf_access_sub_key").on(t.cfAccessSub),
+    // NOTE (D-22): drizzle-kit 0.31 does not reliably emit this expression
+    // index (`lower(email)`) from the schema DSL. Verify the generated SQL
+    // in packages/db/migrations/0000_*.sql by hand; if it is missing, the
+    // statement is hand-appended there per docs/SCHEMA.md §Migration
+    // strategy, and this comment is the pointer back to it.
+    uniqueIndex("users_email_lower_key").on(sql`lower(${t.email})`),
+  ],
+);

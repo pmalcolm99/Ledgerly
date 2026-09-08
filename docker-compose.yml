@@ -1,0 +1,75 @@
+name: ledgerly
+
+services:
+  webapp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: ${IMAGE_LOCATION:-ghcr.io/pmalcolm99/ledgerly:latest}
+    restart: always
+    # Localhost only — nothing but the Cloudflare Tunnel can reach this
+    # (ARCHITECTURE.md §8, D-16). db and redis publish no ports at all.
+    ports:
+      - "127.0.0.1:${APP_PORT:-3000}:${APP_PORT:-3000}"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      UPLOADS_DIR: /app/uploads
+      BACKUPS_DIR: /app/backups
+      PORT: "${APP_PORT:-3000}"
+    volumes:
+      - app_uploads:/app/uploads
+      - app_backups:/app/backups
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:'+(process.env.PORT||3000)+'/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # No `user:` override here — the container starts as root, and
+    # entrypoint.sh chowns the volumes then drops to `node` via su-exec,
+    # but only after checking `id -u` (Forkd took a production 502 on
+    # exactly this — docker/entrypoint.sh, task 2.10). Both this default
+    # path and an explicit `user: "1000:1000"` override are tested.
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+volumes:
+  app_uploads:
+  app_backups:
+  db_data:
+  redis_data:

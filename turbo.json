@@ -1,0 +1,53 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [".env"],
+  // Turbo 2's default "strict" env mode silently drops any env var not
+  // explicitly allowlisted, which broke both `next build` (packages/config's
+  // startup parse — D-14) and TEST_DATABASE_URL reaching packages/db's test
+  // harness (D-18). "loose" passes the invoking shell's environment through
+  // unfiltered, same as running each task directly — appropriate here since
+  // every var is Zod-validated at the point of use regardless of how it
+  // arrived, and an allowlist would just be ARCHITECTURE.md §7.2's table
+  // duplicated somewhere it can silently drift out of sync.
+  "envMode": "loose",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": []
+    },
+    "typecheck": {
+      "outputs": []
+    },
+    // Run serially via the root script's --concurrency=1. Every
+    // database-touching suite shares one TEST_DATABASE_URL, and
+    // withCleanDatabase() TRUNCATEs it, which needs ACCESS EXCLUSIVE —
+    // concurrent packages clobber each other's fixtures. Raised as M-6 in
+    // the task 3.12 review. The durable fix is a database per package;
+    // until then this is what makes `pnpm test` deterministic.
+    "test": {
+      "outputs": []
+    },
+    "format": {
+      "cache": false
+    },
+    "db:generate": {
+      "cache": false
+    },
+    "db:migrate": {
+      "cache": false
+    },
+    "db:push": {
+      "cache": false
+    },
+    "db:seed": {
+      "cache": false
+    }
+  }
+}

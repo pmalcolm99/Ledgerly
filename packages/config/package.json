@@ -1,0 +1,27 @@
+{
+  "name": "@ledgerly/config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/env.ts",
+  "types": "./src/env.ts",
+  "exports": {
+    ".": "./src/env.ts",
+    "./env": "./src/env.ts",
+    "./edge": "./src/edge.ts"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "server-only": "^0.0.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.2"
+  }
+}
