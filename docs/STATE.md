@@ -4,9 +4,53 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 4 — Projects & permissions. **Complete.** Reviewed twice (task 4.8 —
-an initial pass and a follow-up verifying the fixes), findings triaged and
-fixed, committed.
+Phase 5 — Ingest pipeline. **Complete.** Reviewed once (task 5.11), all
+High/Medium findings and nearly all Low findings fixed, committed.
+
+## Task 5.11 review — what was found and what was done
+
+The `reviewer` pass found 3 high, 8 medium, and 10 low. All three high and
+all eight medium findings fixed before commit; 8 of 10 low findings fixed,
+2 deliberately deferred (noted at the end).
+
+| #       | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Fix                                                                                                                                                                                                                                                                                                                                     |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **H-1** | The size guard ran only after `request.formData()` had already buffered the whole multipart body and every file's bytes — no cap on total request size or file count, so an oversized body or a huge file count spent unbounded memory/CPU before any guard fired.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | A `Content-Length` ceiling (`MAX_UPLOAD_BYTES * MAX_FILES_PER_BATCH`) rejects before `formData()` ever runs; a hard `MAX_FILES_PER_BATCH` (60) caps file count once parsed; per-file `File.size` is checked before the `arrayBuffer()` copy. Files are now processed sequentially, not via unbounded `Promise.all`.                     |
+| **H-2** | `processOneFile` had no error handling around the DB insert, staged write, or enqueue. A thrown error rejected the whole `Promise.all`, losing every other file's results; an enqueue failure after a successful insert left a `pending` row with no job and no record.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Every persistence step is wrapped; a failure after the row exists marks it `extraction_status='failed'`, `extraction_error='UPLOAD_PERSISTENCE_FAILED'` rather than leaving it silently `pending` forever. `processOneFile` never throws past its own guard stage.                                                                      |
+| **H-3** | `pipeline/ingest.ts` consumed (renamed/deleted) `staging.bin` **before** the final `receipts` DB write. A failure between those two steps left a retry with no staged bytes, throwing `STAGING_FILE_MISSING` on an ingest that partially succeeded — the module's own "retry-safe" doc comment was untrue.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Reordered: the DB write (`imageKey`/`thumbKey`/`originalKey`) happens first; `staging.bin` is touched only after that write commits. Added an "already ingested" early-return (checks `receipt.imageKey`) so a retry that reaches the function again after a genuinely successful prior run is a safe no-op.                            |
+| **M-1** | `MAX_UPLOAD_MEGAPIXELS` was enforced only by the upload route's header probe. Every actual `sharp` decode used sharp's own ~268MP default regardless of the operator-configured (possibly much lower) cap.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `maxMegapixels` threaded through `renderDisplayAndThumb`/`renderExtraction`/`regenerateExtractionRender`, passed as `limitInputPixels` on every real decode.                                                                                                                                                                            |
+| **M-2** | The image-serving route had no `nosniff`, no `Content-Disposition`, no CSP — attacker-controlled bytes served from the app's own origin.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Added `x-content-type-options: nosniff`, `content-security-policy: default-src 'none'; sandbox`, and `content-disposition` (`inline` for display/thumb, `attachment` for original).                                                                                                                                                     |
+| **M-3** | A retained `original.<ext>` keeps GPS EXIF (D-09's "untouched bytes") and was served to every project member with plain `read` access — uploading a receipt to a shared project disclosed the uploader's location to everyone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `kind=original` now additionally requires the caller be the uploader or hold `manage`-level access (full/project owner/instance owner); `display`/`thumb` (EXIF-stripped) stay at the general `read` floor.                                                                                                                             |
+| **M-4** | `receipts.delete` locked the `receipts` row `FOR UPDATE` **before** any authorization check — the exact timing-oracle/connection-pinning problem `scope.ts`'s own doc comment describes at length as the reason for check-lock-recheck.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Reordered to an unlocked precheck (learn `projectId` only) → `lockScopedProject` (authorization + project lock) → a fresh, still-unlocked receipt re-read. No lock is ever taken on a row before the caller is proven authorized; the project lock still serializes concurrent `receipts.delete`/`members.*` calls on the same project. |
+| **M-5** | The `isInstanceOwner` check read `ctx.user.role`, resolved from the JWT at request entry and unprotected by any lock — a user demoted from instance owner mid-request would still pass.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Re-reads `users.role` for the caller's own id inside the transaction.                                                                                                                                                                                                                                                                   |
+| **M-6** | `worker.on("failed", ...)`'s `attemptsMade < attempts` gate is not a reliable signal for every way a job can end up permanently stuck (e.g. a stalled worker), leaving a receipt `pending` forever with no operator-visible failure.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Added `reconcilePendingReceipts`, run once at `ingestWorker` startup: any `pending` receipt with no render and no activity in 15 minutes gets a fresh `receipt-ingest` job (`jobId: receiptId`, so a still-genuinely-active job is untouched). Same D-08 principle Phase 6 documents for its own queue, applied here.                   |
+| **M-7** | `redisConnectionOptions` silently dropped the logical Redis database number from the URL (`redis://host:port/N`), so `TEST_REDIS_URL`'s db-index isolation from `REDIS_URL` — the whole point of this session's own `scripts/test-redis.sh` — did nothing; a test run could land on a developer's real dev Redis. The connection singleton also ignored the URL on every call after the first.                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `redisConnectionOptions` now parses `url.pathname` into ioredis's `db` option. `getRedisConnection` is keyed on the URL it was first created with and throws on a mismatched second call instead of silently reusing the wrong connection.                                                                                              |
+| **M-8** | The image route read the whole file into a `Buffer` then copied it again into a `Uint8Array` — ~2x the file size in memory per in-flight request, no `Range` support.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Streams via `Readable.toWeb(receiptFileReadStream(...))` with an explicit `content-length` from `fs.stat`. Verified live: byte-identical to the file on disk, correct `content-length`.                                                                                                                                                 |
+| **L**   | Nine more: batch-exceeds-limit now 413 not 429; PDF probe/rasterize temp files written `mode: 0o600`; an AVIF file whose major brand is the generic `mif1` it shares with real HEIC (compatible-brand-only `avif` tag) is now rejected, not misidentified; `IngestError` messages no longer embed filesystem paths (BullMQ persists `Error.message` as `failedReason` in Redis); a `receipts.delete` landing mid-ingest no longer leaves orphaned renders with no DB row (the final ingest write is a conditional `UPDATE ... WHERE deleted_at IS NULL`, cleaning up on a zero-row result); `display`/`thumb` now cache `private, max-age=86400, must-revalidate` (immutable once written) while `original` stays `no-store`; `instrumentation.ts` calls `getEnv()` once, not twice; fixed-window burst behavior documented in `rateLimit.ts`'s own comment. | All fixed.                                                                                                                                                                                                                                                                                                                              |
+
+**Deliberately not fixed — carried forward:**
+
+- **LOW** — `routers/receipts.ts` calls `getEnv().UPLOADS_DIR` directly
+  rather than through an injected dependency, unlike every other file this
+  phase added. Flagged by the reviewer as inconsistent with this phase's
+  own DI pattern. Not changed: `Context`'s shape (`{db, user}`) is shared
+  by every existing router and test in the app, and widening it to carry
+  `env`/`uploadsDir` has a blast radius disproportionate to a style nit —
+  `receipts.test.ts`'s "deletes the image directory only after the DB
+  transaction commits" test already demonstrates this file IS testable
+  against a temp dir today (via the same "set `process.env.UPLOADS_DIR`
+  once before the first `getEnv()` call" trick `env.ts`'s own caching
+  requires elsewhere in this codebase).
+- **LOW** — Ingest failures reuse `extraction_status='failed'` /
+  `extraction_error`, the same columns Phase 6's AI extraction will use for
+  its own failures. Once Phase 6 exists, an operator won't be able to tell
+  "the render pipeline failed" from "Claude failed" by status alone —
+  `extraction_error`'s reason codes ARE already ingest-stage-specific
+  (`PDFTOPPM_UNAVAILABLE`, `IMAGE_DECODE_FAILED`, etc.), so the information
+  exists, just not as a first-class column. Adding one needs a schema
+  migration and touches Phase 6's own status-model design, which doesn't
+  exist yet — left for Phase 6 to resolve deliberately rather than
+  guessed at here.
 
 ## Task 4.8 review — what was found and what was done
 
@@ -389,9 +433,90 @@ up -d`. All three containers healthy; `webapp`'s `next-server` runs as
   independently re-ran the full suite rather than trusting the first pass's
   fix claims, and found one more real bug in the H-1 fix's own first draft.
 
+**Phase 5 (2026-09-08)**
+
+- Design pass resolved two ambiguities before writing code: the storage
+  path (the brief sketched `data/receipts/<project_id>/...`; followed the
+  already-settled ARCHITECTURE.md §5/D-23 path instead —
+  `${UPLOADS_DIR}/<project_id>/<receipt_id>/...`, no `receipts/` segment)
+  and the queue architecture (a new `receipt-ingest` queue/worker for the
+  render pipeline, sequential to and separate from Phase 6's
+  `receipt-extract`, which stays `autorun:false` until Phase 6). Two
+  questions put to the user directly: the image route's failure shape for
+  "no identity at all" (settled on 403, matching the app-wide D-24
+  convention, vs. 404 for every other failure) and real-device test files
+  (settled on synthetic-only — D-13, the repo is public, so no real phone
+  photo, even gitignored, should ever risk being committed).
+- `packages/shared/src/fileSniff.ts` — magic-byte sniffing
+  (JPEG/PNG/WebP/TIFF/HEIC-HEIF/PDF), authoritative over client
+  `Content-Type`/filename, which are read nowhere in the guard chain.
+- `packages/api/src/storage.ts` — UUID-derived storage paths, closing path
+  traversal by construction (D-23); every function testable against a
+  plain temp dir with no environment coupling.
+- `packages/api/src/rateLimit.ts` — Redis Lua atomic fixed-window limiter,
+  whole-batch cost, DI'd Redis client (keeps `packages/api` free of a new
+  `ioredis` dependency).
+- `packages/queue/src/pipeline/render.ts` — header-only probes
+  (`probeImageDimensions`, `probePdfPageDimensionsAtDpi` — the latter
+  matters for PDF: a crafted `/MediaBox` can declare an arbitrarily large
+  page independent of content, so a fixed rasterization DPI does not make
+  the guard moot) and the actual pipeline (PDF rasterize via `pdftoppm`,
+  EXIF orient-then-strip via sharp's default `.rotate()` with no
+  `.withMetadata()`, renders B/C, plus `renderExtraction`/
+  `regenerateExtractionRender` ready for Phase 6, unused this phase).
+- `packages/queue/src/pipeline/ingest.ts` + `ingestWorker.ts` — the
+  `receipt-ingest` worker (`INGEST_CONCURRENCY`, `autorun:true`, distinct
+  from Phase 6's `AI_CONCURRENCY`). Retry-safe: the DB write happens
+  before the staged upload is consumed, and an already-ingested receipt is
+  a fast no-op.
+- `apps/web/src/app/api/receipts/upload/` — the upload Route Handler.
+  Guards run in order (size → magic-byte sniff → megapixel/PDF-page-size),
+  all before any decode, all before any receipt row exists. One bad file
+  in a batch is rejected individually; the rest still upload.
+- `apps/web/src/app/api/images/[...key]/` — authenticated image serving.
+  403 for no identity; 404 for every other failure (nonexistent receipt,
+  wrong project, no membership, unprocessed render) — never an existence
+  oracle. `original` (the untouched upload, D-09) is additionally
+  restricted to the uploader or a `manage`-level member, since it can
+  carry GPS EXIF that `display`/`thumb` strip.
+- `packages/api/src/routers/receipts.ts` — `receipts.delete` (soft
+  delete + physical directory removal, only after the DB transaction
+  commits), a small necessary addition beyond the phase brief's literal 5
+  numbered items, same judgment-call convention Phase 4 used for
+  `unarchive`.
+- `scripts/test-redis.sh` + `TEST_REDIS_URL` — new test infrastructure,
+  mirroring `scripts/test-db.sh`/`TEST_DATABASE_URL` exactly: a dedicated
+  throwaway Redis (compose's `redis` publishes no ports, same reasoning as
+  `db`), `TEST_REDIS_URL` and `REDIS_URL` as two logical Redis databases
+  on the one container rather than two containers.
+- **300 tests passing** across all 8 packages (`api` 115, `auth` 52,
+  `shared` 61, `config` 17, `db` 2, `queue` 25, `web` 28). `pnpm lint` and
+  `pnpm typecheck` clean repo-wide.
+- **Full manual verification against a real running `pnpm dev` server**
+  (not just unit tests): a real synthesized JPEG with GPS EXIF and
+  orientation 6, uploaded through the real HTTP route, ingested by the
+  real worker — `exiftool` on the resulting `display.webp` shows zero EXIF
+  fields (GPS included). A real hand-built PDF rasterized end-to-end into
+  a real `display.webp`/`thumb.webp`. A mislabeled file (HTML bytes,
+  claimed `image/jpeg`, `.jpg` extension) rejected as
+  `UNRECOGNIZED_OR_MISLABELED_TYPE`. `/api/images/...` returned
+  byte-identical content with the exact `content-length`/`nosniff`/
+  `content-disposition` headers the streaming (M-8) and header-hardening
+  (M-2) fixes were meant to produce. `receipts.delete` removed the image
+  directory and the image route 404'd immediately after.
+- Reviewed once — see "Task 5.11 review" above.
+- **Not verified this session, deliberately**: a real HEIC photographed on
+  a phone (PHASES.md's own gate line for this phase). Per the answered
+  question above, real-device files were kept out of this public repo
+  entirely rather than used transiently; nothing in the pipeline is
+  HEIC-specific enough to be a real risk (sharp+libheif handles it exactly
+  like every other format `render.ts` decodes), but the literal gate
+  criterion is unconfirmed and belongs in "Blocked / open questions"
+  below so it isn't lost.
+
 ## Next
 
-Phase 5 — Ingest pipeline (parallel-safe with Phase 7).
+Phase 6 — AI extraction.
 
 ### Running the database tests locally
 
@@ -414,6 +539,19 @@ The script reads only `TEST_DATABASE_URL` and `DATABASE_URL` from `.env`
 rather than sourcing it, and refuses to run if the two are equal (D-18);
 `packages/db/src/testHarness.ts` asserts the same thing again at test time.
 `vitest.shared.ts` lifts `TEST_DATABASE_URL` out of `.env` for the run.
+
+### Running the test Redis locally
+
+```
+./scripts/test-redis.sh          # start (idempotent)
+./scripts/test-redis.sh --reset  # destroy and recreate from scratch
+./scripts/test-redis.sh --stop   # remove the container
+```
+
+Same reasoning as the test database, one container instead of two: compose's
+`redis` publishes no ports, so `TEST_REDIS_URL` and `REDIS_URL` point at the
+same throwaway container on different logical Redis database numbers
+(`/0` vs `/1`) rather than two separate containers/ports.
 
 ## Resolved questions
 
@@ -445,6 +583,18 @@ Decisions taken by the user this session:
 
 ## Blocked / open questions
 
+- **Phase 5's gate line — "a real HEIC photographed on your phone
+  round-trips end to end" — is unverified.** Deliberately: the repo is
+  public (D-13), so no real phone photo (which may carry real GPS EXIF)
+  should be committed or transiently handled in a way that risks it, even
+  gitignored. Automated coverage is synthetic-only (EXIF orientation via
+  sharp, a header-only oversized PNG, a hand-built PDF). Nothing in the
+  pipeline is HEIC-specific enough to expect a real HEIC to behave
+  differently — sharp+libheif decodes it exactly like every other format —
+  but this is a real, named gap, not a silent one. Whoever next has a real
+  iPhone photo handy: run it through `/api/receipts/upload` once (locally,
+  never committed) and confirm `display.webp`/`thumb.webp` land correctly
+  and `exiftool` shows no EXIF; then this line can be struck.
 - **D-12 is Provisional.** Phase 6 task 6.3 must confirm strict-mode tool use
   accepts `["string","null"]` union types; if not, the fallback is non-strict
   tool use with Zod validation, appended to D-12 rather than filed anew. Phase 6

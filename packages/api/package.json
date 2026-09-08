@@ -9,7 +9,9 @@
     ".": "./src/index.ts",
     "./trpc": "./src/trpc.ts",
     "./root": "./src/root.ts",
-    "./scope": "./src/scope.ts"
+    "./scope": "./src/scope.ts",
+    "./storage": "./src/storage.ts",
+    "./rateLimit": "./src/rateLimit.ts"
   },
   "scripts": {
     "lint": "eslint .",
@@ -28,6 +30,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
+    "ioredis": "^5.4.2",
     "typescript": "^5.7.2",
     "vitest": "^3.0.2"
   }

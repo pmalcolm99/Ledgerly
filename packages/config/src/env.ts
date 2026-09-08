@@ -72,6 +72,17 @@ const rawSchema = z.object({
   // --- Uploads -----------------------------------------------------------
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(52_428_800),
   RETAIN_ORIGINALS: zBoolEnv(false),
+  // Decompression-bomb guard (Phase 5 task 5.2): checked against header-only
+  // dimensions (sharp .metadata(), or a PDF's declared page size at the
+  // pipeline's fixed rasterization DPI) BEFORE any decode.
+  MAX_UPLOAD_MEGAPIXELS: z.coerce.number().int().positive().default(100),
+  // Per-user, whole-batch-atomic, Redis-backed (packages/api/src/rateLimit.ts).
+  UPLOAD_RATE_LIMIT_PER_MIN: z.coerce.number().int().positive().default(60),
+  // Concurrency cap for the Phase 5 `receipt-ingest` render-pipeline worker
+  // (packages/queue/src/ingestWorker.ts) — a DIFFERENT knob from
+  // AI_CONCURRENCY above, which caps Phase 6's `receipt-extract` AI-call
+  // worker. Same default by coincidence only; do not merge the two.
+  INGEST_CONCURRENCY: z.coerce.number().int().positive().default(3),
 
   // --- Misc ----------------------------------------------------------------
   DEFAULT_CURRENCY: z.string().length(3).default("USD"),

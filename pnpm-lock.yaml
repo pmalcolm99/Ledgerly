@@ -74,6 +74,9 @@ importers:
       bullmq:
         specifier: ^5.34.0
         version: 5.81.4
+      drizzle-orm:
+        specifier: ^0.41.0
+        version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       ioredis:
         specifier: ^5.4.2
         version: 5.11.1
@@ -139,6 +142,9 @@ importers:
       '@types/node':
         specifier: ^22.10.5
         version: 22.20.1
+      ioredis:
+        specifier: ^5.4.2
+        version: 5.11.1
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
@@ -238,12 +244,24 @@ importers:
 
   packages/queue:
     dependencies:
+      '@ledgerly/api':
+        specifier: workspace:*
+        version: link:../api
       '@ledgerly/config':
         specifier: workspace:*
         version: link:../config
+      '@ledgerly/db':
+        specifier: workspace:*
+        version: link:../db
+      '@ledgerly/shared':
+        specifier: workspace:*
+        version: link:../shared
       bullmq:
         specifier: ^5.34.0
         version: 5.81.4
+      drizzle-orm:
+        specifier: ^0.41.0
+        version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       ioredis:
         specifier: ^5.4.2
         version: 5.11.1

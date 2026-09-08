@@ -396,31 +396,34 @@ The schema is also where cross-field invariants live:
 
 ### 7.2 Key variables
 
-| Variable                  | Default              | Notes                                                        |
-| ------------------------- | -------------------- | ------------------------------------------------------------ |
-| `APP_PORT`                | 3000                 | host bind and container port (D-16)                          |
-| `APP_HOSTNAME`            | —                    | public hostname; used for absolute URLs (D-16)               |
-| `DATABASE_URL`            | —                    | composed in compose from `POSTGRES_*`                        |
-| `REDIS_URL`               | `redis://redis:6379` |                                                              |
-| `MASTER_KEY`              | —                    | 32 bytes base64; encrypts `app_config`. Back up out-of-band  |
-| `UPLOADS_DIR`             | `/app/uploads`       | named volume                                                 |
-| `BACKUPS_DIR`             | `/app/backups`       | named volume                                                 |
-| `CF_ACCESS_ENABLED`       | `false`              |                                                              |
-| `CF_ACCESS_AUD`           | —                    | never committed                                              |
-| `CF_ACCESS_TEAM_DOMAIN`   | —                    | never committed                                              |
-| `CF_ACCESS_JWKS_TTL_MS`   | `3600000`            | JWKS `cacheMaxAge`; explicit, not inherited (D-29)           |
-| `ACCESS_ALLOW_SUB_RELINK` | `false`              | IdP-migration recovery only; WARNs at boot while true (D-27) |
-| `DEV_AUTH_BYPASS`         | `false`              | hard-fails under production                                  |
-| `ANTHROPIC_API_KEY`       | —                    | server-side only                                             |
-| `AI_MODEL_PASS1`          | `claude-haiku-4-5`   |                                                              |
-| `AI_MODEL_PASS2`          | `claude-sonnet-5`    |                                                              |
-| `AI_ESCALATE_BELOW`       | `0.6`                |                                                              |
-| `AI_CONCURRENCY`          | `3`                  |                                                              |
-| `MAX_UPLOAD_BYTES`        | `52428800`           | 50 MB                                                        |
-| `RETAIN_ORIGINALS`        | `false`              | ~10x storage if true (D-09)                                  |
-| `DEFAULT_CURRENCY`        | `USD`                | no UI in v1 (D-17)                                           |
-| `BACKUP_RETENTION_DAYS`   | `30`                 |                                                              |
-| `BACKUP_INCLUDE_IMAGES`   | `false`              |                                                              |
+| Variable                    | Default              | Notes                                                        |
+| --------------------------- | -------------------- | ------------------------------------------------------------ |
+| `APP_PORT`                  | 3000                 | host bind and container port (D-16)                          |
+| `APP_HOSTNAME`              | —                    | public hostname; used for absolute URLs (D-16)               |
+| `DATABASE_URL`              | —                    | composed in compose from `POSTGRES_*`                        |
+| `REDIS_URL`                 | `redis://redis:6379` |                                                              |
+| `MASTER_KEY`                | —                    | 32 bytes base64; encrypts `app_config`. Back up out-of-band  |
+| `UPLOADS_DIR`               | `/app/uploads`       | named volume                                                 |
+| `BACKUPS_DIR`               | `/app/backups`       | named volume                                                 |
+| `CF_ACCESS_ENABLED`         | `false`              |                                                              |
+| `CF_ACCESS_AUD`             | —                    | never committed                                              |
+| `CF_ACCESS_TEAM_DOMAIN`     | —                    | never committed                                              |
+| `CF_ACCESS_JWKS_TTL_MS`     | `3600000`            | JWKS `cacheMaxAge`; explicit, not inherited (D-29)           |
+| `ACCESS_ALLOW_SUB_RELINK`   | `false`              | IdP-migration recovery only; WARNs at boot while true (D-27) |
+| `DEV_AUTH_BYPASS`           | `false`              | hard-fails under production                                  |
+| `ANTHROPIC_API_KEY`         | —                    | server-side only                                             |
+| `AI_MODEL_PASS1`            | `claude-haiku-4-5`   |                                                              |
+| `AI_MODEL_PASS2`            | `claude-sonnet-5`    |                                                              |
+| `AI_ESCALATE_BELOW`         | `0.6`                |                                                              |
+| `AI_CONCURRENCY`            | `3`                  |                                                              |
+| `MAX_UPLOAD_BYTES`          | `52428800`           | 50 MB                                                        |
+| `RETAIN_ORIGINALS`          | `false`              | ~10x storage if true (D-09)                                  |
+| `MAX_UPLOAD_MEGAPIXELS`     | `100`                | decompression-bomb cap, checked header-only before decode    |
+| `UPLOAD_RATE_LIMIT_PER_MIN` | `60`                 | per-user, whole-batch atomic (Phase 5)                       |
+| `INGEST_CONCURRENCY`        | `3`                  | render-worker concurrency; distinct from `AI_CONCURRENCY`    |
+| `DEFAULT_CURRENCY`          | `USD`                | no UI in v1 (D-17)                                           |
+| `BACKUP_RETENTION_DAYS`     | `30`                 |                                                              |
+| `BACKUP_INCLUDE_IMAGES`     | `false`              |                                                              |
 
 Only variables explicitly whitelisted as public are re-exported to the client.
 `ANTHROPIC_API_KEY`, `MASTER_KEY`, `DATABASE_URL`, and `CF_ACCESS_AUD` are never

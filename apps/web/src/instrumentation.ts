@@ -23,9 +23,13 @@ export async function register(): Promise<void> {
     // secrets; invoking it here is what keeps D-05/D-14 a startup guard —
     // a misconfigured process throws and exits non-zero before the server
     // ever listens, rather than failing later on some unlucky route.
+    // Imported once and reused below (for startIngestWorker) — getEnv()
+    // is itself cached after the first call, so calling it twice would
+    // have been harmless, but there's no reason to.
+    const { getEnv } = await import("@ledgerly/config/env");
+    let env: ReturnType<typeof getEnv>;
     try {
-      const { getEnv } = await import("@ledgerly/config/env");
-      getEnv();
+      env = getEnv();
     } catch (error) {
       // Without this, a throw here becomes an `unhandledRejection` that
       // Next logs and then survives: the process keeps running, binds a
@@ -45,5 +49,12 @@ export async function register(): Promise<void> {
     // calls startWorkers(env.REDIS_URL) here, replacing the processor
     // stub in packages/queue/src/worker.ts with the real pipeline.
     await import("@ledgerly/queue/worker");
+
+    // Phase 5's render-pipeline worker, by contrast, IS actually started
+    // here — unlike the Phase 6 stub above, it has a real processor
+    // (packages/queue/src/pipeline/ingest.ts) and runs with
+    // `autorun: true`.
+    const { startIngestWorker } = await import("@ledgerly/queue/ingestWorker");
+    await startIngestWorker(env.REDIS_URL);
   }
 }

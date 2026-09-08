@@ -8,8 +8,9 @@ const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Reads one key out of the repo-root `.env`. Deliberately not a general env
- * loader and deliberately not `dotenv`: only TEST_DATABASE_URL is lifted,
- * so nothing else from a developer's `.env` leaks into the test process.
+ * loader and deliberately not `dotenv`: only TEST_DATABASE_URL and
+ * TEST_REDIS_URL are lifted, so nothing else from a developer's `.env`
+ * leaks into the test process.
  */
 function readFromDotEnv(key: string): string | undefined {
   const file = path.join(repoRoot, ".env");
@@ -22,6 +23,10 @@ function readFromDotEnv(key: string): string | undefined {
 }
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL ?? readFromDotEnv("TEST_DATABASE_URL");
+// TEST_REDIS_URL (Phase 5, mirrors D-18's TEST_DATABASE_URL reasoning
+// exactly) — a dedicated throwaway Redis (scripts/test-redis.sh) rather
+// than docker-compose's `redis`, which publishes no ports.
+const testRedisUrl = process.env.TEST_REDIS_URL ?? readFromDotEnv("TEST_REDIS_URL");
 
 /**
  * Config every package's own vitest.config.ts merges in. Vitest resolves
@@ -45,6 +50,7 @@ export default defineConfig({
       // key is lifted out of the loaded file -- nothing else from .env is
       // pulled into the test environment.
       ...(testDatabaseUrl ? { TEST_DATABASE_URL: testDatabaseUrl } : {}),
+      ...(testRedisUrl ? { TEST_REDIS_URL: testRedisUrl } : {}),
 
       // packages/config/src/env.ts does `export const env =
       // parseEnv(process.env)` at module scope (that top-level evaluation

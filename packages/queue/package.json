@@ -8,8 +8,10 @@
   "exports": {
     ".": "./src/index.ts",
     "./worker": "./src/worker.ts",
+    "./ingestWorker": "./src/ingestWorker.ts",
     "./redis": "./src/redis.ts",
-    "./queue": "./src/queue.ts"
+    "./queue": "./src/queue.ts",
+    "./pipeline/render": "./src/pipeline/render.ts"
   },
   "scripts": {
     "lint": "eslint .",
@@ -17,8 +19,12 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@ledgerly/api": "workspace:*",
     "@ledgerly/config": "workspace:*",
+    "@ledgerly/db": "workspace:*",
+    "@ledgerly/shared": "workspace:*",
     "bullmq": "^5.34.0",
+    "drizzle-orm": "^0.41.0",
     "ioredis": "^5.4.2",
     "server-only": "^0.0.1",
     "sharp": "^0.33.5"
