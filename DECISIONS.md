@@ -102,7 +102,7 @@ Server Components (Forkd's sign-out page silently failed to delete the cookie),
 and clearing only the app session leaves `CF_Authorization` valid so the user is
 silently re-authenticated on the next visit.
 
-**Why.** Under D-03 there is no app session to clear, so sign-out is *only* the
+**Why.** Under D-03 there is no app session to clear, so sign-out is _only_ the
 redirect to `https://<team>/cdn-cgi/access/logout`. That is also the only thing
 that ever actually logged a Forkd user out.
 
@@ -128,6 +128,33 @@ demands exactly this — "fail loud, at startup, not at request time."
 **Consequence.** The invariant lives in the Zod env schema in
 `packages/config`: `DEV_AUTH_BYPASS === true && NODE_ENV === "production"`
 throws and the process exits non-zero. Phase 3 tests the refusal.
+
+**Amendment (Phase 3, 2026-09-08) — "throws" is not the same as "exits".**
+The first container-level test of this guard found it firing correctly and
+then _not stopping the process_. Next.js caught the throw from the
+instrumentation hook, logged it as an `unhandledRejection`, and kept
+running: the container stayed `running` with exit code 0, bound its port,
+and served 500s indefinitely. `restart: always` does not help, because
+nothing ever exits. A misconfigured deploy would sit permanently broken
+rather than crash-looping visibly. No authentication bypass occurred — Next
+refuses to serve any route once the hook fails — but D-05's actual promise
+is that _the process does not exist in the unsafe state_, and it did.
+
+Two changes make that literally true:
+
+1. `apps/web/src/instrumentation.ts` wraps the config load in a `try/catch`
+   that logs `FATAL` and calls `process.exit(1)`. Verified: the container
+   now exits with code 1 in about two seconds.
+2. The same invariant is enforced independently in
+   `packages/config/src/edge.ts`, which adds `NODE_ENV` to its literal
+   reads. The Node-side guard runs at boot in the Node runtime; the Edge
+   runtime parses its own environment separately, so without this the
+   middleware could in principle honour a production dev-bypass through
+   `edgeEnv.DEV_AUTH_BYPASS` on a process that had somehow started. Both
+   runtimes now refuse.
+
+The general lesson, worth carrying into later phases: a startup guard that
+throws has only done half its job. What matters is the exit code.
 
 ---
 
@@ -521,3 +548,252 @@ every segment a server-generated UUID. `UPLOADS_DIR` is a named volume outside
 `public/`. `/api/images/[...key]` resolves the receipt, composes with
 `scopedProjects(user)`, and returns **404** rather than 403 on a permission
 failure, so the endpoint is not an existence oracle for other users' receipts.
+
+---
+
+## D-24 — The edge middleware is a perimeter, not a trust boundary. **Settled.**
+
+**Context.** `ARCHITECTURE.md` §3.1 step 5 reads "attach identity to the
+request; continue". The obvious implementation is an `x-ledgerly-sub` header
+set by `proxy.ts` via `NextResponse.next({ request: { headers } })` and trusted
+by the Node layer. Phase 3's design pass rejected it.
+
+**Why.** That implementation makes the middleware `matcher` a security
+control. Any path the matcher fails to cover — a new route group, a Next.js
+upgrade that changes matcher semantics, an `/api/` prefix somebody adds — is a
+path where an attacker who can reach the origin sets `x-ledgerly-sub` and is
+authenticated as anyone. Matcher gaps are the most common Next.js
+authentication defect, and D-03 was taken specifically to stop relying on
+"remembered exceptions" of this kind.
+
+The second verification costs one in-memory JWKS lookup and one RSA signature
+check. D-03 already priced and accepted exactly that cost for exactly this
+reason.
+
+**Consequence.** Nothing is attached to the request. `proxy.ts` verifies the
+JWT and either rejects or calls `next()`. `resolveIdentity()` in the Node layer
+reads `Cf-Access-Jwt-Assertion` from the raw headers and verifies it again,
+independently. That is the only trust boundary in the application.
+
+A matcher gap becomes a performance regression rather than an auth bypass.
+`verifyAccessJwt` becomes a pure function over `(token, keySet)`, unit-testable
+in plain Node with no Edge Runtime shim and no HTTP mocking. Verified by
+`grep -rn 'x-ledgerly-sub\|x-user-id' apps/web/src` returning nothing.
+
+---
+
+## D-25 — `aud`, `iss`, and `alg` are pinned, and asserted twice. **Settled.**
+
+**Context.** Forkd calls `jwtVerify(token, jwks, { audience: process.env.CF_ACCESS_AUD, issuer: ... })`
+(`docs/reference/FORKD_AUTH.md` §1). `jose` **skips audience validation
+entirely when `audience` is `undefined`.**
+
+**Why.** An unset or empty `CF_ACCESS_AUD` therefore converts "reject hard on
+`aud` mismatch" into "accept any valid Cloudflare Access token from any
+application on the team" — with no error, no log line, and a green test suite.
+It is the highest-consequence failure available in this phase and it is silent,
+which is the combination that makes it worth redundant checking. `CLAUDE.md`'s
+requirement is a hard reject; a check that can be disabled by a missing
+variable does not implement it.
+
+**Consequence.** Three layers, in `packages/auth/src/cloudflareAccess.ts`:
+
+1. **Precondition.** An absent `CF_ACCESS_AUD` or `CF_ACCESS_TEAM_DOMAIN`
+   returns `not_configured` and refuses to verify. It never falls through to
+   `jwtVerify`.
+2. **`jose`.** `algorithms: ['RS256']`, `audience`, `issuer`,
+   `requiredClaims: ['sub','exp','iat','aud','iss']`, and an explicit
+   `clockTolerance: 60`. `requiredClaims` makes a token with no `exp` a
+   rejection rather than a token that never expires. `nbf` is deliberately not
+   required — `jose` validates it when present, and Cloudflare does not always
+   emit it. `clockTolerance` is set rather than inherited because
+   `FORKD_AUTH.md` §3's claim of a 60-second `jose` default is unverified and
+   has differed across major versions.
+3. **Redundant assertion.** After `jwtVerify` returns, `alg`, `aud`, and `iss`
+   are compared again against the configured values. `aud` is handled as
+   `string | string[]` — Cloudflare emits an array, so a naive `!==` rejects
+   every real token and a naive `includes` on a string matches a substring.
+
+`packages/config` additionally constrains `CF_ACCESS_AUD` to
+`/^[0-9a-f]{64}$/`, so a placeholder or empty value fails at startup rather
+than at verification time.
+
+The cost is a handful of comparisons on a path that already does RSA. The
+benefit is that no single future refactor of how config is assembled can
+silently disable the check the entire authentication model rests on.
+
+---
+
+## D-26 — A missing or empty `sub` rejects the token. **Settled.**
+
+**Context.** Forkd stores `sub: payload.sub ?? ""` (`FORKD_AUTH.md` §3). Under
+Forkd this is harmless: `sub` is decorative and email is the join key.
+
+**Why.** Under D-06 `sub` **is** the identity and carries
+`users_cf_access_sub_key`, a unique index. An empty-string `sub` would insert
+one user row and then match every subsequent subject-less token, collapsing all
+of them into a single shared account. Cloudflare **service tokens** have
+exactly this shape: `sub` is `""` and the identity is carried in
+`common_name`.
+
+**Consequence.** `verifyAccessJwt` returns `empty_subject` when `sub` is
+absent, non-string, or empty after trimming. `?? ''` appears nowhere in
+`packages/auth`. This also rejects service tokens, which is correct — Ledgerly
+has no machine-access surface — and is documented so it is not later "fixed"
+as a bug.
+
+The same rule applies to `email`: absent or empty returns `missing_email`,
+because `users.email` is `NOT NULL`.
+
+---
+
+## D-27 — Email refresh is best-effort; `ACCESS_ALLOW_SUB_RELINK` recovers an IdP migration. **Settled** (user decision).
+
+**Context.** `users_email_lower_key` is `UNIQUE (lower(email))` and D-06 keys
+identity on `sub`. That pairing creates a failure Forkd cannot reach, because
+Forkd keys on email and so cannot hold two rows in conflict.
+
+**Case A — refresh collision.** An existing user's IdP email changes to one
+another row already holds; the per-visit refresh `UPDATE` raises `23505`.
+
+**Case B — the instance-wide lockout.** The operator changes the Cloudflare
+Access identity provider. Every returning user presents a **new `sub` with
+their existing email**, so every provisioning `INSERT` collides. Everyone is
+locked out, _including the instance owner_ — which means task 3.7's owner-only
+re-link action, recorded in D-06 as the mitigation for precisely this scenario,
+cannot be reached to perform it. D-06's mitigation does not survive its own
+motivating case.
+
+**Why this resolution.** Case A must never fail a request: `sub` is unchanged,
+the user is authenticated, and the collision concerns a display attribute.
+Locking someone out over their display email is a worse outcome than a stale
+one.
+
+Case B needs a recovery path that does not require the app to be reachable by
+someone who is locked out of it. Auto-relinking on email match unconditionally
+would defeat D-06 outright — it restores email as a join key, so any IdP that
+lets a user assert an unverified address could take over an account. Documented
+recovery SQL avoids new code but means hand-editing the identity table under
+outage pressure, applying the same email-matching trust by hand and untested.
+
+Gating the behaviour on an explicit, default-off, deliberately-temporary flag
+keeps D-06's guarantee intact in the steady state and makes the dangerous path
+a supported, audited, tested operation rather than an improvisation.
+
+**Consequence.**
+
+- **Case A:** catch `23505`, keep the stale email, set `emailRefreshSkipped`,
+  log once at WARN with both `sub` values and neither address, and continue.
+- **Case B, flag off (the default):** the collision is caught and classified
+  `identity_conflict` — a clean `ACCESS_DENIED_RESPONSE` plus an `audit_log`
+  row. Never an unhandled `23505` returning a 500 with a Postgres constraint
+  name in the body.
+- **Case B, `ACCESS_ALLOW_SUB_RELINK=true`:** a new `sub` whose email matches
+  exactly one existing row is reassigned onto that row. Every reassignment
+  writes `audit_log` with both the old and the new `sub`. A match against more
+  than one row is impossible under the unique index; a match against zero rows
+  provisions normally.
+- `packages/config` logs at WARN on every boot while the flag is true, so it is
+  not left on by accident after a migration.
+- `.env.example` documents it as "off except during a deliberate identity-
+  provider migration", and `SETUP.md` carries the procedure.
+
+**Consequence, accepted.** While the flag is on, email is temporarily a join
+key and D-06's guarantee is suspended. That is the point of it being a flag,
+default false, WARN-logged at startup, and audited per write.
+
+---
+
+## D-28 — `protectedProcedure` implies onboarded. **Settled.**
+
+**Context.** The onboarding gate must block every route until `first_name` and
+`last_name` are set. The natural shape is a `requireOnboarded` middleware
+composed onto the procedures that need it.
+
+**Why the inverse.** An opt-in check fails **open** when omitted, and omission
+is the failure that actually occurs — a new router is added, the extra
+middleware is not. A default-deny ladder fails closed: forgetting to think
+about onboarding yields a blocked route, which is noticed immediately in
+development, rather than an open one, which is noticed by nobody.
+
+**Consequence.** The ladder is `publicProcedure` -> `protectedProcedure`
+(identity **and** onboarded) -> `ownerProcedure`, with `onboardingProcedure`
+as the explicit, deliberately-awkward opt-out holding exactly two members:
+`auth.me` and `auth.completeOnboarding`. Adding a third is a review trigger.
+
+For pages, the gate is `apps/web/src/app/(app)/layout.tsx`, and `/welcome`
+lives **outside** the `(app)` route group rather than being exempted from
+within it. There is no exemption list to maintain — the structural placement is
+the exemption. This is deliberately unlike Forkd's sync route, which had to be
+exempted from its own cookie check, a security-critical exception that then had
+to be remembered forever (D-03).
+
+`PHASES.md` task 3.8 lists `apps/web/src/proxy.ts` as a file for this task.
+It cannot be: the gate reads `users.onboarded_at`, middleware runs on the Edge
+Runtime, and `pg` does not. `ARCHITECTURE.md` §3.1 already places the gate in
+the Node layer after `resolveIdentity()`; that is the correct reading.
+
+`onboarded_at` is written in the same statement as `first_name` and
+`last_name`, so the two representations of "onboarded" cannot disagree.
+
+---
+
+## D-29 — JWKS cache TTL, cooldown, and fetch timeout are explicit. **Settled.**
+
+**Context.** Forkd passes no options to `createRemoteJWKSet` and relies on
+`jose`'s internal caching; `FORKD_AUTH.md` §2 records the TTL as "not
+explicitly configured... approximately 1 hour", inferred rather than set.
+
+**Why.** Under D-03 the JWKS lookup is on the path of **every request**, not
+only new logins, so its failure modes matter more here than they did in Forkd.
+`timeoutDuration` is the one that bites: without it, a JWKS endpoint that
+accepts a connection and then stalls holds every request open until something
+else times out. An inferred default is also not a default that a `jose` minor
+release is obliged to keep.
+
+**Consequence.** `cacheMaxAge` from `CF_ACCESS_JWKS_TTL_MS` (default
+3_600_000), `cooldownDuration: 30_000`, `timeoutDuration: 5_000`. The key set
+is a lazy singleton so module import does not depend on env being parsed, and
+it is passed to `verifyAccessJwt` as a parameter rather than reached through a
+module-level mutable seam — which is what makes the verifier unit-testable
+without network access or a test-only export.
+
+**Explicitly not added:** a last-known-good fallback layer. D-03 assessed and
+accepted JWKS unavailability as a lockout risk; caching stale keys past their
+TTL would quietly weaken revocation to buy back availability that decision said
+it did not need.
+
+---
+
+## D-30 — The Access middleware file is `middleware.ts`, not `proxy.ts`. **Settled.**
+
+**Context.** `ARCHITECTURE.md` §2, `docs/PHASES.md` task 3.6, and
+`docs/reference/FORKD_AUTH.md` all name this file `apps/web/src/proxy.ts` —
+Forkd's name for it, carried across during Phase 1.
+
+**Why it had to change.** Ledgerly is on Next.js 15.5.25, where the only
+recognised filename is `middleware`. There is no `PROXY_FILENAME` constant
+in that release; `proxy.ts` is the Next 16 rename. A file named `proxy.ts`
+is not an error and not a warning — it is simply never registered.
+
+That failure mode is the reason this gets its own decision rather than a
+silent rename. With `proxy.ts`, `pnpm build` succeeded, typecheck passed,
+lint passed, every unit test passed, and
+`.next/server/middleware-manifest.json` was empty: **the Cloudflare Access
+perimeter did not exist and nothing said so.** A middleware that is not
+wired up fails open and is indistinguishable from one that is, unless you
+go looking at the manifest.
+
+**Consequence.** The file is `apps/web/src/middleware.ts` with a default
+export. Registration is verified by asserting
+`.next/server/middleware-manifest.json` contains the matcher, and by the
+live probe that an unauthenticated request to a gated route returns 403 —
+not by the build succeeding, which proves nothing here.
+
+`ARCHITECTURE.md` §2's module layout still reads `proxy.ts` and should be
+corrected when that document is next revised. The framework decides this
+one, so the code is right and the document is stale.
+
+**Consequence, deferred.** When Ledgerly moves to Next 16, `middleware.ts`
+is deprecated in favour of `proxy.ts` and this decision reverses. The
+manifest assertion is what will catch it either way.

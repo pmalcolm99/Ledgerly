@@ -13,27 +13,27 @@ order), `docs/Ledgerly_Project_Plan.md` (original brief).
 
 ## 1. Stack
 
-| Layer | Choice | Version | Source |
-|---|---|---|---|
-| Runtime | Node | 22-alpine | Forkd |
-| Language | TypeScript, ESM, ES2022, `strict` | 5.x | Forkd |
-| Framework | Next.js App Router, `output: "standalone"` | 15+ | Forkd |
-| UI | React + HeroUI + TailwindCSS | 19 / 2.7 / 4.x | Forkd |
-| Icons | lucide-react | 1.x | Forkd |
-| API | **tRPC** + TanStack Query + superjson | 11 / 5 / 2 | Forkd — see D-01 |
-| Database | **PostgreSQL** | **17**-alpine | Forkd — see D-02 |
-| ORM | Drizzle ORM + drizzle-kit | 0.41 / 0.31 | Forkd |
-| Driver | `pg` (`pg.Pool`) | 8.x | Forkd |
-| Validation | Zod | 3.x | Forkd |
-| JWT | `jose` | 6.x | Forkd |
-| Jobs | **BullMQ + Redis** | 5.x / 8.x | Forkd — see D-08 |
-| Images | `sharp` (with libheif), `pdftoppm` | 0.33 | see D-11 |
-| Spreadsheets | `exceljs` | 4.x | new |
-| AI | `@anthropic-ai/sdk` | latest | Forkd |
-| Tests | Vitest | 3.x | Forkd |
-| Monorepo | pnpm workspaces + Turbo | 11 / 2.x | Forkd — see D-07 |
-| Lint / format | ESLint 9 flat config, Prettier 3 | | Forkd |
-| Secrets | secretlint (pre-commit) + gitleaks (CI) | | see D-13 |
+| Layer         | Choice                                     | Version        | Source           |
+| ------------- | ------------------------------------------ | -------------- | ---------------- |
+| Runtime       | Node                                       | 22-alpine      | Forkd            |
+| Language      | TypeScript, ESM, ES2022, `strict`          | 5.x            | Forkd            |
+| Framework     | Next.js App Router, `output: "standalone"` | 15+            | Forkd            |
+| UI            | React + HeroUI + TailwindCSS               | 19 / 2.7 / 4.x | Forkd            |
+| Icons         | lucide-react                               | 1.x            | Forkd            |
+| API           | **tRPC** + TanStack Query + superjson      | 11 / 5 / 2     | Forkd — see D-01 |
+| Database      | **PostgreSQL**                             | **17**-alpine  | Forkd — see D-02 |
+| ORM           | Drizzle ORM + drizzle-kit                  | 0.41 / 0.31    | Forkd            |
+| Driver        | `pg` (`pg.Pool`)                           | 8.x            | Forkd            |
+| Validation    | Zod                                        | 3.x            | Forkd            |
+| JWT           | `jose`                                     | 6.x            | Forkd            |
+| Jobs          | **BullMQ + Redis**                         | 5.x / 8.x      | Forkd — see D-08 |
+| Images        | `sharp` (with libheif), `pdftoppm`         | 0.33           | see D-11         |
+| Spreadsheets  | `exceljs`                                  | 4.x            | new              |
+| AI            | `@anthropic-ai/sdk`                        | latest         | Forkd            |
+| Tests         | Vitest                                     | 3.x            | Forkd            |
+| Monorepo      | pnpm workspaces + Turbo                    | 11 / 2.x       | Forkd — see D-07 |
+| Lint / format | ESLint 9 flat config, Prettier 3           |                | Forkd            |
+| Secrets       | secretlint (pre-commit) + gitleaks (CI)    |                | see D-13         |
 
 **Not adopted from Forkd:** `better-auth` (D-03), `playwright-core`,
 `chrome-headless`, `yt-dlp`, `openai`, `qrcode`, `framer-motion`. Ledgerly has
@@ -62,7 +62,7 @@ apps/
       components/               React components
       lib/                      client-safe helpers, tRPC client
       server/                   server-only helpers, shutdown hooks
-      proxy.ts                  edge middleware: CF Access JWT verification
+      middleware.ts             edge perimeter: CF Access JWT verification (D-30)
     public/                     manifest, icons, sw.js, offline.html
     next.config.ts              standalone output, CSP headers, serverExternalPackages
     instrumentation.ts          starts the in-process BullMQ workers
@@ -127,13 +127,22 @@ Browser
             issuer:   https://${CF_ACCESS_TEAM_DOMAIN}
             exp / nbf checked implicitly
        4. extract sub, email, name
-       5. attach identity to the request; continue
+       5. continue — attaching nothing to the request       (D-24)
   -> Server Component / Route Handler / tRPC procedure
-       resolveIdentity()  — React cache()-wrapped, one DB read per request
+       resolveIdentity()  — re-reads and re-verifies the JWT from the raw
+                            headers; React cache()-wrapped, one DB read
+                            per request
        -> JIT provision on first sight of a sub  (§4.2)
        -> onboarding gate: first_name or last_name null -> redirect /welcome
   -> tRPC procedure -> scopedProjects(user) -> Drizzle -> Postgres
 ```
+
+**The middleware is a perimeter, not a trust boundary.** See D-24. It rejects
+unauthenticated requests cheaply at the edge and passes nothing downstream; the
+Node layer verifies the JWT again, independently, and that second verification
+is the only trust boundary. Identity is never carried between the two in a
+request header. A middleware `matcher` gap is therefore a performance
+regression, not an auth bypass.
 
 **There is no session cookie and no session table.** See D-03. Forkd layered a
 Better Auth session on top of Access and paid for it three times over (redirect
@@ -179,6 +188,13 @@ null). Email is a mutable attribute, never a join key. See D-06.
 trivially forgeable if anything ever reaches the app off-tunnel, and carries no
 signature.
 
+A token with a missing or empty `sub` is **rejected**, never stored as `""`
+(D-26). Under D-06 an empty `sub` would match a unique index and collapse every
+subject-less token into one shared account; Cloudflare service tokens have
+exactly that shape. `aud`, `iss`, and `alg` are pinned and asserted twice, and
+an unconfigured `CF_ACCESS_AUD` refuses to verify rather than silently skipping
+the audience check (D-25).
+
 **IdP-change caveat.** If the Cloudflare Access identity provider is changed
 (Google to one-time-PIN, say), `sub` changes and the returning user is
 provisioned as a new account. Mitigation: an owner-only **"re-link account"**
@@ -206,14 +222,19 @@ a dedicated single-row `instance_state` table instead — see `docs/SCHEMA.md`
 The owner assignment is logged at WARN with the email, so the operator can
 verify the right person won.
 
+Because `users_email_lower_key` is unique and identity is `sub`, an IdP change
+gives every returning user a new `sub` with an existing email and collides on
+insert — locking out the whole instance, owner included. `ACCESS_ALLOW_SUB_RELINK`
+(default false) is the audited recovery path; see D-27.
+
 ### 4.3 Authorization at the query layer
 
 One helper, in `packages/api/src/scope.ts`:
 
 ```ts
-scopedProjects(user)          // -> a Drizzle subquery of project ids the user may see
-scopedProjects(user, "add")   // -> ... may add receipts to
-scopedProjects(user, "manage")// -> ... may manage members of
+scopedProjects(user); // -> a Drizzle subquery of project ids the user may see
+scopedProjects(user, "add"); // -> ... may add receipts to
+scopedProjects(user, "manage"); // -> ... may manage members of
 ```
 
 The instance owner short-circuits to "all projects". Everyone else gets the
@@ -223,7 +244,9 @@ its own permission check. The permission matrix and its exact semantics live in
 `docs/SCHEMA.md` §project_members.
 
 tRPC procedure ladder, mirroring Forkd's: `publicProcedure` ->
-`protectedProcedure` (identity present) -> `ownerProcedure` (instance owner).
+`protectedProcedure` (identity present **and** onboarded) -> `ownerProcedure`
+(instance owner). `onboardingProcedure` is the explicit opt-out from the
+onboarding requirement and holds exactly two members (D-28).
 Per-project permission is never expressed as a procedure — it is expressed as a
 scope composed into the query, because that is the check that cannot be
 forgotten.
@@ -286,10 +309,10 @@ Runs in the BullMQ worker, never in a request. See D-08.
 
 ### 6.1 The ladder
 
-| Pass | Model (env) | Default | When |
-|---|---|---|---|
-| 1 | `AI_MODEL_PASS1` | `claude-haiku-4-5` | every receipt |
-| 2 | `AI_MODEL_PASS2` | `claude-sonnet-5` | pass 1 returned null `total`, null `transaction_date`, zero items, or `confidence < AI_ESCALATE_BELOW` (default 0.6) |
+| Pass | Model (env)      | Default            | When                                                                                                                 |
+| ---- | ---------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| 1    | `AI_MODEL_PASS1` | `claude-haiku-4-5` | every receipt                                                                                                        |
+| 2    | `AI_MODEL_PASS2` | `claude-sonnet-5`  | pass 1 returned null `total`, null `transaction_date`, zero items, or `confidence < AI_ESCALATE_BELOW` (default 0.6) |
 
 Model IDs are exact and carry no date suffix. Both are env-tunable so the ladder
 can be re-pointed without a code change. See D-12 for why these two, and for the
@@ -373,29 +396,31 @@ The schema is also where cross-field invariants live:
 
 ### 7.2 Key variables
 
-| Variable | Default | Notes |
-|---|---|---|
-| `APP_PORT` | 3000 | host bind and container port (D-16) |
-| `APP_HOSTNAME` | — | public hostname; used for absolute URLs (D-16) |
-| `DATABASE_URL` | — | composed in compose from `POSTGRES_*` |
-| `REDIS_URL` | `redis://redis:6379` | |
-| `MASTER_KEY` | — | 32 bytes base64; encrypts `app_config`. Back up out-of-band |
-| `UPLOADS_DIR` | `/app/uploads` | named volume |
-| `BACKUPS_DIR` | `/app/backups` | named volume |
-| `CF_ACCESS_ENABLED` | `false` | |
-| `CF_ACCESS_AUD` | — | never committed |
-| `CF_ACCESS_TEAM_DOMAIN` | — | never committed |
-| `DEV_AUTH_BYPASS` | `false` | hard-fails under production |
-| `ANTHROPIC_API_KEY` | — | server-side only |
-| `AI_MODEL_PASS1` | `claude-haiku-4-5` | |
-| `AI_MODEL_PASS2` | `claude-sonnet-5` | |
-| `AI_ESCALATE_BELOW` | `0.6` | |
-| `AI_CONCURRENCY` | `3` | |
-| `MAX_UPLOAD_BYTES` | `52428800` | 50 MB |
-| `RETAIN_ORIGINALS` | `false` | ~10x storage if true (D-09) |
-| `DEFAULT_CURRENCY` | `USD` | no UI in v1 (D-17) |
-| `BACKUP_RETENTION_DAYS` | `30` | |
-| `BACKUP_INCLUDE_IMAGES` | `false` | |
+| Variable                  | Default              | Notes                                                        |
+| ------------------------- | -------------------- | ------------------------------------------------------------ |
+| `APP_PORT`                | 3000                 | host bind and container port (D-16)                          |
+| `APP_HOSTNAME`            | —                    | public hostname; used for absolute URLs (D-16)               |
+| `DATABASE_URL`            | —                    | composed in compose from `POSTGRES_*`                        |
+| `REDIS_URL`               | `redis://redis:6379` |                                                              |
+| `MASTER_KEY`              | —                    | 32 bytes base64; encrypts `app_config`. Back up out-of-band  |
+| `UPLOADS_DIR`             | `/app/uploads`       | named volume                                                 |
+| `BACKUPS_DIR`             | `/app/backups`       | named volume                                                 |
+| `CF_ACCESS_ENABLED`       | `false`              |                                                              |
+| `CF_ACCESS_AUD`           | —                    | never committed                                              |
+| `CF_ACCESS_TEAM_DOMAIN`   | —                    | never committed                                              |
+| `CF_ACCESS_JWKS_TTL_MS`   | `3600000`            | JWKS `cacheMaxAge`; explicit, not inherited (D-29)           |
+| `ACCESS_ALLOW_SUB_RELINK` | `false`              | IdP-migration recovery only; WARNs at boot while true (D-27) |
+| `DEV_AUTH_BYPASS`         | `false`              | hard-fails under production                                  |
+| `ANTHROPIC_API_KEY`       | —                    | server-side only                                             |
+| `AI_MODEL_PASS1`          | `claude-haiku-4-5`   |                                                              |
+| `AI_MODEL_PASS2`          | `claude-sonnet-5`    |                                                              |
+| `AI_ESCALATE_BELOW`       | `0.6`                |                                                              |
+| `AI_CONCURRENCY`          | `3`                  |                                                              |
+| `MAX_UPLOAD_BYTES`        | `52428800`           | 50 MB                                                        |
+| `RETAIN_ORIGINALS`        | `false`              | ~10x storage if true (D-09)                                  |
+| `DEFAULT_CURRENCY`        | `USD`                | no UI in v1 (D-17)                                           |
+| `BACKUP_RETENTION_DAYS`   | `30`                 |                                                              |
+| `BACKUP_INCLUDE_IMAGES`   | `false`              |                                                              |
 
 Only variables explicitly whitelisted as public are re-exported to the client.
 `ANTHROPIC_API_KEY`, `MASTER_KEY`, `DATABASE_URL`, and `CF_ACCESS_AUD` are never
@@ -525,22 +550,29 @@ until the user cleared site data.
 
 ## 10. Deviations from Forkd — index
 
-| ID | Deviation |
-|---|---|
-| D-01 | tRPC retained over the brief's Express/Fastify |
-| D-02 | PostgreSQL 17, not 16 |
-| D-03 | No Better Auth, no session table, no session cookie |
-| D-04 | Sign-out is only the Access logout redirect |
-| D-05 | `DEV_AUTH_BYPASS` fails at startup, not per-request |
-| D-06 | Identity keyed on `sub`, not email |
-| D-07 | Monorepo retained |
-| D-08 | BullMQ + Redis retained |
-| D-11 | `sharp`+libheif over `heic-convert`; `poppler-utils` added |
-| D-13 | gitleaks in CI alongside secretlint |
-| D-14 | Zod env validation at startup |
-| D-15 | Deep healthcheck |
-| D-16 | `APP_PORT` / `APP_HOSTNAME` naming |
-| D-18 | Isolated test database |
-| D-19 | Receipt pipeline rewritten, scaffolding ported |
+| ID   | Deviation                                                               |
+| ---- | ----------------------------------------------------------------------- |
+| D-01 | tRPC retained over the brief's Express/Fastify                          |
+| D-02 | PostgreSQL 17, not 16                                                   |
+| D-03 | No Better Auth, no session table, no session cookie                     |
+| D-04 | Sign-out is only the Access logout redirect                             |
+| D-05 | `DEV_AUTH_BYPASS` fails at startup, not per-request                     |
+| D-06 | Identity keyed on `sub`, not email                                      |
+| D-07 | Monorepo retained                                                       |
+| D-08 | BullMQ + Redis retained                                                 |
+| D-11 | `sharp`+libheif over `heic-convert`; `poppler-utils` added              |
+| D-13 | gitleaks in CI alongside secretlint                                     |
+| D-14 | Zod env validation at startup                                           |
+| D-15 | Deep healthcheck                                                        |
+| D-16 | `APP_PORT` / `APP_HOSTNAME` naming                                      |
+| D-18 | Isolated test database                                                  |
+| D-19 | Receipt pipeline rewritten, scaffolding ported                          |
+| D-24 | Edge middleware is a perimeter; the Node layer re-verifies              |
+| D-25 | `aud`/`iss`/`alg` pinned and asserted twice; unconfigured `aud` refuses |
+| D-26 | Missing or empty `sub` rejects the token                                |
+| D-27 | Best-effort email refresh; `ACCESS_ALLOW_SUB_RELINK` for IdP migration  |
+| D-28 | `protectedProcedure` implies onboarded                                  |
+| D-29 | Explicit JWKS TTL, cooldown, and fetch timeout                          |
+| D-30 | Middleware file is `middleware.ts`; `proxy.ts` is inert on Next 15      |
 
 Full rationale for each in `DECISIONS.md`.
