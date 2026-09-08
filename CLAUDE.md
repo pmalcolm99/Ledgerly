@@ -1,8 +1,7 @@
 # Ledgerly
 
-Receipt capture and spend tracking. Self-hosted PWA behind Cloudflare Tunnel
-
-- Cloudflare Access, with Claude-powered receipt extraction.
+Receipt capture and spend tracking. Self-hosted PWA behind a Cloudflare
+Tunnel and Cloudflare Access, with Claude-powered receipt extraction.
 
 Architecturally modeled on Forkd (`/Users/pmalcolm/Documents/Forkd`).
 
