@@ -4,7 +4,8 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 8 — Export. **Code complete and reviewed.** Data leaves the system for
+Phase 8 — Export, plus two follow-up requests (D-39 admin-settable Claude API
+key, D-40 the new app icon). **Code complete and reviewed.** Data leaves the system for
 the first time: `GET /api/projects/[id]/export?format=xlsx|csv` streams a
 three-sheet workbook (Line Items, Receipts, Summary) or the line-item sheet as
 CSV, respecting whatever filter is on the dashboard, audited on the way out.
@@ -20,6 +21,70 @@ here. Two sample workbooks were generated for it and are in `docs/private/`
 Phase 7 remains ungated for its own reason (usable on your phone through the
 tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
 `ANTHROPIC_API_KEY`); D-12 stays Provisional.
+
+## Post-Phase-8 work — admin-settable API key, and a new app icon
+
+Two unrelated requests, done together and reviewed together.
+
+### D-39 — the Claude API key is settable from the admin screen
+
+`app_config` finally has its first writer. `packages/api/src/secrets.ts` is
+AES-256-GCM over `MASTER_KEY`, blob layout `version || iv || tag ||
+ciphertext`, fresh IV per write, with the version byte as AAD so it cannot be
+downgraded once a version 2 exists. Resolution is `app_config` -> env ->
+nothing, **stored wins**, and the worker resolves per job (caching the
+`Anthropic` client on the resolved secret) so a saved key takes effect on the
+next receipt rather than the next container recreate.
+
+The key is write-only over the API: `admin.aiKey` returns `AiKeyDescription`,
+a type with **no field capable of holding a secret**, so a later edit cannot
+leak one by accident. The only representation a user sees is the last four
+characters.
+
+`ANTHROPIC_API_KEY` is now optional in `packages/config` — a fresh instance
+has to boot with no key or the screen that sets one is unreachable. That is a
+deliberate narrowing of D-14 for one variable, compensated with three visible
+signals. See D-39.
+
+### D-40 — the app icon is a committed source image
+
+`apps/web/assets/icon-source.png` is the source of truth; every raster is
+derived from it by `scripts/generate-icons.ts`. Three corrections the supplied
+art needed, all in the generator rather than hand-edited into the PNG: iOS
+paints black behind transparency (so `apple-icon` is flattened and fills its
+square), Android crops maskable icons to a circle (so that one is flattened
+and inset 10%), and the tile was neither square nor centred in its canvas
+(measured from the alpha channel and re-centred, rather than `sharp`'s
+`.trim()`, which preserves the off-centre framing). 256-colour quantisation
+took the icon set from 580KB to 263KB and the splash set from 2.53MB to
+1.12MB, verified visually identical (mean per-channel error ~5/255) — the
+service worker precaches all three icons, so this is not cosmetic.
+
+### Review — what was found and what was done
+
+No high findings. The key-leak axis was traced clean: tRPC return types, the
+`errorFormatter`, superjson, zod issue payloads, the transport (mutations
+cannot go over GET, so no access-log exposure), the client bundle, PWA
+storage, and the worker's new log line. Two mediums, both recovery rather than
+disclosure, and six lows. All fixed.
+
+| Sev | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Fix                                                                                                                                                                                                                                                                                                                                                                 |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Med | **An undecryptable stored key locked the owner out of the only screen that could fix it.** Rotate `MASTER_KEY` or restore a dump under a different one, and `admin.aiKey` threw; `AiKeyCard` rendered its error branch, where Save and Clear did not exist. The only way back was `psql`. The worker made it worse: a non-`ExtractError` was treated as retryable, so every receipt burned three attempts and reported the generic `AI_EXTRACTION_FAILED`. | `undecryptable` is now a fourth `AiKeySource` rather than an exception; the card renders the same Save/Clear form on the error path (neither mutation reads the row, so both work on ciphertext); the worker gets a distinct non-retryable `ANTHROPIC_KEY_UNDECRYPTABLE`. Deliberately does NOT fall back to the env key.                                           |
+| Med | **Receipts that failed for want of a key were stranded permanently** — exactly D-39's headline scenario. `reconcilePendingExtractions` sweeps only `pending`; these are `failed`. The UI said "new uploads use it immediately", quietly excluding the entire backlog.                                                                                                                                                                                      | `setAiKey`/`clearAiKey` reset every live receipt whose `extraction_error` is a key-blocked code back to `pending` and re-enqueue via `ctx.enqueueReceiptExtract`. Best-effort — the capability is optional and a Redis failure must not fail the key change, so the rows are left `pending` for the boot sweep regardless. The success message now names the count. |
+| Low | `ANTHROPIC_KEY_NOT_CONFIGURED` had **no user-facing label**, so the third of D-39's "three visible signals" did not actually exist — it fell through to the generic "Extraction failed."                                                                                                                                                                                                                                                                   | Both key-blocked codes added to `receiptLabels.ts`, each naming the fix rather than the symptom.                                                                                                                                                                                                                                                                    |
+| Low | The **format version byte was read before authentication and covered by nothing**. Not exploitable at version 1; a free downgrade the moment a version 2 exists.                                                                                                                                                                                                                                                                                           | `setAAD` on both sides, plus a test. Done now because it cannot be retrofitted once rows exist in the wild.                                                                                                                                                                                                                                                         |
+| Low | `secretsMatch` was **dead code** whose comment promised constant time while branching on length.                                                                                                                                                                                                                                                                                                                                                           | Deleted.                                                                                                                                                                                                                                                                                                                                                            |
+| Low | `readSecretMetadata`'s comment claimed the UI path never holds the plaintext; `describeAiKey` decrypts to compute four characters.                                                                                                                                                                                                                                                                                                                         | Comment corrected to say what is actually true, and why it is still safe.                                                                                                                                                                                                                                                                                           |
+| Low | `clearAiKey` **audited a clear that may not have happened** — an append-only log asserting an effect that did not occur.                                                                                                                                                                                                                                                                                                                                   | `deleteSecret` returns whether a row existed; the audit row and the requeue are conditional on it.                                                                                                                                                                                                                                                                  |
+| Low | The worker's new key path had **no test**, and the reason code crosses three hops (`ExtractError` -> `UnrecoverableError.message` -> the `failed` handler).                                                                                                                                                                                                                                                                                                | `packages/queue/src/workerKey.test.ts` pins the reason codes, their non-retryability, the per-job pickup, and the one-entry cache.                                                                                                                                                                                                                                  |
+
+One repo-hygiene note from the review acted on: the 1.3MB `ledgerly icon.png`
+at the repo root was untracked and un-ignored, byte-identical to the committed
+`apps/web/assets/icon-source.png`, and would have been swept in by `git add
+-A`. Removed.
+
+**607 unit tests**, up from 594.
 
 ## Phase 8 review — what was found and what was done
 

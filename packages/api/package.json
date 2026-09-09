@@ -12,7 +12,9 @@
     "./scope": "./src/scope.ts",
     "./storage": "./src/storage.ts",
     "./rateLimit": "./src/rateLimit.ts",
-    "./export": "./src/export/index.ts"
+    "./export": "./src/export/index.ts",
+    "./aiKey": "./src/aiKey.ts",
+    "./secrets": "./src/secrets.ts"
   },
   "scripts": {
     "lint": "eslint .",

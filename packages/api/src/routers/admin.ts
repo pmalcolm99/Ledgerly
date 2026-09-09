@@ -1,6 +1,6 @@
 import "server-only";
 
-import { asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import {
@@ -12,12 +12,17 @@ import {
   receipts,
   users,
 } from "@ledgerly/db/schema";
+import { getEnv } from "@ledgerly/config/env";
 import { displayNameOf } from "@ledgerly/shared/personName";
 
+import { describeAiKey, validateAiKeyShape } from "../aiKey";
+import { recordAudit } from "../audit";
 import { isUniqueViolation } from "../errors";
 import { NEEDS_REVIEW_SQL } from "../receiptAccess";
 import { scopedProjects } from "../scope";
+import { SECRET_KEYS, deleteSecret, writeSecret } from "../secrets";
 import { ownerProcedure, router } from "../trpc";
+import type { Context } from "../trpc";
 
 /**
  * $/MTok, matched by substring against `model` (same convention as
@@ -367,4 +372,186 @@ export const adminRouter = router({
 
       return rows;
     }),
+  /**
+   * The Claude API key's STATUS — never the key.
+   *
+   * `describeAiKey` returns a type with no field that can hold a secret (see
+   * aiKey.ts), which is what makes this procedure safe by construction rather
+   * than by the author remembering to strip a field. What reaches the client
+   * is: where the key came from, its last four characters, and who set it.
+   *
+   * `ownerProcedure`, like everything else on this screen. A key that any
+   * member could read the shape of, or worse replace, would be a
+   * spend-and-data-exfiltration lever on a shared instance.
+   */
+  aiKey: ownerProcedure.query(async ({ ctx }) => {
+    const env = getEnv();
+    const description = await describeAiKey(ctx.db, env.MASTER_KEY, env.ANTHROPIC_API_KEY);
+
+    let updatedByName: string | null = null;
+    if (description.updatedBy) {
+      const [row] = await ctx.db
+        .select({
+          displayName: users.displayName,
+          firstName: users.firstName,
+          lastName: users.lastName,
+        })
+        .from(users)
+        .where(eq(users.id, description.updatedBy))
+        .limit(1);
+      // No email in the fallback chain: this is a settings screen, not the
+      // user directory, and it does not need to disclose an address.
+      updatedByName = row ? displayNameOf({ ...row, email: null }) : null;
+    }
+
+    return {
+      source: description.source,
+      hint: description.hint,
+      updatedAt: description.updatedAt,
+      updatedByName,
+      /** True when an env fallback exists, so the UI can say what "Clear"
+       *  will actually fall back TO rather than implying it disables AI. */
+      hasEnvFallback: env.ANTHROPIC_API_KEY.length > 0,
+    };
+  }),
+
+  /**
+   * Stores a Claude API key, encrypted with `MASTER_KEY` (docs/SCHEMA.md
+   * §app_config). Write-only: there is no procedure anywhere that returns it.
+   *
+   * The audit row records that the key changed and nothing about its value —
+   * not even the hint. `audit.ts`'s contract is that metadata never carries
+   * secrets, and a hint accumulated across many rows is a slow leak.
+   */
+  setAiKey: ownerProcedure
+    .input(z.object({ apiKey: z.string().min(1).max(512) }))
+    .mutation(async ({ ctx, input }) => {
+      const validated = validateAiKeyShape(input.apiKey);
+      if (!validated.ok) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: validated.message });
+      }
+
+      const env = getEnv();
+      await ctx.db.transaction(async (tx) => {
+        await writeSecret(
+          tx,
+          SECRET_KEYS.anthropicApiKey,
+          validated.key,
+          env.MASTER_KEY,
+          ctx.user.id,
+        );
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.updated",
+          entityType: "app_config",
+          // `audit_log.entity_id` is uuid-typed and this table is keyed by
+          // text, so the key name goes in metadata and entityId stays null.
+          entityId: null,
+          metadata: { key: SECRET_KEYS.anthropicApiKey, via: "admin.setAiKey" },
+        });
+      });
+
+      // Every receipt that failed purely because there was no usable key is
+      // now extractable. Without this, D-39's own headline scenario — boot a
+      // fresh instance, upload receipts, then set the key — strands the whole
+      // backlog: `reconcilePendingExtractions` only sweeps `pending`, and
+      // these are `failed`. The user would have to find and re-extract each
+      // one by hand, from a screen that does not say why they failed.
+      const requeued = await requeueKeyBlockedReceipts(ctx);
+      return { ok: true as const, requeued };
+    }),
+
+  /** Removes the stored key, falling back to `ANTHROPIC_API_KEY` from the
+   *  environment if one is set — or to no key at all, which fails extraction
+   *  with a named reason rather than silently.
+   *
+   *  Also the recovery path when `MASTER_KEY` no longer matches the stored
+   *  row: this never reads the row, so it works on ciphertext nobody can
+   *  decrypt. */
+  clearAiKey: ownerProcedure.mutation(async ({ ctx }) => {
+    const cleared = await ctx.db.transaction(async (tx) => {
+      const removed = await deleteSecret(tx, SECRET_KEYS.anthropicApiKey);
+      // Only audit an effect that actually happened. An append-only log whose
+      // rows assert clears that cleared nothing is a log you cannot reason
+      // from later.
+      if (removed) {
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.cleared",
+          entityType: "app_config",
+          entityId: null,
+          metadata: { key: SECRET_KEYS.anthropicApiKey, via: "admin.clearAiKey" },
+        });
+      }
+      return removed;
+    });
+
+    // Falling back to a working env key unblocks the same backlog that
+    // setting a key does.
+    const requeued = cleared ? await requeueKeyBlockedReceipts(ctx) : 0;
+    return { ok: true as const, cleared, requeued };
+  }),
 });
+
+/**
+ * The `extraction_error` reason codes that mean "this receipt failed only
+ * because there was no usable API key". Shared with `packages/queue`'s worker
+ * by value rather than by import — `api` cannot import `queue` (D-07) — so
+ * `worker.ts` and this list must be changed together. Both are covered by
+ * `aiKey.test.ts`.
+ */
+const KEY_BLOCKED_ERRORS = ["ANTHROPIC_KEY_NOT_CONFIGURED", "ANTHROPIC_KEY_UNDECRYPTABLE"];
+
+/**
+ * Re-enqueues every live receipt whose extraction failed only because no
+ * usable key was available, and returns how many.
+ *
+ * `extraction_status` is set back to `pending` inside the same transaction as
+ * the enqueue decision, for the reason Phase 6's review finding M-2 records:
+ * `receipt-extract` dedupes on `jobId: receiptId`, so a collision with an
+ * in-flight job is harmless to observe, and a `pending` row is what the
+ * startup reconciliation sweep treats as its backstop if the enqueue itself
+ * is lost.
+ *
+ * Best-effort by design: `ctx.enqueueReceiptExtract` is an optional capability
+ * (it is absent in tests and in the RSC caller), and a Redis failure here must
+ * not fail the key change the operator actually asked for. The receipts are
+ * left `pending`, which the boot sweep will pick up.
+ */
+async function requeueKeyBlockedReceipts(
+  ctx: Pick<Context, "db" | "enqueueReceiptExtract">,
+): Promise<number> {
+  const blocked = await ctx.db
+    .update(receipts)
+    .set({ extractionStatus: "pending", extractionError: null, updatedAt: new Date() })
+    .where(
+      and(
+        isNull(receipts.deletedAt),
+        eq(receipts.extractionStatus, "failed"),
+        inArray(receipts.extractionError, KEY_BLOCKED_ERRORS),
+      ),
+    )
+    .returning({ id: receipts.id });
+
+  if (blocked.length === 0) return 0;
+
+  const enqueue = ctx.enqueueReceiptExtract;
+  if (!enqueue) {
+    console.warn(
+      `[ledgerly] ${blocked.length} receipt(s) reset to pending after an API key change, but no ` +
+        "queue is wired into this context — the worker's startup sweep will pick them up.",
+    );
+    return blocked.length;
+  }
+
+  for (const row of blocked) {
+    try {
+      // `forcePass2: false` — this is a retry of a call that never happened,
+      // not an escalation. The ladder decides for itself.
+      await enqueue({ receiptId: row.id, forcePass2: false });
+    } catch (error) {
+      console.error(`[ledgerly] failed to re-enqueue receipt ${row.id} after a key change:`, error);
+    }
+  }
+  return blocked.length;
+}

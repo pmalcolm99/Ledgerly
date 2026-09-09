@@ -39,7 +39,39 @@ describe("parseEnv", () => {
     expect(error).toBeDefined();
     expect(error?.message).toContain("DATABASE_URL");
     expect(error?.message).toContain("MASTER_KEY");
-    expect(error?.message).toContain("ANTHROPIC_API_KEY");
+    // NOT ANTHROPIC_API_KEY — it is optional since D-39, because the admin
+    // screen can set it and an instance has to boot before that screen is
+    // reachable. The assertion is kept as a negative so the change is
+    // deliberate rather than something a later edit can quietly undo.
+    expect(error?.message).not.toContain("ANTHROPIC_API_KEY");
+  });
+
+  /**
+   * D-39. The key moved from "refuse to boot" to "warn, and say where it can
+   * be set" — the fallback chain is app_config -> env -> nothing, and only
+   * the running app can see app_config.
+   */
+  it("defaults ANTHROPIC_API_KEY to empty and warns rather than refusing to boot (D-39)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const env = parseEnv(baseEnv({ ANTHROPIC_API_KEY: undefined }));
+      expect(env.ANTHROPIC_API_KEY).toBe("");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("ANTHROPIC_API_KEY is not set"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not warn about the AI key when one is present", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      parseEnv(baseEnv({ ANTHROPIC_API_KEY: "sk-ant-testkey-0123456789" }));
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("ANTHROPIC_API_KEY is not set"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("throws when DEV_AUTH_BYPASS=true and NODE_ENV=production (D-05)", () => {

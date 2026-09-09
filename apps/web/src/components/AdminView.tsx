@@ -6,6 +6,7 @@ import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
 import { Database, HardDriveDownload } from "lucide-react";
 
 import { trpc } from "../lib/trpc";
+import { AiKeyCard } from "./AiKeyCard";
 
 /**
  * apps/web/src/components/AdminView.tsx — brief §7: all projects, all users,
@@ -26,6 +27,8 @@ export function AdminView() {
         <Stat label="Receipts" value={overview.data?.totals.receiptCount} />
         <Stat label="Need review" value={overview.data?.totals.needsReviewCount} />
       </div>
+
+      <AiKeyCard />
 
       <Card shadow="sm">
         <CardBody className="gap-3 p-4">

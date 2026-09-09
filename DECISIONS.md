@@ -1074,3 +1074,123 @@ routinely exceed it. The cost is a possibly-visible apostrophe on the handful
 of cells that need one. The XLSX path was verified unaffected — ExcelJS types a
 JS string as `Cell.Types.String` unconditionally, and a formula requires an
 explicit `{formula: …}`.
+
+---
+
+## D-39 — The Anthropic API key is settable from the admin screen, and `ANTHROPIC_API_KEY` becomes optional. **Settled** (user decision).
+
+**Context.** The key was environment-only: `packages/config` required it, and
+`packages/queue/src/worker.ts` built one `Anthropic` client from it at worker
+startup. Changing it meant editing `.env` and recreating the container. The
+user asked for it to be settable from the admin page.
+
+**Why `app_config`.** The table already existed for exactly this — encrypted
+key-value settings keyed with `MASTER_KEY` (`docs/SCHEMA.md` §app_config) —
+and had never been written to. `packages/api/src/secrets.ts` is the first
+writer: AES-256-GCM, `version || iv || tag || ciphertext`, a fresh random IV
+per write. GCM rather than CBC because it is authenticated: a tampered row
+fails to decrypt rather than yielding attacker-influenced plaintext that is
+then used as an API key. The property `docs/SCHEMA.md` promises — a stolen
+`pg_dump` yields ciphertext and nothing else, because `MASTER_KEY` is backed
+up out-of-band — is asserted directly in `secrets.test.ts`.
+
+**Resolution order: `app_config` -> env -> nothing.** The stored value wins.
+An operator who types a key into the screen and watches the environment
+silently override it has no way to diagnose that; the reverse — environment as
+a bootstrap default the UI can supersede — is explainable, and it is what makes
+the screen useful on an instance that already has an env key.
+
+**Consequence, and the part that is a real narrowing of an earlier decision.**
+`ANTHROPIC_API_KEY` is no longer required, because a fresh instance has to be
+able to boot with no key at all or the screen that sets one is unreachable.
+That weakens D-14's "refuse to boot on a missing required variable" for this
+one variable. Accepted deliberately, and compensated with three visible
+signals in place of one fatal one: a WARN at every boot when the environment
+variable is empty, a "Not configured" banner on the admin screen, and a
+non-retryable job failure with the reason code `ANTHROPIC_KEY_NOT_CONFIGURED`
+that leaves the receipt in the review queue with its images intact. Every other
+required variable keeps the old behaviour — this is a carve-out, not a change
+of policy.
+
+**Consequence.** The worker resolves the key **per job** rather than once at
+startup, caching the `Anthropic` client keyed on the resolved secret so a key
+change drops the old client instead of accumulating one. Without this, a key
+saved from the UI would not take effect until the container was recreated, and
+the symptom would be "I saved the key and extraction still fails" with a
+restart as the undocumented fix. The cost is one indexed row read plus a
+decrypt per receipt.
+
+**Consequence.** The key is write-only over the API. `admin.aiKey` returns a
+type with no field capable of holding a secret (`AiKeyDescription`), so no
+future edit can leak one through it by accident; the only representation a
+user ever sees is the last four characters and a length. The audit rows
+(`app_config.updated`, `app_config.cleared`) name the config key and never its
+value — not even the hint, since hints accumulated across many rows are a slow
+leak.
+
+**Consequence, accepted.** `packages/queue` now imports `@ledgerly/api/aiKey`.
+That direction is already the established one (`queue` depends on `api`,
+ARCHITECTURE.md §2.1) and introduces no cycle.
+
+**Consequence — `undecryptable` is a fourth state, not an error.** Rotate
+`MASTER_KEY`, or restore a `pg_dump` onto an instance holding a different one,
+and the stored row is ciphertext nobody can read. Three rules follow, all found
+by the review of this change:
+
+- It does **not** fall back to the environment key. Quietly extracting with a
+  different key would bury the fact that `MASTER_KEY` is wrong for this
+  database, and the next thing the operator would notice is an empty
+  `app_config` after some later restore.
+- The admin screen must still render its Save and Clear controls when the
+  status read fails, because it is the only screen that can fix the row.
+  Neither mutation reads the row, so both work on ciphertext.
+- It gets its own reason code, `ANTHROPIC_KEY_UNDECRYPTABLE`, distinct from
+  `ANTHROPIC_KEY_NOT_CONFIGURED` — "restore the right MASTER_KEY or clear the
+  row" is nothing like "go and set a key".
+
+**Consequence — setting a key re-extracts the backlog.** D-39's own headline
+scenario is: boot a fresh instance, upload receipts, then set the key. Those
+receipts are `failed`, and the worker's startup reconciliation sweep only
+looks at `pending`, so without this they would stay failed forever and have to
+be re-extracted by hand. `admin.setAiKey` (and a `clearAiKey` that falls back
+to a working env key) resets every live receipt whose `extraction_error` is one
+of the two key-blocked codes to `pending` and re-enqueues it. Best-effort: the
+queue is an optional context capability, and a Redis failure must not fail the
+key change, so the receipts are left `pending` for the boot sweep either way.
+
+---
+
+## D-40 — The app icon is a committed source image, not drawn in code. **Settled** (user decision).
+
+**Context.** Task 7.9's icons were generated from an inline SVG in
+`scripts/generate-icons.ts`, so the mark existed only as code. The user
+supplied a rendered PNG.
+
+**Why a source file.** `apps/web/assets/icon-source.png` is now the single
+source of truth and every raster output is derived from it, so replacing the
+brand mark is a one-file swap plus `pnpm --filter @ledgerly/web icons` — no
+code edit. The generator keeps producing every output, so the filenames and
+the iOS splash `<link>` media queries still cannot drift from each other.
+
+**Consequence — three corrections the generator applies, none of them
+cosmetic.** The supplied art is a rounded tile on a transparent field, and
+each platform mishandles that differently:
+
+1. **iOS paints black behind transparency.** `apple-icon.png` is flattened
+   onto the tile colour and fills its whole square; iOS applies its own corner
+   mask. A transparent-cornered apple-touch-icon installs with black corners.
+2. **Android crops maskable icons to a circle** inscribed in the middle 80%.
+   `icon-maskable.png` is flattened and inset 10%, or the launcher clips the
+   design's scan-bracket corners off.
+3. **The tile was neither square nor centred** in the source canvas
+   (1134x1116 at an asymmetric offset within 1254x1254). The generator measures
+   the alpha bounding box and re-centres on a square, rather than hardcoding a
+   crop, so a future replacement with different padding still lands centred.
+   `sharp`'s `.trim()` is not used: it trims to the bounding box, which
+   preserves the off-centre framing that is visible at favicon sizes.
+
+**Consequence, accepted.** The artwork is detailed — a receipt with printed
+rules, a cart glyph and a dollar sign — and at a 16px browser-tab favicon it
+reads as a shape rather than a picture. That is a property of the mark, not of
+the pipeline, and is left as-is rather than silently substituting a simplified
+glyph that would then disagree with the home-screen icon.

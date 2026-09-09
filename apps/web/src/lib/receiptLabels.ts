@@ -82,6 +82,12 @@ const EXTRACTION_ERROR_LABELS: Record<string, string> = {
   AI_INVALID_RESPONSE: "The extraction service returned something unreadable.",
   EXTRACTION_RENDER_FAILED: "Couldn't prepare the image for extraction.",
   AI_EXTRACTION_FAILED: "Extraction failed.",
+  // D-39. These are the two states where nothing was wrong with the receipt
+  // at all, so the message names the fix rather than the symptom.
+  ANTHROPIC_KEY_NOT_CONFIGURED:
+    "No Claude API key is configured, so this couldn't be read. An instance owner can set one in Admin → Claude API key; saving it re-extracts this receipt automatically.",
+  ANTHROPIC_KEY_UNDECRYPTABLE:
+    "The stored Claude API key can't be decrypted — MASTER_KEY doesn't match this database. An instance owner can restore the right MASTER_KEY, or clear and re-enter the key in Admin.",
 };
 
 export function extractionErrorLabel(error: string | null): string | null {

@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
+import { resolveAiKey } from "@ledgerly/api/aiKey";
 import { receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
 
@@ -79,7 +80,43 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
 
   const env = getEnv();
   const db = getDb();
-  const anthropicClient = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, maxRetries: 0 });
+
+  /**
+   * The API key is resolved PER JOB, not once at startup.
+   *
+   * Since D-39 the key can be set from the admin screen into `app_config`,
+   * which means a client constructed at boot would keep using a key the
+   * operator has since replaced — and the symptom would be "I saved the key
+   * and extraction still fails", with a restart as the undocumented fix.
+   * Resolving per job costs one indexed row read and a decrypt.
+   *
+   * The `Anthropic` client itself is still cached, keyed on the resolved
+   * secret: building one per job would discard its connection pool on every
+   * receipt. The cache holds exactly one entry, so a key change drops the
+   * old client rather than accumulating one per key ever seen.
+   */
+  let cached: { key: string; client: Anthropic } | undefined;
+
+  async function anthropicForJob(): Promise<Anthropic> {
+    const { apiKey, source } = await resolveAiKey(db, env.MASTER_KEY, env.ANTHROPIC_API_KEY);
+    if (source === "undecryptable") {
+      // A stored key exists but MASTER_KEY cannot read it. Its own reason
+      // code, not the generic one: the fix is "restore the right MASTER_KEY,
+      // or clear the row", which is nothing like "go and set a key".
+      throw new ExtractError("ANTHROPIC_KEY_UNDECRYPTABLE", { retryable: false });
+    }
+    if (!apiKey) {
+      // Non-retryable: no amount of backoff produces a key. The receipt
+      // lands in the review queue with its images intact, and the reason
+      // code tells the operator exactly which screen fixes it.
+      throw new ExtractError("ANTHROPIC_KEY_NOT_CONFIGURED", { retryable: false });
+    }
+    if (cached?.key !== apiKey) {
+      cached = { key: apiKey, client: new Anthropic({ apiKey, maxRetries: 0 }) };
+      console.log(`[ledgerly] Anthropic client initialised from ${source}`);
+    }
+    return cached.client;
+  }
 
   const worker = new Worker<ExtractJobData>(
     RECEIPT_EXTRACT_QUEUE_NAME,
@@ -88,7 +125,7 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
         await processReceiptExtraction(
           {
             db,
-            anthropicClient,
+            anthropicClient: await anthropicForJob(),
             uploadsDir: env.UPLOADS_DIR,
             maxMegapixels: env.MAX_UPLOAD_MEGAPIXELS,
             modelPass1: env.AI_MODEL_PASS1,

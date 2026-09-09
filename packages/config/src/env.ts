@@ -63,7 +63,11 @@ const rawSchema = z.object({
   ACCESS_ALLOW_SUB_RELINK: zBoolEnv(false),
 
   // --- AI extraction ---------------------------------------------------------
-  ANTHROPIC_API_KEY: z.string().min(1, "ANTHROPIC_API_KEY is required"),
+  // Optional since the admin screen can set it (D-39). It is the FALLBACK,
+  // not the source of truth: `app_config.anthropic_api_key`, encrypted with
+  // MASTER_KEY, wins when present. A fresh instance has to be able to boot
+  // with no key at all, or there is no way to reach the screen that sets one.
+  ANTHROPIC_API_KEY: z.string().default(""),
   AI_MODEL_PASS1: z.string().min(1).default("claude-haiku-4-5"),
   AI_MODEL_PASS2: z.string().min(1).default("claude-sonnet-5"),
   AI_ESCALATE_BELOW: z.coerce.number().min(0).max(1).default(0.6),
@@ -159,6 +163,20 @@ export function parseEnv(raw: Record<string, string | undefined>): Env {
       "[ledgerly] WARN: ACCESS_ALLOW_SUB_RELINK=true. Email-matched sub re-linking is " +
         "active. This should be enabled only during a deliberate identity-provider " +
         "migration and turned off immediately afterward (D-27).",
+    );
+  }
+
+  // D-39: an unset AI key can no longer refuse the boot, because the admin
+  // screen is now a legitimate place to set it and an instance has to start
+  // before that screen is reachable. It is still a misconfiguration if
+  // NOTHING is set, so it is loud here — and surfaced again on the admin
+  // screen and as a named job failure, since this process cannot see
+  // `app_config` at config-parse time.
+  if (result.data.ANTHROPIC_API_KEY === "") {
+    console.warn(
+      "[ledgerly] WARN: ANTHROPIC_API_KEY is not set in the environment. " +
+        "Receipt extraction will fail unless a key has been saved from the admin " +
+        "screen (Admin -> Claude API key), which overrides this variable anyway.",
     );
   }
 
