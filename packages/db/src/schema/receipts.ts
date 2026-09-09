@@ -73,6 +73,22 @@ export const receipts = pgTable(
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
+    // Phase 7: fields the user has deliberately marked as blank ("this
+    // receipt genuinely has no phone number"), so the review badge clears.
+    // Distinct from missing_fields, which means "still needs entry".
+    //
+    // This needs to be persisted rather than just removed from
+    // missing_fields, because every extraction run recomputes missing_fields
+    // from scratch — without a record of the dismissal, an automatic retry
+    // resurrects a badge the user already dealt with, and re-extract is a
+    // button on the same screen as dismiss. `pipeline/extract.ts` subtracts
+    // this set when it writes missing_fields; a *manual* re-extract clears it,
+    // because asking the model to read the receipt again is a request for a
+    // fresh opinion.
+    dismissedFields: text("dismissed_fields")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
 
     userNotes: text("user_notes"),
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
@@ -104,6 +120,30 @@ export const receipts = pgTable(
     index("receipts_review_idx")
       .on(t.projectId, t.extractionStatus)
       .where(sql`${t.deletedAt} IS NULL AND ${t.extractionStatus} <> 'ok'`),
+    // Cross-project review queue (task 7.5). `receipts_review_idx` above
+    // cannot serve it: extraction_status is 'partial' *iff* validation_flags
+    // is non-empty, so a receipt with unread fields but clean arithmetic is
+    // still 'ok' — and that is the largest bucket in the queue. This is an
+    // addition, not a replacement; 7.5's acceptance still names the other one
+    // and projects.stats's needsReviewCount can use it per-project.
+    //
+    // Leading column is created_at, not project_id: the queue is cross-project
+    // and globally ordered oldest-first, so an ordered scan the LIMIT stops
+    // early on beats a BitmapOr across N project ids plus a sort. Same shape
+    // and reasoning as receipts_pending_idx.
+    //
+    // NOTE (D-22): partial index whose predicate contains an OR and an array
+    // literal — the first of that shape in this schema. Verify the emitted SQL
+    // in packages/db/migrations/0003_*.sql by hand and hand-append per
+    // docs/SCHEMA.md §Migration strategy if drizzle-kit drops or reshapes the
+    // WHERE. The predicate must match the query's clause EXACTLY or the
+    // planner will not use it — packages/api's NEEDS_REVIEW_SQL is the single
+    // definition both sides share.
+    index("receipts_needs_review_idx")
+      .on(t.createdAt)
+      .where(
+        sql`${t.deletedAt} IS NULL AND (${t.missingFields} <> '{}' OR ${t.extractionStatus} <> 'ok')`,
+      ),
     // reconciliation sweep (D-08)
     index("receipts_pending_idx")
       .on(t.createdAt)

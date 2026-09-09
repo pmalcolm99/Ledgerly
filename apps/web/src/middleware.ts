@@ -54,7 +54,17 @@ export const config = {
   // /_next/static Access bypass — nothing anonymous ever needs an asset.
   // /welcome IS matched and requires a valid JWT; it is exempt only from
   // the *onboarding* gate, by living outside the (app) route group.
+  //
+  // Phase 7 added `splash/`. iOS requests apple-touch-startup-image while
+  // launching the installed app, which can happen before an Access cookie is
+  // presented; gated, the splash screen simply fails and the launch flashes
+  // white. These are generated brand images with no user data in them.
+  //
+  // Note `(?:apple-)?icon[\w-]*\.png` already covers `apple-icon.png` —
+  // which is why the icons use Next's `apple-icon` file convention rather
+  // than the hand-rolled `apple-touch-icon.png`, a name this pattern does
+  // NOT match (it requires "icon" immediately after "apple-").
   matcher: [
-    "/((?!_next/|favicon\\.ico|manifest\\.webmanifest|robots\\.txt|sw\\.js|offline\\.html|(?:apple-)?icon[\\w-]*\\.png|api/v1/health(?![\\w-])).*)",
+    "/((?!_next/|favicon\\.ico|manifest\\.webmanifest|robots\\.txt|sw\\.js|offline\\.html|splash/|(?:apple-)?icon[\\w-]*\\.png|api/v1/health(?![\\w-])).*)",
   ],
 };

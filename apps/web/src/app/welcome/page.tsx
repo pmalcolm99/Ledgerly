@@ -2,17 +2,26 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { appRouter, createCallerFactory, createContext } from "@ledgerly/api";
 import { isOnboarded } from "@ledgerly/auth";
+import { Receipt } from "lucide-react";
 
+import { WelcomeForm } from "../../components/WelcomeForm";
 import { resolveIdentity } from "../../server/identity";
 
 /**
- * apps/web/src/app/welcome/page.tsx — the onboarding gate's target
- * (task 3.8).
+ * apps/web/src/app/welcome/page.tsx — onboarding (task 3.8, brief §1).
  *
  * Deliberately OUTSIDE the `(app)` route group, so it is not gated by the
- * layout that redirects here. It is still matched by `proxy.ts` and still
- * requires a valid Cloudflare Access JWT — it is exempt from onboarding,
- * not from authentication.
+ * layout that redirects here. It is still matched by `middleware.ts` and still
+ * requires a valid Cloudflare Access JWT — it is exempt from onboarding, not
+ * from authentication.
+ *
+ * Still a Server Action rather than a client mutation: it runs before the user
+ * is onboarded, which is exactly the state `protectedProcedure` refuses, so
+ * routing it through the server-side caller keeps it on `onboardingProcedure`
+ * without the client needing a special case.
+ *
+ * Shown once — the `(app)` layout only redirects here while `onboarded_at` is
+ * null, and this page redirects away once it is set.
  */
 
 const createCaller = createCallerFactory(appRouter);
@@ -36,18 +45,18 @@ export default async function WelcomePage() {
   }
 
   return (
-    <main>
-      <h1>Welcome to Ledgerly</h1>
-      <p>Tell us your name to finish setting up your account.</p>
-      <form action={submit}>
-        <label htmlFor="firstName">First name</label>
-        <input id="firstName" name="firstName" required maxLength={100} autoComplete="given-name" />
-
-        <label htmlFor="lastName">Last name</label>
-        <input id="lastName" name="lastName" required maxLength={100} autoComplete="family-name" />
-
-        <button type="submit">Continue</button>
-      </form>
+    <main className="mx-auto flex min-h-[100dvh] w-full max-w-md flex-col justify-center px-4 py-8">
+      <div className="rounded-xl border border-divider bg-content1 p-6 shadow-small">
+        <div className="mb-4 flex items-center gap-2">
+          <Receipt className="h-6 w-6 text-primary" aria-hidden />
+          <h1 className="text-2xl font-bold">Welcome to Ledgerly</h1>
+        </div>
+        <p className="mb-4 text-sm text-default-500">
+          Tell us your name to finish setting up your account. This is how you&apos;ll appear to
+          anyone you share a project with.
+        </p>
+        <WelcomeForm action={submit} />
+      </div>
     </main>
   );
 }

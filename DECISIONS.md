@@ -817,3 +817,152 @@ one, so the code is right and the document is stale.
 **Consequence, deferred.** When Ledgerly moves to Next 16, `middleware.ts`
 is deprecated in favour of `proxy.ts` and this decision reverses. The
 manifest assertion is what will catch it either way.
+
+---
+
+## D-31 — Ledgerly's accent is teal; the other three themes are Forkd's. **Settled** (user decision).
+
+**Context.** Phase 7 had to decide how literally to copy Forkd's palette. The
+brief asked for "a sibling app, not a cousin".
+
+**Why.** Copying the whole design system — spacing, type scale, component
+vocabulary, the five-theme mechanism, the content1–4 ramps — is what makes the
+two apps feel related. Copying the _brand colour_ as well would make them
+indistinguishable in an app switcher, which is a real cost on a phone where
+both are installed.
+
+**Consequence.** `dark` and `light` carry a muted teal (`#2f7d80`) at the same
+lightness progression as Forkd's `#3d7a52` green. `midnight`, `amber` and
+`plum` are ported verbatim — they are _named_ for their accents, so changing
+those would be pointless. Theme labels become "Ledgerly Dark" / "Ledgerly
+Light"; the other three keep their names. `apps/web/hero.ts` holds the ramps.
+
+---
+
+## D-32 — The HeroUI theme lives in `hero.ts`, not `tailwind.config.js`. **Settled.**
+
+**Context.** `docs/PHASES.md` task 7.1 names `apps/web/tailwind.config.js`.
+
+**Why.** Tailwind 4 has no JavaScript config file. A theme plugin is loaded
+from CSS with `@plugin`, and the plugin is an ordinary module.
+
+**Consequence.** `apps/web/hero.ts` default-exports `heroui({...})` and
+`apps/web/src/app/globals.css` loads it with `@plugin "../../hero.ts"`.
+`@heroui/theme` is an explicit devDependency of `apps/web` — it is otherwise
+nested under `@heroui/react` and unreachable, so both the import and the
+`@source` glob would fail to resolve under pnpm. PHASES.md's file name is
+stale; the framework decides this one.
+
+---
+
+## D-33 — Category permissions, and `users.list` enumerates the instance. **Settled** (user decision).
+
+**Context.** `docs/SCHEMA.md`'s permission matrix has no column for
+categories, and nothing in the API could turn a person into the `userId` that
+`members.add` requires — so member management was unreachable from a UI.
+
+**Why (categories).** D-20 makes the taxonomy instance-wide and
+user-extensible, so _creating_ one must be open to any onboarded user; a bad
+category is cosmetic and soft-delete-recoverable. _Renaming or deleting_ one
+changes every historical report and every past export for everyone, which is
+not something one user should be able to do to another's data.
+
+**Why (`users.list`).** A member picker needs a directory. The alternative —
+typing an exact email — is worse to use and no more private in practice among
+people who already share projects.
+
+**Consequence.** categories: `list`/`create` for any onboarded user;
+`update`/`delete` for the row's `created_by` or the instance owner; `is_system`
+rows for nobody, ever. `users.list` returns every onboarded user's id, name and
+email to any caller holding `manage` on at least one project — **an accepted
+disclosure, recorded here rather than left implicit.** It returns no `role`,
+`cf_access_sub`, `theme` or `last_seen_at`. Its gate reads the caller's role
+live from the database and also admits the instance owner outright, because
+`scopedProjects` is empty on an instance with no projects yet — a pure
+"do you manage anything" gate would hand the owner an empty picker at exactly
+the moment they are setting the instance up.
+
+---
+
+## D-34 — Playwright returns, as a devDependency only. **Settled** (user decision).
+
+**Context.** `ARCHITECTURE.md` §1 lists `playwright-core` as "not adopted from
+Forkd", and D-07's consequence notes "Ledgerly has no Playwright". But
+`docs/PHASES.md` tasks 7.11 and 7.12 both name Playwright WebKit as their
+acceptance mechanism.
+
+**Why the old rule does not apply.** What Forkd's Playwright actually broke was
+Next's standalone **file tracing** — a large dynamically-imported library
+missing from the production bundle. That is a runtime-image concern. A
+devDependency used by CI is never traced into the container and cannot
+reproduce it.
+
+**Why it is worth having.** `FORKD_LESSONS.md` records three bugs that appeared
+only on iOS and were missed by unit tests and by Chrome's device emulator.
+Phase 7's suite found four more in its first run: HeroUI's `text-small` beating
+the `max(16px, 1em)` iOS-zoom rule (every input zoomed on focus), project cards
+rendered as `div role="button"` rather than anchors, the review queue rendering
+no heading while loading or erroring, and a modal left invisible at
+`opacity: 0`. None were visible to a unit test.
+
+**Consequence.** `@playwright/test` is a devDependency of `apps/web`; **WebKit
+only**, installed in its own CI job. It runs against `next dev`, because
+`DEV_AUTH_BYPASS` is refused under `NODE_ENV=production` (D-05) and that
+refusal is exactly the guarantee that makes the bypass safe. Dev-mode
+compilation is slow, so the suite warms every route in setup and runs with
+generous timeouts. The runtime image still has no browser, and
+`docker/Dockerfile` is unchanged.
+
+---
+
+## D-35 — HeroUI's overlay animations are disabled. **Settled.**
+
+**Context.** With HeroUI 2.8 and React 19, an opened `Modal` never played its
+enter transition. framer-motion left the wrapper holding the **exit** variant
+as an inline style — `opacity: 0` plus a translate — so the dialog was mounted,
+focus-trapping the page, hit-testable, and completely invisible. The
+create-project dialog could not be seen at all.
+
+**Why not just upgrade or downgrade.** Reproduced on framer-motion 11.18 and
+12.43, in Chrome and in WebKit, with React Strict Mode both on and off. It is
+not a dev-only artifact and `disableAnimation` alone did not clear it.
+
+**Consequence.** `HeroUIProvider` sets `disableAnimation`, each `Modal` sets it
+too, and `globals.css` carries the rule that actually fixes it:
+
+```css
+[data-slot="wrapper"]:has(> [role="dialog"]) {
+  opacity: 1 !important;
+  transform: none !important;
+}
+```
+
+`!important` is doing real work — it is overriding an inline style set by
+JavaScript, which nothing else outranks. `:has()` scopes it to wrappers that
+actually contain a dialog, because `data-slot="wrapper"` is a generic HeroUI
+hook. Losing the fade is the intended trade: this app runs on a phone over a
+tunnel. Revisit if a later HeroUI release fixes the animation.
+
+---
+
+## D-36 — `receipts.dismissed_fields`. **Settled.**
+
+**Context.** The brief's receipt detail screen asks that a missing field can be
+"filled in or dismissed", where dismissing "marks the field intentionally blank
+so the badge clears".
+
+**Why a column.** Every extraction run recomputes `missing_fields` from
+scratch. Without a record of what the user deliberately blanked, the next
+automatic retry resurrects a badge they already dealt with — and "re-extract"
+is a button on the same screen as "dismiss". The user clears it, and it comes
+back.
+
+**Consequence.** `receipts.dismissed_fields text[] NOT NULL DEFAULT '{}'`
+(migration 0003, a metadata-only `ADD COLUMN`).
+`pipeline/extract.ts` subtracts it when writing `missing_fields`. A **manual**
+re-extract clears it, because explicitly asking the model to read the receipt
+again is a request for a fresh opinion rather than a re-application of stale
+assertions. Filling a dismissed field also clears its dismissal. The review
+predicate stays `missing_fields <> '{}' OR extraction_status <> 'ok'`, with no
+set-difference in it, so `receipts_needs_review_idx` remains a plain partial
+index the planner can match.

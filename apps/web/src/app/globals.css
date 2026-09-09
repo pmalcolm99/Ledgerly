@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/* HeroUI's theme is a Tailwind 4 plugin (apps/web/hero.ts). There is no
+   tailwind.config.js under Tailwind 4 — see hero.ts's header and D-32. */
+@plugin "../../hero.ts";
+
+/* Tailwind 4 only generates classes it can see in scanned source. HeroUI's
+   component variants live in its own dist, which is outside this app's tree,
+   so it has to be named explicitly or every HeroUI component ships unstyled.
+   `@heroui/theme` is a direct devDependency of apps/web precisely so this
+   path resolves through a symlink pnpm actually creates — it is nested under
+   @heroui/react otherwise and unreachable from here. */
+@source "../../node_modules/@heroui/theme/dist/**/*.{js,mjs}";
+
+/* The five themes are classes on <html>, not media queries: the active theme
+   is read server-side from users.theme in layout.tsx, so there is no flash and
+   no dependence on the OS setting. */
+@custom-variant dark (&:where(.dark, .midnight, .amber, .plum) &);
+
+@layer base {
+  html {
+    /* 100dvh, never 100vh (FORKD_LESSONS.md): iOS Safari's 100vh includes the
+       collapsing toolbar, so a full-height element overflows by ~60px until
+       the user scrolls. */
+    height: 100dvh;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    min-height: 100dvh;
+    line-height: 1.5;
+    font-family:
+      system-ui,
+      -apple-system,
+      "Segoe UI",
+      Roboto,
+      Helvetica,
+      Arial,
+      sans-serif;
+
+    /* Safe-area insets applied globally, exactly as Forkd does: left/right/
+       bottom here, top on the Navbar so the header colour fills behind the
+       status bar instead of leaving a strip of background. */
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+
+    /* clip, not hidden: `hidden` would establish a scroll container and break
+       `position: sticky` on the header. */
+    overflow-x: clip;
+  }
+}
+
+/*
+ * iOS Safari zooms the viewport when a focused input's font-size is below
+ * 16px, and never zooms back out.
+ *
+ * DELIBERATELY UNLAYERED. This lived in `@layer base` and did not work:
+ * HeroUI sizes its inputs with a `text-small` utility (14px), Tailwind's
+ * `utilities` layer outranks `base`, and every input on the app was therefore
+ * 14px and zooming on focus. Unlayered declarations beat every cascade layer,
+ * which is the only way a blanket rule can win against a component library's
+ * own utilities without a specificity war.
+ *
+ * `max(16px, 1em)` rather than a flat 16px so a deliberately larger input
+ * keeps its size. Asserted by the WebKit suite (e2e/structure.spec.ts) —
+ * this exact regression is what that test exists for.
+ */
+input,
+textarea,
+select {
+  font-size: max(16px, 1em);
+}
+
+@utility pb-safe {
+  padding-bottom: calc(env(safe-area-inset-bottom) + var(--pb-safe-extra, 0px));
+}
+
+/* Traps a child's stacking context so its z-indexes cannot paint through a
+   modal (FORKD_LESSONS.md: Leaflet's panes escaped and covered a lightbox).
+   Ledgerly has no Leaflet, but the receipt image viewer transforms and the
+   same hazard applies to anything that creates layers. */
+@utility isolate-stack {
+  isolation: isolate;
+}
+
+/*
+ * Force HeroUI's modal wrapper into its settled, visible state.
+ *
+ * THE BUG: HeroUI animates overlays with framer-motion. With this combination
+ * (HeroUI 2.8 + React 19) the enter transition never runs, and the wrapper is
+ * left holding framer-motion's EXIT variant as an INLINE style —
+ * `opacity: 0; transform: translateY(var(--slide-exit)) scale(var(--scale-exit))`.
+ * The dialog is therefore mounted, focus-trapping the page, hit-testable, and
+ * completely invisible. Confirmed by hand in Chrome and reproduced in WebKit;
+ * it is not a dev-only artifact (it survives with React Strict Mode disabled)
+ * and it is not fixed by `disableAnimation`, which the modals also pass.
+ *
+ * `!important` is required, and is doing real work rather than papering over a
+ * specificity mistake: the value being overridden is an inline style set by
+ * JavaScript, and nothing but `!important` outranks that.
+ *
+ * Scoped with `:has()` to the wrapper that actually contains a dialog, because
+ * `data-slot="wrapper"` is a generic HeroUI hook used by other components that
+ * must keep their own opacity and transform.
+ *
+ * Losing the fade is the intended trade — see providers.tsx. Revisit if a
+ * later HeroUI release fixes the animation.
+ */
+[data-slot="wrapper"]:has(> [role="dialog"]) {
+  opacity: 1 !important;
+  transform: none !important;
+}

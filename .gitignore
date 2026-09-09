@@ -50,3 +50,10 @@ npm-debug.log*
 
 # Claude Code per-machine settings (agents/ and commands/ ARE tracked)
 .claude/settings.local.json
+
+# Playwright output (traces, screenshots, HTML report). Regenerated on every
+# run; traces can embed page content, so they never belong in a public repo.
+test-results/
+playwright-report/
+blob-report/
+.playwright/

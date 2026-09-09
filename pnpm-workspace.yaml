@@ -2,6 +2,9 @@ packages:
   - "apps/*"
   - "packages/*"
 allowBuilds:
+  # HeroUI's postinstall is a try/catch-wrapped funding notice; nothing we
+  # need, and an unreviewed postinstall is not worth running for one.
+  "@heroui/shared-utils": false
   esbuild: true
   msgpackr-extract: true
   sharp: true

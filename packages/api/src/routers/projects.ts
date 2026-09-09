@@ -1,15 +1,97 @@
 import "server-only";
 
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-import { projectMembers, projects } from "@ledgerly/db/schema";
+import { categories, projectMembers, projects, receiptItems, receipts } from "@ledgerly/db/schema";
 
 import { recordAudit } from "../audit";
 import type { Tx } from "../audit";
 import { isUniqueViolation } from "../errors";
+import { NEEDS_REVIEW_SQL } from "../receiptAccess";
 import { lockScopedProject, scopedProjects } from "../scope";
 import { protectedProcedure, router } from "../trpc";
+
+/**
+ * Per-project rollups as CORRELATED scalar subqueries in the select list.
+ *
+ * This is one round trip, so it is not an N+1 — "N+1" means N round trips,
+ * not N index probes. Each subquery correlates on `projects.id`, so it runs
+ * only for projects the outer WHERE already admitted, and probes
+ * `receipts_project_date_idx` on its leading `project_id` column.
+ *
+ * The alternative shapes are both wrong here. A second query keyed on the ids
+ * the first returned is the N+1. A non-correlated `GROUP BY project_id`
+ * subquery aggregates every receipt on the instance and then throws away the
+ * rows the caller cannot see — doing the work, and the disclosure, before the
+ * scope is applied.
+ *
+ * TWO CASTS THAT ARE NOT OPTIONAL (D-21):
+ *   `count(*)` is bigint, which the pg driver hands back as a STRING. Typing
+ *   it `sql<number>` without `::int` is a lie that only shows up when someone
+ *   adds two counts and gets "12" + "5" === "125".
+ *   `sum(numeric)` is numeric, also a string. It stays a string all the way to
+ *   the display formatter; typing it `sql<number>` is the single easiest way
+ *   to introduce a float into money in this codebase.
+ *
+ * COLUMN REFERENCES ARE WRITTEN OUT, QUALIFIED, ON PURPOSE.
+ *
+ * On drizzle-orm 0.41.0, interpolating a column into a `sql` template inside a
+ * select list renders it BARE, with no table prefix. Verified by printing
+ * `.toSQL()`:
+ *
+ *   db.select({ id: projects.id,
+ *               n: sql`(select count(*) from ${receipts}
+ *                       where ${receipts.projectId} = ${projects.id})` })
+ *     .from(projects)
+ *
+ *   -> select "id", (select count(*) from "receipts"
+ *                    where "project_id" = "id") from "projects"
+ *
+ * Inside a correlated subquery both sides then bind to the INNER table, so
+ * that predicate is `receipts.project_id = receipts.id` — never true. Every
+ * rollup silently returned 0 and the dashboard read "0 receipts, $0.00" for
+ * every project. It fails as a plausible number rather than an error, which is
+ * why the rollup tests assert real counts and not just types.
+ *
+ * (A code reading of drizzle's `buildQueryFromSourceParams` suggests columns
+ * are always qualified. They are not on this path and this version — hence the
+ * transcript above rather than a claim. Re-run it before relying on the
+ * opposite.)
+ *
+ * A nested `SQL` object, like NEEDS_REVIEW_SQL below, IS rendered qualified,
+ * so it is safe to embed as-is.
+ */
+const receiptRollups = {
+  receiptCount: sql<number>`(
+    select count(*)::int from ${receipts}
+    where "receipts"."project_id" = "projects"."id" and "receipts"."deleted_at" is null
+  )`,
+  totalSpend: sql<string>`(
+    select coalesce(sum("receipts"."total"), 0)::numeric(12,2)::text from ${receipts}
+    where "receipts"."project_id" = "projects"."id" and "receipts"."deleted_at" is null
+  )`,
+  needsReviewCount: sql<number>`(
+    select count(*)::int from ${receipts}
+    where "receipts"."project_id" = "projects"."id" and "receipts"."deleted_at" is null
+      and ${NEEDS_REVIEW_SQL}
+  )`,
+  /** `sum` skips NULLs, so without this the dashboard total silently
+   *  understates whenever a receipt's total could not be read, and nothing on
+   *  screen says so. */
+  receiptsMissingTotal: sql<number>`(
+    select count(*)::int from ${receipts}
+    where "receipts"."project_id" = "projects"."id" and "receipts"."deleted_at" is null
+      and "receipts"."total" is null
+  )`,
+  /** D-17: totals sum without regard to currency, which is correct only while
+   *  every row shares one. Returning the distinct set lets the UI refuse to
+   *  show a total rather than show a meaningless one. */
+  currencies: sql<string[]>`(
+    select coalesce(array_agg(distinct "receipts"."currency"), '{}') from ${receipts}
+    where "receipts"."project_id" = "projects"."id" and "receipts"."deleted_at" is null
+  )`,
+};
 
 /**
  * packages/api/src/routers/projects.ts — project CRUD (task 4.2, 4.5).
@@ -125,16 +207,110 @@ export const projectsRouter = router({
     return row;
   }),
 
+  /**
+   * The landing screen's data (task 7.3). Extended in Phase 7 to carry the
+   * rollups the project list renders — total spend, receipt count, and the
+   * needs-review badge — in the same single query.
+   */
   list: protectedProcedure.input(listInput).query(async ({ ctx, input }) => {
     const conditions = [inArray(projects.id, scopedProjects(ctx.user, "read"))];
     if (input?.status) conditions.push(eq(projects.status, input.status));
 
     return ctx.db
-      .select()
+      .select({
+        id: projects.id,
+        ownerId: projects.ownerId,
+        name: projects.name,
+        description: projects.description,
+        startDate: projects.startDate,
+        endDate: projects.endDate,
+        status: projects.status,
+        createdAt: projects.createdAt,
+        updatedAt: projects.updatedAt,
+        archivedAt: projects.archivedAt,
+        ...receiptRollups,
+      })
       .from(projects)
       .where(and(...conditions))
       .orderBy(desc(projects.createdAt));
   }),
+
+  /**
+   * The dashboard header and its spend-by-category chart (task 7.3).
+   *
+   * Two statements, and BOTH compose `scopedProjects` — the second does not
+   * get to assume the first authorized anything.
+   *
+   * THE TWO NUMBERS DO NOT RECONCILE, BY CONSTRUCTION. `totalSpend` is
+   * `sum(receipts.total)`; `byCategory` sums `receipt_items.line_total`. They
+   * differ by sales tax, tip, receipts whose line items were never extracted,
+   * and every receipt flagged `arithmetic_mismatch_items`. `byCategoryTotal`
+   * is returned as its own field precisely so the UI can show the gap
+   * honestly instead of implying a reconciliation that does not exist.
+   *
+   * Tax and tip are deliberately NOT apportioned pro-rata across categories.
+   * This is a tax record; inventing per-category numbers would be worse than
+   * showing an unallocated remainder.
+   */
+  stats: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string().uuid(),
+        from: z.string().date().optional(),
+        to: z.string().date().optional(),
+      }),
+    )
+    .query(async ({ ctx, input }) => {
+      const [header] = await ctx.db
+        .select({
+          id: projects.id,
+          name: projects.name,
+          description: projects.description,
+          startDate: projects.startDate,
+          endDate: projects.endDate,
+          status: projects.status,
+          ownerId: projects.ownerId,
+          ...receiptRollups,
+        })
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            inArray(projects.id, scopedProjects(ctx.user, "read")),
+          ),
+        )
+        .limit(1);
+      if (!header) throw new TRPCError({ code: "NOT_FOUND" });
+
+      const itemConditions = [
+        eq(receipts.projectId, input.projectId),
+        // Composed again, independently of the header query above.
+        inArray(receipts.projectId, scopedProjects(ctx.user, "read")),
+        isNull(receipts.deletedAt),
+      ];
+      if (input.from) itemConditions.push(gte(receipts.transactionDate, input.from));
+      if (input.to) itemConditions.push(lte(receipts.transactionDate, input.to));
+
+      const byCategory = await ctx.db
+        .select({
+          categoryId: categories.id,
+          name: categories.name,
+          color: categories.color,
+          itemCount: sql<number>`count(*)::int`,
+          spend: sql<string>`coalesce(sum(${receiptItems.lineTotal}), 0)::numeric(12,2)::text`,
+        })
+        .from(receiptItems)
+        .innerJoin(receipts, eq(receipts.id, receiptItems.receiptId))
+        // LEFT: an item with no category is a real, displayable bucket
+        // ("Unassigned"), and is NOT the same thing as the seeded
+        // `uncategorized` system category — both can appear in one chart.
+        .leftJoin(categories, eq(categories.id, receiptItems.categoryId))
+        .where(and(...itemConditions))
+        .groupBy(categories.id, categories.name, categories.color)
+        .orderBy(sql`sum(${receiptItems.lineTotal}) DESC NULLS LAST`);
+
+      return { project: header, byCategory };
+    }),
 
   /**
    * Plain metadata edit — name/description/dates. Not audited beyond the

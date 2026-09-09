@@ -25,6 +25,23 @@ const nextConfig: NextConfig = {
   // running `node -e "require('./apps/web/node_modules/sharp')"` etc.
   // against a real `next build` output.
   serverExternalPackages: ["sharp", "bullmq", "ioredis"],
+
+  async headers() {
+    return [
+      {
+        // A service worker that is itself cached is a service worker you
+        // cannot replace. Browsers already special-case /sw.js somewhat, but
+        // an explicit no-cache is what guarantees a fixed worker actually
+        // reaches an installed PWA rather than being shadowed by a stale copy
+        // for up to 24 hours.
+        source: "/sw.js",
+        headers: [
+          { key: "Cache-Control", value: "no-cache, no-store, must-revalidate" },
+          { key: "Service-Worker-Allowed", value: "/" },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;

@@ -1,6 +1,8 @@
 // @ts-check
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
+import reactHooks from "eslint-plugin-react-hooks";
+import nextPlugin from "@next/eslint-plugin-next";
 
 // The D-07 dependency direction: packages/shared is imported by Client
 // Components, so it must never pull in a Node-only or server-only module.
@@ -77,6 +79,30 @@ export default tseslint.config(
     ignores: ["packages/shared/**/*.test.{ts,tsx}"],
     rules: {
       "no-restricted-imports": ["error", { patterns: SHARED_FORBIDDEN_IMPORTS }],
+    },
+  },
+  // React rules, scoped to apps/web — the only package with components.
+  //
+  // `react-hooks/exhaustive-deps` is the reason this is here rather than
+  // left to code review: FORKD_LESSONS.md records a production bug where a
+  // debounced handler captured `searchParams` at mount and, 300ms later,
+  // rebuilt the URL from that stale copy and wiped a live filter. That is a
+  // stale-closure bug, it was timing-dependent, and it is exactly what this
+  // rule reports. Ledgerly's own Filters.tsx is written to avoid it; the rule
+  // is what stops the next component from reintroducing it.
+  //
+  // `@next/next` also supplies the rules Next's own build expects to exist —
+  // without the plugin, an `eslint-disable-next-line @next/next/no-img-element`
+  // comment is itself a build error ("Definition for rule ... was not found").
+  {
+    files: ["apps/web/**/*.{ts,tsx}"],
+    plugins: {
+      "react-hooks": reactHooks,
+      "@next/next": nextPlugin,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      ...nextPlugin.configs.recommended.rules,
     },
   },
   // Config package: server-only env.ts may import node:*; edge.ts may not

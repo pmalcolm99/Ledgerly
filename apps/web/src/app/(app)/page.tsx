@@ -1,10 +1,10 @@
-// Placeholder landing page. The real dashboard, auth gate, and onboarding
-// flow are Phase 3 and Phase 7 scope.
+import { ProjectList } from "../../components/ProjectList";
+
+/**
+ * The landing screen (brief §2). Deliberately the project list rather than a
+ * dashboard: on a phone, the first tap should be the project you are about to
+ * photograph a receipt into.
+ */
 export default function HomePage() {
-  return (
-    <main>
-      <h1>Ledgerly</h1>
-      <p>Foundation build — Phase 2. Nothing here yet.</p>
-    </main>
-  );
+  return <ProjectList />;
 }

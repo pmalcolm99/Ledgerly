@@ -1,9 +1,10 @@
 import "server-only";
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-import { projectMembers, projects } from "@ledgerly/db/schema";
+import { projectMembers, projects, users } from "@ledgerly/db/schema";
+import { displayNameOf } from "@ledgerly/shared/personName";
 import type { AuthUser } from "@ledgerly/auth/types";
 
 import { recordAudit } from "../audit";
@@ -145,10 +146,51 @@ export const membersRouter = router({
       .limit(1);
     if (!project) throw new TRPCError({ code: "NOT_FOUND" });
 
-    return ctx.db
-      .select()
+    // Joined to `users` in Phase 7: this previously returned bare UUIDs, which
+    // no UI can render. INNER, not LEFT — project_members.user_id is
+    // ON DELETE CASCADE, so a membership row cannot outlive its user.
+    //
+    // Email is exposed to fellow project members deliberately: it is the only
+    // thing that disambiguates two people with the same display name, and
+    // these are people who already share a project. audit.ts's no-PII rule
+    // governs the audit log, not this surface.
+    const rows = await ctx.db
+      .select({
+        userId: projectMembers.userId,
+        permission: projectMembers.permission,
+        grantedBy: projectMembers.grantedBy,
+        grantedAt: projectMembers.grantedAt,
+        displayName: users.displayName,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        email: users.email,
+        ownerId: projects.ownerId,
+      })
       .from(projectMembers)
-      .where(eq(projectMembers.projectId, input.projectId));
+      .innerJoin(users, eq(users.id, projectMembers.userId))
+      .innerJoin(projects, eq(projects.id, projectMembers.projectId))
+      // Composed here as well as in the probe above. The probe throws first
+      // in the same request, so this is not exploitable today — but putting
+      // the enforcement in a *preceding statement* rather than in the query
+      // is the scattered check CLAUDE.md forbids, and `receipts.get` and
+      // `projects.stats` both refuse the same shape. One extra indexed row.
+      .where(
+        and(
+          eq(projectMembers.projectId, input.projectId),
+          inArray(projects.id, scopedProjects(ctx.user, "read")),
+        ),
+      )
+      .orderBy(desc(projectMembers.permission), asc(users.displayName));
+
+    return rows.map((row) => ({
+      userId: row.userId,
+      permission: row.permission,
+      grantedBy: row.grantedBy,
+      grantedAt: row.grantedAt,
+      email: row.email,
+      name: displayNameOf(row),
+      isProjectOwner: row.userId === row.ownerId,
+    }));
   }),
 
   add: protectedProcedure.input(addInput).mutation(async ({ ctx, input }) => {

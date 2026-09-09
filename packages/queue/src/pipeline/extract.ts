@@ -415,9 +415,35 @@ export async function processReceiptExtraction(
   if (items.length === 0) missingFields.push("items");
 
   await db.transaction(async (tx) => {
+    // Phase 7: honour the fields the user deliberately marked blank.
+    //
+    // missingFields above is recomputed from scratch on every run, so without
+    // this subtraction a dismissal is silently undone by the next automatic
+    // retry — the user clears a badge and it comes back. Read inside the
+    // transaction so it reflects any dismissal committed while this (paid,
+    // slow) extraction was in flight.
+    //
+    // A MANUAL re-extract clears the set instead of subtracting it: pressing
+    // "re-extract" is an explicit request for a fresh reading of the receipt,
+    // which makes the user's earlier "this field is genuinely blank"
+    // assertions stale rather than authoritative.
+    const [existing] = await tx
+      .select({ dismissedFields: receipts.dismissedFields })
+      .from(receipts)
+      .where(eq(receipts.id, receiptId))
+      .limit(1)
+      // FOR UPDATE: a plain select under READ COMMITTED takes its own
+      // snapshot, so a `dismissMissingField` committing between this read and
+      // the update below would be silently overwritten by the value read
+      // before it. Extraction holds no other lock on this row.
+      .for("update");
+    const dismissed = forcePass2 ? [] : (existing?.dismissedFields ?? []);
+    const effectiveMissingFields = missingFields.filter((field) => !dismissed.includes(field));
+
     const updated = await tx
       .update(receipts)
       .set({
+        dismissedFields: dismissed,
         merchantName,
         merchantAddress,
         merchantPhone,
@@ -435,7 +461,7 @@ export async function processReceiptExtraction(
         extractionConfidence: String(confidence),
         extractionRaw: finalPass.rawScrubbed,
         extractionError: null,
-        missingFields,
+        missingFields: effectiveMissingFields,
         validationFlags,
         updatedAt: new Date(),
       })

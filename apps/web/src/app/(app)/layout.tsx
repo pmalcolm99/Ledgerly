@@ -1,6 +1,11 @@
 import { redirect } from "next/navigation";
 import { isOnboarded } from "@ledgerly/auth";
+import { displayNameOf } from "@ledgerly/shared/personName";
+import { resolveTheme } from "@ledgerly/shared/themes";
 
+import { Header } from "../../components/Header";
+import { InstallPrompt } from "../../components/InstallPrompt";
+import { ServiceWorkerRegistrar } from "../../components/ServiceWorkerRegistrar";
 import { resolveIdentity } from "../../server/identity";
 
 /**
@@ -14,9 +19,9 @@ import { resolveIdentity } from "../../server/identity";
  * route: an exception carved into a security check that then has to be
  * remembered forever.
  *
- * The gate cannot live in `proxy.ts` despite what PHASES.md task 3.8 lists:
- * it needs `users.onboarded_at`, middleware runs on the Edge Runtime, and
- * `pg` does not run there. ARCHITECTURE.md §3.1 already places it here.
+ * The gate cannot live in `middleware.ts` despite what PHASES.md task 3.8
+ * lists: it needs `users.onboarded_at`, middleware runs on the Edge Runtime,
+ * and `pg` does not run there. ARCHITECTURE.md §3.1 already places it here.
  */
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   const user = await resolveIdentity();
@@ -26,5 +31,16 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   if (!user) redirect("/api/auth/sign-out");
   if (!isOnboarded(user)) redirect("/welcome");
 
-  return <>{children}</>;
+  return (
+    <div className="flex min-h-[100dvh] flex-col">
+      <Header
+        userName={displayNameOf(user)}
+        isInstanceOwner={user.role === "owner"}
+        theme={resolveTheme(user.theme)}
+      />
+      <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-5">{children}</main>
+      <InstallPrompt />
+      <ServiceWorkerRegistrar />
+    </div>
+  );
 }

@@ -1,0 +1,2 @@
+ALTER TABLE "receipts" ADD COLUMN "dismissed_fields" text[] DEFAULT '{}'::text[] NOT NULL;--> statement-breakpoint
+CREATE INDEX "receipts_needs_review_idx" ON "receipts" USING btree ("created_at") WHERE "receipts"."deleted_at" IS NULL AND ("receipts"."missing_fields" <> '{}' OR "receipts"."extraction_status" <> 'ok');

@@ -4,11 +4,37 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 6 — AI extraction. **Code complete and reviewed** (task 6.13); every
-High/Medium/Low finding fixed. **Not yet gated**: tasks 6.3 and 6.12 both
-require a real `ANTHROPIC_API_KEY` (this session's `.env` holds only a
-placeholder) — see "Blocked / open questions" below. D-12 stays
-Provisional until someone with a real key runs both.
+Phase 7 — UI & PWA. **Code complete and reviewed.** The app has screens for
+the first time: onboarding, project list, project dashboard, receipt capture,
+receipt detail, review queue, category settings, and an admin view. Manifest,
+icons, iOS splash screens, offline shell and service worker all ship.
+
+**Not yet gated.** Phase 7's gate is "usable on your phone through the
+tunnel", and that is a manual check only you can make — there is no iOS device
+here and Playwright's WebKit is not Mobile Safari. The checklist is under
+"Blocked / open questions".
+
+Phase 6 remains ungated for its own reason (tasks 6.3 and 6.12 need a real
+`ANTHROPIC_API_KEY`); D-12 stays Provisional.
+
+## Phase 7 review — what was found and what was done
+
+The `reviewer` pass found 1 high, 5 medium and 4 low. Ten fixed, one
+disputed with evidence, one already done.
+
+| Sev  | Finding                                                                                                                                                                                                                                                                                                          | Fix                                                                                                                                                                                                                                                                     |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| High | `receiptItems.create/update` stored a **full, Luhn-valid card number** via `description`/`sku`. `receipts.update` scrubs its whole patch; the line-item router, added the same phase, scrubbed nothing — and a line item is exactly where someone retypes what a receipt prints. Confirmed live by the reviewer. | `scrubLuhnSequences` over the supplied patch in both, `redactions` in the audit row, two regression tests.                                                                                                                                                              |
+| Med  | `members.list`'s rewritten row query did not compose `scopedProjects` — enforcement sat in the preceding probe statement. Not exploitable (the probe throws first) but exactly the shape `receipts.get` and `projects.stats` refuse.                                                                             | Scope composed into the row query too.                                                                                                                                                                                                                                  |
+| Med  | `canEditSql` used `"manage"`, which **includes** archived projects, while enforcement gates at `"add"`, which excludes them. The UI offered a full editing surface on an archived project and every save returned `NOT_FOUND` — reading as "this receipt is gone".                                               | Rewritten as `"add"` AND (`"manage"` OR own), mirroring `loadEditableReceipt` exactly. Regression test.                                                                                                                                                                 |
+| Med  | `update`/`dismissMissingField`/`undismissMissingField` returned the whole row including `extraction_raw`, which `receipts.get` deliberately strips — shipping the full model payload on every committed field edit.                                                                                              | Explicit projection shared by all three, so a column added later is not silently included. Regression test.                                                                                                                                                             |
+| Med  | `categories.delete`'s usage count excluded soft-deleted receipts. `ON DELETE RESTRICT` never fires on a soft delete, so that count is the _only_ guard — a category referenced solely by items on soft-deleted receipts could be deleted, leaving live FKs to a deleted row.                                     | Count includes them. Regression test.                                                                                                                                                                                                                                   |
+| Med  | `ReviewQueue` hardcoded `canEdit`, so a read-only member got editable inputs and every save failed. The queue is gated at `"read"` on purpose and the API already returned a correct per-row `canEdit`.                                                                                                          | Threaded through, plus a "view only" marker.                                                                                                                                                                                                                            |
+| Low  | `extract.ts`'s `dismissed_fields` read was unlocked; a dismissal committing mid-extraction was silently overwritten.                                                                                                                                                                                             | `.for("update")`.                                                                                                                                                                                                                                                       |
+| Low  | `users.list` re-read the caller's role live but then passed `ctx.user` (JWT role) to `scopedProjects`, which short-circuits on `role === "owner"` — a demoted owner kept the directory.                                                                                                                          | Scope composed against a user object carrying the live role.                                                                                                                                                                                                            |
+| Low  | `sw.js` claimed everything cached passes `isCacheable`, but `cache.add` does its own fetch and does not check `redirected`.                                                                                                                                                                                      | Precache fetches and gates each entry itself. Two new tests, including a redirected 200 being refused.                                                                                                                                                                  |
+| Low  | `docs/STATE.md` not updated.                                                                                                                                                                                                                                                                                     | It was — the review ran against a tree from before that edit.                                                                                                                                                                                                           |
+| Low  | The comment explaining why correlated subqueries write out qualified column names was said to be factually wrong: drizzle's source suggests columns always render qualified.                                                                                                                                     | **Disputed, with evidence.** Re-verified on drizzle-orm 0.41.0 by printing `.toSQL()`: a column interpolated into a `sql` template in a select list renders BARE. The transcript is now in the comment so the next reader can re-run it rather than trust either claim. |
 
 ## Task 6.13 review — what was found and what was done
 
@@ -172,6 +198,95 @@ The `reviewer` pass found 2 high, 7 medium and 11 low. Fixed before commit:
   package framework-agnostic. The relocation is right; the document is not.
 
 ## Completed
+
+**Phase 7 (2026-09-08)**
+
+- **Design system.** `@heroui/react` 2.8 + Tailwind 4 — verified compatible
+  (`@heroui/theme` 2.4.26's peer is `tailwindcss >=4.0.0`), which keeps
+  Forkd's v2 component API while satisfying ARCHITECTURE.md §9. Five themes
+  in `apps/web/hero.ts`; Ledgerly's own teal accent on Dark/Light, Forkd's
+  Midnight/Amber/Plum ported verbatim (D-31). Confirmed in the built CSS by
+  reading the emitted `--heroui-primary` hue per theme, not by eye.
+  `tailwind.config.js` does not exist under Tailwind 4 (D-32).
+- **Backend.** Phase 7 turned out to be about two-thirds backend: `receipts`
+  had only `delete`/`reextract`, and the UI needed list/get/update, line-item
+  CRUD, categories, a user directory, project rollups and an admin overview.
+  All of it composes `scopedProjects`; `packages/api/src/receiptAccess.ts`
+  extracts the receipt gate the two existing mutations each carried inline,
+  and both were refactored onto it with the existing suites as the net.
+- **Migration 0003** — `receipts.dismissed_fields` (D-36) and
+  `receipts_needs_review_idx`. drizzle-kit emitted the partial index's WHERE
+  clause correctly this time (D-22 hand-check done). Index use was verified
+  with `EXPLAIN` against 20,200 rows, not just asserted: the planner picks an
+  ordered `Index Scan using receipts_needs_review_idx` that the LIMIT stops
+  early.
+- **`packages/shared` grew three modules and gained two by move.**
+  `moneyDisplay.ts`, `numeric.ts`, `personName.ts` are new;
+  `receiptValidation.ts` and `scrub.ts` moved out of `packages/queue`
+  (re-export shims left behind, all 95 queue tests unchanged and green) so
+  `packages/api` can reach them — it cannot import `@ledgerly/queue`, which
+  already depends on it.
+- **Tests: 485 unit (up from 461) + 15 Playwright/WebKit.** Highlights:
+  `apps/web/src/sw.test.ts` evaluates the SHIPPED `public/sw.js` in a
+  synthetic worker scope and drives it with real Request/Response objects —
+  a 302, an opaqueredirect, an opaque response and a 500 are none of them
+  cached, `/api/*` is never intercepted, and a navigation is never cached at
+  all. `packages/api/src/routers/phase7Permissions.test.ts` is the matrix for
+  every new procedure, including the "own only" cell that
+  `permissions.test.ts` previously had to test against `scopedProjects`
+  directly because receipts did not exist yet.
+
+**Four real bugs the WebKit suite caught, none of them visible to a unit test**
+
+1. **Every input was 14px and iOS zoomed on focus.** The
+   `font-size: max(16px, 1em)` rule was inside `@layer base`; HeroUI sizes
+   inputs with a `text-small` utility, and Tailwind's `utilities` layer
+   outranks `base`. The rule is now unlayered, which beats every cascade
+   layer. This is task 7.1's acceptance criterion, and it was silently failing.
+2. **The create-project modal was invisible.** framer-motion left HeroUI's
+   modal wrapper holding its _exit_ variant as an inline style
+   (`opacity: 0` + a translate) and never played the enter transition, so the
+   dialog was mounted, focus-trapping the page, and unseeable. Reproduced in
+   Chrome and WebKit, on framer-motion 11 and 12, with Strict Mode on and off
+   (D-35).
+3. **Project cards were not links.** `<Card isPressable as={NextLink}>`
+   renders a `div role="button"` and drops the anchor — no open-in-new-tab,
+   no middle-click, no link semantics for a screen reader.
+4. **The review queue had no heading while loading or on error** — the page
+   had no identity at exactly the moments it was slowest.
+
+**Notes worth carrying forward**
+
+- **Drizzle renders `${table.column}` UNQUALIFIED inside a `sql` template.**
+  Every project rollup silently returned 0 because
+  `where ${receipts.projectId} = ${projects.id}` became
+  `where "project_id" = "id"`, binding both sides to the inner table. It fails
+  as a plausible number, not as an error — the dashboard read "0 receipts,
+  $0.00" for every project. Correlated subqueries now write their column
+  references out, qualified. A nested `SQL` object (e.g. `NEEDS_REVIEW_SQL`)
+  _is_ rendered qualified, so embedding one is safe.
+- **`count(*)` is bigint and the pg driver returns it as a STRING.** Every
+  count is cast `::int` in SQL; `sum(numeric)` stays a string all the way to
+  the display formatter (D-21).
+- **The service worker is not registered in development.** It caches
+  `/_next/static/*` cache-first with no revalidation, which is right for
+  content-hashed production URLs and wrong for dev chunks whose contents
+  change under a stable URL.
+- **`apps/web/scripts/generate-icons.ts`** generates every icon and the iOS
+  splash set from an inline SVG, plus the `<link>` media queries, so filenames
+  and device geometries cannot drift. Run `pnpm --filter @ledgerly/web icons`.
+  It lives under `apps/web` rather than the repo-root `scripts/` because Node
+  resolves a dependency from the importing file's location and `sharp` is a
+  dependency of `apps/web`.
+- **Icons use Next's `apple-icon.png` file convention deliberately.** The
+  Access matcher already excluded `(?:apple-)?icon[\w-]*\.png`, which matches
+  `apple-icon.png` but NOT `apple-touch-icon.png` (it requires "icon"
+  immediately after "apple-"). Only `splash/` needed adding.
+- **`/welcome` was the heaviest route in the app** at 462 kB first-load,
+  because a Server Component importing HeroUI pulls the client runtime into
+  its own route bundle. Moving the form into a Client Component and passing
+  the Server Action as a prop took it to 184 kB — on the first screen a new
+  user ever sees.
 
 **Phase 0 (2026-09-07)**
 
@@ -625,7 +740,28 @@ up -d`. All three containers healthy; `webapp`'s `next-server` runs as
 
 ## Next
 
-Phase 6's two live-API tasks (6.3, 6.12), then Phase 7 — UI & PWA.
+Phase 8 — Export (XLSX/CSV). The dashboard's Export button is already rendered
+and disabled, waiting to be wired.
+
+Still outstanding from earlier phases: Phase 6's two live-API tasks (6.3,
+6.12), which need a real `ANTHROPIC_API_KEY`.
+
+### Running the browser suite locally
+
+```
+./scripts/test-db.sh && ./scripts/test-redis.sh
+pnpm --filter @ledgerly/web exec playwright install webkit   # once
+pnpm --filter @ledgerly/web e2e
+```
+
+It creates and migrates its own `ledgerly_e2e` database (never the unit
+suite's — `DEV_AUTH_BYPASS` provisions an instance owner, and
+`users_single_owner_key` permits exactly one, so a leftover owner from the
+unit run makes every page 500). It runs against `next dev`, because
+`DEV_AUTH_BYPASS` is refused under `NODE_ENV=production` (D-05) — so it warms
+every route first and uses generous timeouts; dev-mode compilation plus
+hydrating ~5,400 modules in WebKit genuinely takes tens of seconds on a cold
+route.
 
 ### Running the database tests locally
 
@@ -691,6 +827,49 @@ Decisions taken by the user this session:
 - Category taxonomy → seeded global list, user-extensible (D-20)
 
 ## Blocked / open questions
+
+- **Phase 7's gate is unverified, and only you can close it.** The gate is
+  "usable on your phone through the tunnel". There is no iOS device in this
+  environment, and Playwright's WebKit is **not** Mobile Safari — it does not
+  implement `apple-touch-startup-image`, standalone display mode, the
+  add-to-home-screen flow, or iOS's input-zoom behaviour. What _was_ verified
+  here: the manifest, `/sw.js` and every icon and splash image are served and
+  are outside the Access gate; the service worker's caching rules, driven
+  against the real file; no nested forms, no horizontal scroll, modal
+  stacking and a >=16px input font at a 390px WebKit viewport.
+
+  **The iOS checklist, in the order worth doing it:**
+
+  1. Open the tunnel hostname in Safari. Share → **Add to Home Screen**. The
+     icon should be the teal receipt mark, the name "Ledgerly".
+  2. Launch from the home screen. You should get the dark splash screen with
+     the mark centred, then the app with **no Safari chrome** — no URL bar, no
+     toolbar.
+  3. On a notched device: nothing under the notch, and the header's background
+     fills behind the status bar rather than leaving a strip.
+  4. Tap into any text field. **The viewport must not zoom.** This is the one
+     that was silently broken until the WebKit suite caught it, so it is worth
+     checking on the real thing.
+  5. From the installed app, tap "Add receipts" → the camera should open
+     directly (`capture="environment"`). Take a photo of a real receipt.
+     Confirm the per-file progress bar, then the "Reading the receipt…" state,
+     then the thumbnail appearing.
+  6. Multi-select several photos from the camera roll in one action.
+  7. Rotate to landscape and back on the dashboard and the receipt detail.
+  8. **Let the Access session expire** (or sign out at
+     `<team>.cloudflareaccess.com`), then launch from the home screen. You
+     should reach the real Access login page and, after signing in, the app.
+     If you ever get a _cached_ login page you cannot get past, that is the
+     bug the service worker is built to prevent and it should be reported
+     loudly — but it should not be reachable: no code path in `sw.js` writes a
+     navigation response to the cache.
+  9. Turn on airplane mode and launch. You should get the offline card, not a
+     browser error page.
+
+- **A real HEIC still has not round-tripped end to end** — Phase 5's own gap,
+  unchanged. Step 5 above is the natural moment to close it: photograph a
+  receipt on the phone and confirm `display.webp`/`thumb.webp` land and
+  `exiftool` shows no EXIF.
 
 - **Phase 5's gate line — "a real HEIC photographed on your phone
   round-trips end to end" — is unverified.** Deliberately: the repo is
