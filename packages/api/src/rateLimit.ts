@@ -45,6 +45,40 @@ return 1
 `;
 
 /**
+ * Admits or rejects a request atomically at the given cost against a
+ * fixed one-minute window keyed by the caller-supplied `key` — the
+ * general form `checkUploadRateLimit` (task 5.9) and `checkReextractRateLimit`
+ * (task 6.10-adjacent, review finding M-3) both build on, each under its
+ * own key prefix so the two budgets never share state.
+ */
+export async function checkRateLimit(
+  redis: RateLimitRedis,
+  key: string,
+  cost: number,
+  limitPerMinute: number,
+): Promise<RateLimitResult> {
+  const minuteBucket = Math.floor(Date.now() / (WINDOW_SECONDS * 1000));
+  const windowedKey = `${key}:${minuteBucket}`;
+
+  const result = await redis.eval(
+    RATE_LIMIT_SCRIPT,
+    1,
+    windowedKey,
+    cost,
+    limitPerMinute,
+    WINDOW_SECONDS,
+  );
+
+  if (result === 1) {
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  // The window is fixed (not sliding), so the caller can retry as soon as
+  // the current minute bucket rolls over.
+  const secondsIntoWindow = Math.floor(Date.now() / 1000) % WINDOW_SECONDS;
+  return { allowed: false, retryAfterSeconds: WINDOW_SECONDS - secondsIntoWindow };
+}
+
+/**
  * Admits or rejects an entire upload request atomically, at a cost of one
  * per file in the batch — not one call per file. A 5-file request either
  * fits within the caller's remaining budget for this minute or the whole
@@ -58,16 +92,21 @@ export async function checkUploadRateLimit(
   cost: number,
   limitPerMinute: number,
 ): Promise<RateLimitResult> {
-  const minuteBucket = Math.floor(Date.now() / (WINDOW_SECONDS * 1000));
-  const key = `upload_rate:${userId}:${minuteBucket}`;
+  return checkRateLimit(redis, `upload_rate:${userId}`, cost, limitPerMinute);
+}
 
-  const result = await redis.eval(RATE_LIMIT_SCRIPT, 1, key, cost, limitPerMinute, WINDOW_SECONDS);
+// Task 6.10-adjacent, review finding M-3: every `receipts.reextract` call
+// forces a Sonnet 5 pass ($3/$15 per MTok, D-12) -- unlike the escalation
+// ladder's own triggers, this is directly user-controllable and otherwise
+// unmetered. Fixed, not env-tunable (`UPLOAD_RATE_LIMIT_PER_MIN`'s
+// equivalent felt like more configuration surface than this narrow
+// anti-abuse guard warrants); generous enough that no legitimate reviewer
+// workflow hits it.
+export const REEXTRACT_RATE_LIMIT_PER_MIN = 10;
 
-  if (result === 1) {
-    return { allowed: true, retryAfterSeconds: 0 };
-  }
-  // The window is fixed (not sliding), so the caller can retry as soon as
-  // the current minute bucket rolls over.
-  const secondsIntoWindow = Math.floor(Date.now() / 1000) % WINDOW_SECONDS;
-  return { allowed: false, retryAfterSeconds: WINDOW_SECONDS - secondsIntoWindow };
+export async function checkReextractRateLimit(
+  redis: RateLimitRedis,
+  userId: string,
+): Promise<RateLimitResult> {
+  return checkRateLimit(redis, `reextract_rate:${userId}`, 1, REEXTRACT_RATE_LIMIT_PER_MIN);
 }

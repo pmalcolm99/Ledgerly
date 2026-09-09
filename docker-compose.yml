@@ -9,6 +9,12 @@ services:
         GIT_SHA: ${GIT_SHA:-dev}
     image: ${IMAGE_LOCATION:-ghcr.io/pmalcolm99/ledgerly:latest}
     restart: always
+    # Phase 6 (review finding L-7): an in-flight Sonnet 5 extraction call
+    # can run tens of seconds. Docker's default 10s SIGTERM->SIGKILL grace
+    # period could cut one off mid-call on every deploy/restart; this gives
+    # packages/queue/src/shutdown.ts's graceful close room to actually wait
+    # for active jobs before the container is force-killed.
+    stop_grace_period: 30s
     # Localhost only — nothing but the Cloudflare Tunnel can reach this
     # (ARCHITECTURE.md §8, D-16). db and redis publish no ports at all.
     ports:

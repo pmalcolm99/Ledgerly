@@ -185,13 +185,13 @@ CREATE INDEX project_members_user_idx ON project_members (user_id);
 
 ### Permission matrix
 
-| | View | Add receipts | Edit/delete receipts | Manage members | Delete project |
-|---|---|---|---|---|---|
-| `read` | yes | — | — | — | — |
-| `read_add` | yes | yes | own only | — | — |
-| `full` | yes | yes | yes | yes | — |
-| Project owner (`projects.owner_id`) | yes | yes | yes | yes | yes |
-| Instance owner (`users.role = 'owner'`) | all projects | yes | yes | yes | yes |
+|                                         | View         | Add receipts | Edit/delete receipts | Manage members | Delete project |
+| --------------------------------------- | ------------ | ------------ | -------------------- | -------------- | -------------- |
+| `read`                                  | yes          | —            | —                    | —              | —              |
+| `read_add`                              | yes          | yes          | own only             | —              | —              |
+| `full`                                  | yes          | yes          | yes                  | yes            | —              |
+| Project owner (`projects.owner_id`)     | yes          | yes          | yes                  | yes            | yes            |
+| Instance owner (`users.role = 'owner'`) | all projects | yes          | yes                  | yes            | yes            |
 
 "own only" means `receipts.uploaded_by = current user`. That is enforced in the
 same scoped query, not as a route-level check.
@@ -232,21 +232,21 @@ CREATE INDEX categories_sort_idx ON categories (sort_order, name) WHERE deleted_
 Instance-wide, not per-project (D-20). Seeded (`is_system = true`, undeletable by
 CHECK constraint):
 
-| sort | name | slug |
-|---|---|---|
-| 10 | Building Supplies | `building-supplies` |
-| 20 | Tools & Equipment | `tools-equipment` |
-| 30 | Household | `household` |
-| 40 | Food & Dining | `food-dining` |
-| 50 | Transportation & Fuel | `transportation-fuel` |
-| 60 | Lodging & Travel | `lodging-travel` |
-| 70 | Professional Services | `professional-services` |
-| 80 | Utilities | `utilities` |
-| 90 | Office Supplies | `office-supplies` |
-| 100 | Shipping & Postage | `shipping-postage` |
-| 110 | Permits & Fees | `permits-fees` |
-| 120 | Labor & Subcontractors | `labor-subcontractors` |
-| 999 | Uncategorized | `uncategorized` |
+| sort | name                   | slug                    |
+| ---- | ---------------------- | ----------------------- |
+| 10   | Building Supplies      | `building-supplies`     |
+| 20   | Tools & Equipment      | `tools-equipment`       |
+| 30   | Household              | `household`             |
+| 40   | Food & Dining          | `food-dining`           |
+| 50   | Transportation & Fuel  | `transportation-fuel`   |
+| 60   | Lodging & Travel       | `lodging-travel`        |
+| 70   | Professional Services  | `professional-services` |
+| 80   | Utilities              | `utilities`             |
+| 90   | Office Supplies        | `office-supplies`       |
+| 100  | Shipping & Postage     | `shipping-postage`      |
+| 110  | Permits & Fees         | `permits-fees`          |
+| 120  | Labor & Subcontractors | `labor-subcontractors`  |
+| 999  | Uncategorized          | `uncategorized`         |
 
 The seed is idempotent, keyed on `slug`. `uncategorized` is the fallback the
 extraction prompt is told to use and must always exist.
@@ -292,6 +292,7 @@ CREATE TABLE receipts (
   extraction_raw        jsonb,
   extraction_error      text,
   missing_fields        text[]            NOT NULL DEFAULT '{}',
+  validation_flags      text[]            NOT NULL DEFAULT '{}',
 
   user_notes            text,
   reviewed_at           timestamptz,
@@ -321,8 +322,8 @@ CREATE INDEX receipts_pending_idx
 ```
 
 - **Every extracted field is nullable.** `project_id`, `currency`,
-  `extraction_status`, and `missing_fields` are the only non-null columns, and
-  none of them come from the model.
+  `extraction_status`, `missing_fields`, and `validation_flags` are the only
+  non-null columns, and none of them come from the model.
 - `card_last4` is `char(4)` with a digits-only CHECK. The database therefore
   cannot store a full card number in this column even if every application guard
   failed — the Luhn scrub (`ARCHITECTURE.md` §6.3) is the first line, this is the
@@ -330,10 +331,18 @@ CREATE INDEX receipts_pending_idx
 - `extraction_raw` is the post-scrub model response, stored verbatim for
   debugging bad reads. It is scrubbed **before** it is written, never after.
 - `missing_fields` defaults to `'{}'` not null, so consumers never branch on
-  null-vs-empty.
+  null-vs-empty. It names fields the user might want to fill in (came back
+  null), never a reason a check failed.
+- `validation_flags` (Phase 6) names which sanity check(s) tripped when
+  `extraction_status = 'partial'` — `arithmetic_mismatch_total`,
+  `arithmetic_mismatch_items`, `date_in_future`, `date_too_old`. Separate
+  from `missing_fields` because more than one check can trip on the same
+  receipt, and separate from `extraction_error` (a single string, reserved
+  for `extraction_status = 'failed'` from either the ingest or the AI
+  stage) because a `partial` receipt is not a failure.
 - `receipts_date_sane` enforces the brief's "before 2000" check at the database
-  level. The future-date and arithmetic checks are *not* constraints — they set
-  `extraction_status = 'partial'` and append to `missing_fields`, because the
+  level. The future-date and arithmetic checks are _not_ constraints — they set
+  `extraction_status = 'partial'` and append to `validation_flags`, because the
   receipt must still be saved (`ARCHITECTURE.md` §6.3).
 - `transaction_time` is `time` without zone: it is what the receipt printed, not
   an instant.

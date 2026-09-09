@@ -41,20 +41,24 @@ export async function register(): Promise<void> {
       process.exit(1);
     }
 
-    // Imported (through this package subpath) but not invoked: this is
-    // what makes sharp, bullmq, and ioredis reachable from the build's
-    // file trace now, which is task 2.8's explicit acceptance criterion
-    // (`.next/standalone/node_modules` must contain all three —
-    // ARCHITECTURE.md §8.1). Phase 6 task 6.1 (D-19) is what actually
-    // calls startWorkers(env.REDIS_URL) here, replacing the processor
-    // stub in packages/queue/src/worker.ts with the real pipeline.
-    await import("@ledgerly/queue/worker");
+    // Both workers have real processors and run with `autorun: true`:
+    // receipt-ingest (Phase 5, packages/queue/src/pipeline/ingest.ts) and
+    // receipt-extract (Phase 6, packages/queue/src/pipeline/extract.ts).
+    // Their subpath imports are also what makes sharp, bullmq, and
+    // ioredis reachable from the build's file trace — task 2.8's
+    // acceptance criterion (`.next/standalone/node_modules` must contain
+    // all three, ARCHITECTURE.md §8.1) — as a byproduct of genuinely using
+    // them, not as a dummy touch.
+    const { startWorkers } = await import("@ledgerly/queue/worker");
+    const extractWorker = await startWorkers(env.REDIS_URL);
 
-    // Phase 5's render-pipeline worker, by contrast, IS actually started
-    // here — unlike the Phase 6 stub above, it has a real processor
-    // (packages/queue/src/pipeline/ingest.ts) and runs with
-    // `autorun: true`.
     const { startIngestWorker } = await import("@ledgerly/queue/ingestWorker");
-    await startIngestWorker(env.REDIS_URL);
+    const ingestWorker = await startIngestWorker(env.REDIS_URL);
+
+    // D-19's graceful-shutdown wiring: stop accepting new jobs and let
+    // in-flight ones finish on SIGTERM/SIGINT, rather than the process
+    // being killed mid-job (`docker stop`, a rolling deploy).
+    const { registerGracefulShutdown } = await import("@ledgerly/queue");
+    registerGracefulShutdown([extractWorker, ingestWorker], env.REDIS_URL);
   }
 }

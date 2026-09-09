@@ -63,6 +63,16 @@ export const receipts = pgTable(
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
+    // Phase 6: which sanity check(s) (ARCHITECTURE.md §6.3) tripped to
+    // produce extraction_status='partial' — distinct from missing_fields
+    // (null fields the user might fill in) and extraction_error (a single
+    // failure-reason string, still used for 'failed' receipts from either
+    // ingest or AI extraction). More than one check can trip on the same
+    // receipt, hence an array rather than reusing extraction_error.
+    validationFlags: text("validation_flags")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
 
     userNotes: text("user_notes"),
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }),

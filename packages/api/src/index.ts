@@ -11,6 +11,6 @@ export {
   ownerProcedure,
   createCallerFactory,
 } from "./trpc";
-export type { Context } from "./trpc";
+export type { Context, EnqueueReceiptExtract } from "./trpc";
 export { lockScopedProject, scopedProjects } from "./scope";
 export type { ProjectIdScope, ScopeLevel } from "./scope";

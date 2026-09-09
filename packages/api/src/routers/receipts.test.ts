@@ -229,3 +229,148 @@ describe("receipts.delete -- other behavior", () => {
     await expect(fs.access(displayPath)).rejects.toThrow();
   });
 });
+
+/**
+ * receipts.reextract — review finding M-6: same own-only matrix as
+ * `delete`, since it copies that procedure's gate verbatim. `ctxFor`
+ * leaves `enqueueReceiptExtract`/`rateLimitRedis` undefined, exercising
+ * the documented "no capability wired -> warn, don't crash" fallback for
+ * both — authorization itself doesn't depend on either being present.
+ */
+describe("receipts.reextract -- own-only matrix", () => {
+  it("a read_add member can reextract their OWN receipt", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner1",
+      members: [{ key: "adder", permission: "read_add" }],
+    });
+    const receiptId = await insertReceipt(project.id, users.adder!.id);
+    const caller = appRouter.createCaller(ctxFor(users.adder!));
+
+    const result = await caller.receipts.reextract({ id: receiptId });
+    expect(result.id).toBe(receiptId);
+  });
+
+  it("a read_add member CANNOT reextract another user's receipt (FORBIDDEN)", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner2",
+      members: [
+        { key: "adder", permission: "read_add" },
+        { key: "otherAdder", permission: "read_add" },
+      ],
+    });
+    const receiptId = await insertReceipt(project.id, users.otherAdder!.id);
+    const caller = appRouter.createCaller(ctxFor(users.adder!));
+
+    await expect(caller.receipts.reextract({ id: receiptId })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+  });
+
+  it("a full member can reextract ANY receipt in the project", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner3",
+      members: [
+        { key: "full", permission: "full" },
+        { key: "adder", permission: "read_add" },
+      ],
+    });
+    const receiptId = await insertReceipt(project.id, users.adder!.id);
+    const caller = appRouter.createCaller(ctxFor(users.full!));
+
+    const result = await caller.receipts.reextract({ id: receiptId });
+    expect(result.id).toBe(receiptId);
+  });
+
+  it("the project owner can reextract any receipt", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner4",
+      members: [{ key: "adder", permission: "read_add" }],
+    });
+    const receiptId = await insertReceipt(project.id, users.adder!.id);
+    const caller = appRouter.createCaller(ctxFor(users.rxowner4!));
+
+    const result = await caller.receipts.reextract({ id: receiptId });
+    expect(result.id).toBe(receiptId);
+  });
+
+  it("the instance owner can reextract any receipt", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner5",
+      members: [{ key: "adder", permission: "read_add" }],
+    });
+    const receiptId = await insertReceipt(project.id, users.adder!.id);
+    const instanceOwner = await mkTestUser(db, "rx-instance-owner", "owner");
+    const caller = appRouter.createCaller(ctxFor(instanceOwner));
+
+    const result = await caller.receipts.reextract({ id: receiptId });
+    expect(result.id).toBe(receiptId);
+  });
+
+  it("a read-only member cannot reextract at all (NOT_FOUND -- fails the scope gate)", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner6",
+      members: [{ key: "reader", permission: "read" }],
+    });
+    const receiptId = await insertReceipt(project.id, users.reader!.id);
+    const caller = appRouter.createCaller(ctxFor(users.reader!));
+
+    await expect(caller.receipts.reextract({ id: receiptId })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+  });
+
+  it("a user with no relationship to the project gets NOT_FOUND", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner7",
+      members: [],
+    });
+    const receiptId = await insertReceipt(project.id, users.rxowner7!.id);
+    const stranger = await mkTestUser(db, "rx-stranger");
+    const caller = appRouter.createCaller(ctxFor(stranger));
+
+    await expect(caller.receipts.reextract({ id: receiptId })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+  });
+});
+
+describe("receipts.reextract -- other behavior", () => {
+  it("BAD_REQUEST when the receipt has no render yet", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner8",
+      members: [],
+    });
+    const [row] = await db
+      .insert(receipts)
+      .values({
+        projectId: project.id,
+        uploadedBy: users.rxowner8!.id,
+        extractionStatus: "pending",
+      })
+      .returning({ id: receipts.id });
+    const caller = appRouter.createCaller(ctxFor(users.rxowner8!));
+
+    await expect(caller.receipts.reextract({ id: row!.id })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+  });
+
+  it("sets extraction_status back to pending and writes one audit row", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "rxowner9",
+      members: [],
+    });
+    const receiptId = await insertReceipt(project.id, users.rxowner9!.id);
+    await db.update(receipts).set({ extractionStatus: "ok" }).where(eq(receipts.id, receiptId));
+    const caller = appRouter.createCaller(ctxFor(users.rxowner9!));
+
+    await caller.receipts.reextract({ id: receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.extractionStatus).toBe("pending");
+
+    const rows = await db.select().from(auditLog).where(eq(auditLog.entityId, receiptId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.action).toBe("receipt.reextract_requested");
+  });
+});

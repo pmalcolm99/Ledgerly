@@ -7,14 +7,37 @@ import type { Database } from "@ledgerly/db";
 import { isOnboarded, resolveIdentityFromHeaders } from "@ledgerly/auth";
 import type { AuthUser } from "@ledgerly/auth";
 
+import type { RateLimitRedis } from "./rateLimit";
+
 /**
  * packages/api/src/trpc.ts — context and the procedure ladder
  * (task 3.11, ARCHITECTURE.md §4.3, contract §8).
  */
 
+/** Enqueues a `receipt-extract` job. Injected rather than imported, because
+ * `packages/queue` already depends on `@ledgerly/api` (e.g.
+ * `pipeline/render.ts` uses `storage.ts`) — importing `@ledgerly/queue`
+ * back from here would be a circular workspace dependency, not just a
+ * style violation of ARCHITECTURE.md §2's one-way dependency direction.
+ * `apps/web`'s tRPC route handler supplies the real implementation;
+ * `undefined` (the default, e.g. in tests and `createCallerFactory`
+ * callers that don't pass it) means the one procedure that reads it
+ * (`receipts.reextract`) records its audit row but logs a warning instead
+ * of enqueuing — never crashes the mutation over a missing capability. */
+export type EnqueueReceiptExtract = (params: {
+  receiptId: string;
+  forcePass2: boolean;
+}) => Promise<void>;
+
 export type Context = {
   db: Database;
   user: AuthUser | null;
+  enqueueReceiptExtract?: EnqueueReceiptExtract;
+  /** Same injection reasoning as `enqueueReceiptExtract` above (Redis
+   * lives behind `@ledgerly/queue`, which cannot be imported back into
+   * this package). Used by `receipts.reextract` (review finding M-3) to
+   * cap how often a caller can force a paid Sonnet pass. */
+  rateLimitRedis?: RateLimitRedis;
 };
 
 /**
@@ -23,8 +46,17 @@ export type Context = {
  * wrapper in apps/web covers the RSC path by a different route to the same
  * end (one database read per request, D-03).
  */
-export async function createContext(opts: { headers: Headers }): Promise<Context> {
-  return { db: getDb(), user: await resolveIdentityFromHeaders(opts.headers) };
+export async function createContext(opts: {
+  headers: Headers;
+  enqueueReceiptExtract?: EnqueueReceiptExtract;
+  rateLimitRedis?: RateLimitRedis;
+}): Promise<Context> {
+  return {
+    db: getDb(),
+    user: await resolveIdentityFromHeaders(opts.headers),
+    enqueueReceiptExtract: opts.enqueueReceiptExtract,
+    rateLimitRedis: opts.rateLimitRedis,
+  };
 }
 
 /**

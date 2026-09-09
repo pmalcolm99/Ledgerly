@@ -7,5 +7,6 @@ export {
   RECEIPT_INGEST_QUEUE_NAME,
   getReceiptIngestQueue,
 } from "./queue";
-export { startWorkers, sharpRuntimeVersions } from "./worker";
+export { startWorkers } from "./worker";
 export { startIngestWorker } from "./ingestWorker";
+export { registerGracefulShutdown } from "./shutdown";

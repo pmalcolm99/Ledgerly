@@ -350,7 +350,9 @@ differs across models.
 2. **Zod parse** into the internal DTO. Every field is nullable.
 3. **Sanity checks**, each setting `extraction_status = 'partial'` and appending
    to `missing_fields[]` rather than failing:
-   - `|subtotal + sales_tax - total| > 0.02`
+   - `|subtotal + sales_tax + tip - total| > 0.02` (`tip` is 0 when not
+     printed — a superset of the brief's formula, added because a tipped
+     receipt otherwise always trips this check; review finding L-4)
    - `|sum(line_total) - subtotal| > 1.00`
    - `transaction_date` in the future, or before 2000-01-01
 4. **Persist** receipt + items in one transaction. `extraction_raw` is stored

@@ -4,8 +4,29 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 5 — Ingest pipeline. **Complete.** Reviewed once (task 5.11), all
-High/Medium findings and nearly all Low findings fixed, committed.
+Phase 6 — AI extraction. **Code complete and reviewed** (task 6.13); every
+High/Medium/Low finding fixed. **Not yet gated**: tasks 6.3 and 6.12 both
+require a real `ANTHROPIC_API_KEY` (this session's `.env` holds only a
+placeholder) — see "Blocked / open questions" below. D-12 stays
+Provisional until someone with a real key runs both.
+
+## Task 6.13 review — what was found and what was done
+
+The `reviewer` pass found 3 high, 6 medium, and 8 low. All 17 fixed before
+commit.
+
+| #       | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Fix                                                                                                                                                                                                                                                                                                                                                                              |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **H-1** | The Luhn scrub Luhn-checked an entire digit RUN (a maximal span of digits/spaces/dashes) as one candidate and skipped it whole once the combined digit count fell outside 13-19 — so a real PAN merely adjacent to any other digits (an expiry date, an auth code, a line wrap) was never checked at all. `scrub.test.ts` had encoded the bypass as intended behavior.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `scrubDigitRun` now slides a window (19 down to 13 digits) across every position within a run, redacting each Luhn-valid span found and leaving the rest of the run intact, rather than testing the whole run as one candidate.                                                                                                                                                  |
+| **H-2** | `date_too_old` guaranteed the persist transaction would abort: the value still got written to `transaction_date`, which `receipts_date_sane`'s CHECK rejects — burning up to 3 retries (6 paid API calls) before permanently failing the receipt with zero extracted data, against ARCHITECTURE.md §6.3's "sanity checks never fail the receipt."                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `transactionDate` is nulled (and added to `missing_fields`) before the write whenever `date_too_old` trips. `date_in_future` has no such constraint, so that value is kept.                                                                                                                                                                                                      |
+| **H-3** | Model output reached the DB unvalidated beyond a bare structural check — an out-of-range `confidence` (`receipts_confidence_range`), a calendar-invalid date/time, an over-magnitude `quantity`, or a malformed item array element could each abort the transaction or throw a raw `TypeError` mid-map.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `normalize.ts`'s date/time functions now round-trip through `Date.UTC` (rejecting Feb 30, hour 99, etc.); new `normalizeConfidence` rejects-to-0 (not clamps) anything outside 0-1; `normalizeQuantity` gained a `numeric(12,3)` magnitude bound; a new `mapItems` filters non-object/malformed array elements before mapping. Every one degrades to null/dropped, never throws. |
+| **M-1** | The scrub skipped JSON _numbers_ (only strings) and object _keys_ — a model emitting a PAN as a number, or as a key, survived into `extraction_raw` unredacted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `scrubLuhnSequences` now scrubs numbers (converting to a redacted string when a match is found) and object keys, not just string values.                                                                                                                                                                                                                                         |
+| **M-2** | `receipt-extract` jobs dedup on `jobId: receiptId`; while a job for a receipt is still waiting/active/delayed, `receipts.reextract`'s re-add silently no-ops, dropping `forcePass2` with no error — and the reconciliation sweep only picks up `pending` receipts, so an already-`ok` receipt was unreachable by it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `reextract` now sets `extraction_status='pending'` inside its transaction before enqueuing — makes the collision harmless to observe and makes the startup sweep a genuine backstop.                                                                                                                                                                                             |
+| **M-3** | `receipts.reextract` forces a paid Sonnet 5 pass with no rate limit — unlike uploads, unmetered and directly user-triggerable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | New `checkReextractRateLimit` (10/min/user), reusing `rateLimit.ts`'s Lua script under a generalized `checkRateLimit`. Injected via `Context.rateLimitRedis`, same pattern as `enqueueReceiptExtract`.                                                                                                                                                                           |
+| **M-4** | `classifyAnthropicError`'s retryable/non-retryable distinction was computed but never used — a 400 (a rejected strict-mode schema, exactly D-12's open question) or a bad API key was retried 3x with backoff before failing, same as a genuinely transient 429/529.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | `ExtractError` gained `retryable`; `worker.ts` throws BullMQ's `UnrecoverableError` for non-retryable reasons, and the `"failed"` handler's finality check now also recognizes `UnrecoverableError` (which can fire on attempt 1 of 3, not just the last).                                                                                                                       |
+| **M-5** | A billable call that returned no usable tool call (`AI_NO_TOOL_USE`/`AI_INVALID_RESPONSE`) was billed but never recorded in `ai_usage` — invisible to `admin.aiUsage`'s spend/escalation-rate accounting.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `runPass` now records `ai_usage` (with `ok:false`) on both failure branches before throwing, not only on success.                                                                                                                                                                                                                                                                |
+| **M-6** | Neither `receipts.reextract` nor `admin.aiUsage` had an authorization test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `receipts.test.ts` gained the full own-only matrix (mirroring `delete`'s 8-case set) plus BAD_REQUEST/audit/status coverage; new `admin.test.ts` covers owner/non-owner/unauthenticated plus the spend-aggregation and escalation-rate-excludes-manual-force shape.                                                                                                              |
+| **L**   | Eight more: object-key/number scrub coverage extended to full-width digits via NFKC normalize (L-6); `arithmetic_mismatch_total` didn't account for `tip`, false-flagging every tipped receipt (L-4, ARCHITECTURE.md §6.3 updated); `admin.aiUsage`'s `sinceDays` had no upper bound (L-5); the escalation guard in `reextract` ran after, not before, the imageKey check, a narrow existence oracle (L-1); the `"failed"` handler's DB write had no `deletedAt` predicate, unlike `extract.ts`'s own persistence (L-2); a soft-delete race between the `receipts` update and the `receiptItems` write in the same transaction (L-3); `shutdown.ts` `process.exit()`'d without closing the pg pool/Redis connection, and `docker-compose.yml` had no `stop_grace_period` for an in-flight Sonnet call (L-7); this section itself, and D-12's amendment (L-8, see `DECISIONS.md`). | All fixed.                                                                                                                                                                                                                                                                                                                                                                       |
 
 ## Task 5.11 review — what was found and what was done
 
@@ -514,9 +535,97 @@ up -d`. All three containers healthy; `webapp`'s `next-server` runs as
   criterion is unconfirmed and belongs in "Blocked / open questions"
   below so it isn't lost.
 
+**Phase 6 (2026-09-08)**
+
+- Migration `0002` — `receipts.validation_flags text[] not null default
+'{}'`, additive-only, plain `ADD COLUMN`. Records which sanity check(s)
+  tripped `extraction_status='partial'`, independent of `missing_fields`
+  (null fields) and `extraction_error` (a single reason string, reserved
+  for `'failed'` from either ingest or AI). Two confirmed-with-the-user
+  design decisions going in: this new column, and extracting
+  `merchant_phone`/`transaction_time`/`tip` in addition to the task
+  brief's original field list (all three already existed as nullable
+  `receipts` columns).
+- `packages/queue/src/pipeline/schema.ts` — the `record_receipt` tool,
+  `strict: true`, `additionalProperties: false`, `category` enum built at
+  call time from the live `categories` table (D-20), always including
+  `uncategorized`. Money fields are `["string","null"]` decimal strings
+  (D-21's convention), not numbers.
+- `packages/queue/src/pipeline/anthropicRequest.ts` — the per-model
+  capability table D-12 calls for: Haiku 4.5 gets
+  `thinking:{type:"enabled",budget_tokens}`, no `effort`; Sonnet 5 gets
+  `thinking:{type:"adaptive"}` + `effort:"high"`. Forces the tool via
+  `tool_choice`.
+- `packages/queue/src/pipeline/scrub.ts` — the Luhn scrub (CLAUDE.md hard
+  rule). Slides a 19-to-13-digit window across every digit run (not just
+  Luhn-checking a whole run as one candidate — see H-1 below), scrubs
+  string values, JSON numbers, and object keys, NFKC-normalizes first.
+  `card_last4` separately asserted to be exactly 4 digits or null.
+- `packages/queue/src/pipeline/normalize.ts` — total, never-throw
+  normalizers for every extracted field, each defending the DB column it
+  feeds (calendar-valid dates/times via `Date.UTC` round-trip, a
+  `numeric(12,3)` magnitude bound on quantity, `normalizeConfidence`
+  rejecting-to-0 anything outside 0-1).
+- `packages/queue/src/pipeline/validate.ts` — the three sanity checks
+  (arithmetic vs. total including tip, arithmetic vs. items, date
+  future/too-old), never failing the receipt, money compared in integer
+  cents via `packages/shared/money.ts` (D-21).
+- `packages/queue/src/pipeline/extract.ts` — `processReceiptExtraction`,
+  mirroring `pipeline/ingest.ts`'s Worker-agnostic shape: idempotency
+  guard, `regenerateExtractionRender` as the sole source of render-A bytes
+  at extraction time (render A is never persisted or queued —
+  ARCHITECTURE.md §5), the two-pass escalation ladder
+  (null total/date/zero items/low confidence), `ExtractError` with a
+  `retryable` flag, one transaction per persist (replace-not-append
+  `receipt_items`, idempotent under retry and manual re-extract).
+- `packages/queue/src/worker.ts` — replaces the Phase 5 stub with the real
+  `receipt-extract` `Worker` (`autorun: true`, concurrency from
+  `AI_CONCURRENCY`), a `"failed"` handler recognizing both
+  attempts-exhausted and `UnrecoverableError` finality, and a startup
+  reconciliation sweep (D-08) filtering `receipts_pending_idx` the
+  opposite direction from `ingestWorker.ts`'s own sweep (render exists,
+  extraction doesn't).
+- `packages/queue/src/shutdown.ts` — new. `SIGTERM`/`SIGINT` handling
+  (D-19) did not exist anywhere in the repo before this phase: closes both
+  workers, then the shared pg pool and Redis connection, before exiting.
+  `docker-compose.yml`'s `webapp` service gained `stop_grace_period: 30s`
+  so an in-flight Sonnet call has room to finish.
+- `packages/api/src/routers/receipts.ts` — `reextract`: forces the Sonnet
+  path directly (skips the ladder), same own-only escalation-guard shape
+  as `delete`, rate-limited (`checkReextractRateLimit`, 10/min/user),
+  injects the queue enqueue via a new optional `Context.enqueueReceiptExtract`
+  capability (packages/api cannot import `@ledgerly/queue` — that package
+  already depends on `@ledgerly/api`, so the reverse import would be
+  circular; `apps/web`'s tRPC route handler wires the real implementation).
+- `packages/api/src/routers/admin.ts` — `aiUsage`: spend (token-derived,
+  a hardcoded $/MTok table) and the pass-1→pass-2 escalation rate per
+  D-12, `ownerProcedure`-gated. No UI page consumes it yet —
+  `apps/web/src/app/admin/` doesn't exist until Phase 7 (task 7.1 is
+  HeroUI/Tailwind setup) — this procedure is task 6.10's "admin view"
+  itself, matching the phase brief's own file list for that task.
+- `apps/web/src/instrumentation.ts` — actually calls `startWorkers` now
+  (previously import-only, for the build's file tracer); registers
+  graceful shutdown for both workers.
+- **384 tests passing** across all 8 packages (`api` 129, `auth` 52,
+  `shared` 61, `config` 17, `db` 2, `queue` 95, `web` 28), up from Phase
+  5's 300. `pnpm lint` and `pnpm typecheck` clean repo-wide.
+- **Full Docker verification**: `docker compose build && up` from current
+  source — migration `0002` applies cleanly, health check 200, no
+  worker/Anthropic-client startup errors (verified even with a placeholder
+  `ANTHROPIC_API_KEY`, since client construction doesn't validate the key
+  format — only an actual call would fail).
+- Reviewed once — see "Task 6.13 review" above. All 17 findings (3 High, 6
+  Medium, 8 Low) fixed before commit.
+- **Not verified this session, deliberately blocked**: task 6.3's live
+  strict-mode confirmation and task 6.12's 10-receipt accuracy run. Both
+  need a real `ANTHROPIC_API_KEY`; this session's `.env` holds only a
+  placeholder (`dev-placehol...`). See "Blocked / open questions" below —
+  same "named gap, not a silent one" convention Phase 5 used for its own
+  real-HEIC gap.
+
 ## Next
 
-Phase 6 — AI extraction.
+Phase 6's two live-API tasks (6.3, 6.12), then Phase 7 — UI & PWA.
 
 ### Running the database tests locally
 
@@ -595,11 +704,31 @@ Decisions taken by the user this session:
   iPhone photo handy: run it through `/api/receipts/upload` once (locally,
   never committed) and confirm `display.webp`/`thumb.webp` land correctly
   and `exiftool` shows no EXIF; then this line can be struck.
-- **D-12 is Provisional.** Phase 6 task 6.3 must confirm strict-mode tool use
-  accepts `["string","null"]` union types; if not, the fallback is non-strict
-  tool use with Zod validation, appended to D-12 rather than filed anew. Phase 6
-  task 6.12 measures extraction accuracy over 10 real receipts, which is what
-  settles whether `claude-haiku-4-5` is the right pass-1 model.
+- **D-12 is still Provisional — task 6.3 was never run.** The whole Phase 6
+  pipeline (`schema.ts`'s `strict: true` tool, the Haiku/Sonnet request
+  shapes) is built and unit-tested against a fake Anthropic client, but the
+  actual live confirmation that strict mode accepts `["string","null"]`
+  union types requires a real `ANTHROPIC_API_KEY` — this session's `.env`
+  holds only a placeholder (`dev-placehol...`), so the call was never made.
+  `pipeline/extract.ts`'s `isRecordReceiptInputShape` is a light structural
+  guard (object + `items` array), not the full Zod parse
+  `ARCHITECTURE.md` §6.2 originally sketched — deliberately: rejecting an
+  entire otherwise-good extraction over one out-of-schema field would
+  contradict CLAUDE.md's "a null field is fine" philosophy, so
+  `normalize.ts`'s per-field functions carry the real defense instead (see
+  the task 6.13 review's H-3 entry). If a real key confirms strict mode
+  holds, this note can be struck and D-12 marked Confirmed; if it doesn't,
+  the fallback is non-strict tool use with a proper Zod parse of the whole
+  response, appended to D-12 rather than filed anew.
+- **Task 6.12 (10-receipt accuracy) never ran, for the same reason** —
+  needs both a real `ANTHROPIC_API_KEY` and the user's own real receipt
+  photos (per Phase 5's D-13 precedent, synthetic-only in this public
+  repo — real receipts stay local, never committed, written to
+  `docs/private/PHASE6_ACCURACY.md`). This is also where the escalation
+  rate gets its first real reading against D-12's ~45% threshold.
+  Whoever next has both: set a real key in `.env`, then run the extraction
+  pipeline against 10 real photos and record correct/null/**wrong** per
+  field (wrong called out by name — it's worse than null).
 
 ## Surprises / notes
 

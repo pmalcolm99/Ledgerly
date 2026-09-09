@@ -337,6 +337,26 @@ appended here rather than filed as a new decision. Phase 6 also measures
 extraction accuracy over 10 real receipts, which is what settles whether the
 pass-1 model is the right one.
 
+**Amendment (Phase 6 implementation session, 2026-09-08): still Provisional
+— the confirmation call was never made.** The full pipeline was built —
+`packages/queue/src/pipeline/schema.ts`'s `record_receipt` tool with
+`strict: true` and `["string","null"]` money/date/time fields exactly as
+sketched above, `pipeline/anthropicRequest.ts`'s per-model request-shape
+table, the two-pass ladder, the Luhn scrub, sanity checks — and is
+unit-tested end to end against a fake Anthropic client. But this session's
+`.env` held only a placeholder `ANTHROPIC_API_KEY` (`dev-placehol...`), so
+the one live call task 6.3 requires was never actually made. Nothing here
+depends on the outcome being one way or the other: `pipeline/extract.ts`
+treats the tool-input shape check as a structural gate only (object +
+`items` array), not a hard reject-the-whole-response validator, and every
+individual field goes through a total, never-throw normalizer in
+`normalize.ts` regardless of whether strict mode's own guarantees hold —
+so the pipeline degrades gracefully either way, it just isn't yet _known_
+which way. Whoever next has a real key: one call with this exact schema
+settles it, and task 6.12's 10-receipt accuracy run (also blocked on a
+real key, and on the user's own receipt photos) is what settles the
+pass-1 model question. See `docs/STATE.md`'s "Blocked / open questions."
+
 ---
 
 ## D-13 — gitleaks in CI alongside secretlint in pre-commit. **Settled.**
