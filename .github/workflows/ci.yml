@@ -135,6 +135,24 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # `--with-deps` shells out to `apt-get update`, which fails the whole
+      # install if ANY configured repository is unhealthy — even one this
+      # project has no use for. The runner image ships Google's Chrome repo
+      # preconfigured, and on 2026-09-09 it began serving a `Packages.gz` whose
+      # hash did not match its own Release file, taking down every e2e run on
+      # `main` with `E: Failed to fetch ... Hash Sum mismatch`. Nothing in this
+      # suite uses Chrome: it is WebKit only.
+      #
+      # So the repositories that have nothing to do with WebKit's system
+      # libraries are removed first. This narrows what CI depends on rather
+      # than papering over a failure — an unrelated third-party apt repo should
+      # never have been able to break this job.
+      - name: Drop apt repositories this job does not need
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+
       # WebKit only — Chromium and Firefox are never used by this suite.
       - run: pnpm --filter @ledgerly/web exec playwright install --with-deps webkit
 
