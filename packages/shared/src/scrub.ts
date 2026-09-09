@@ -177,7 +177,9 @@ export function scrubLuhnSequences<T>(value: T): ScrubResult<T> {
  * CLAUDE.md: "card_last4 is exactly four digits or null. Never the full
  * number."
  */
-export function normalizeCardLast4(value: string | null): string | null {
-  if (value === null) return null;
+export function normalizeCardLast4(value: string | null | undefined): string | null {
+  // `undefined` as well as `null`: model output can omit a field entirely,
+  // and a missing card_last4 is the same fact as an absent one.
+  if (value === null || value === undefined) return null;
   return /^\d{4}$/.test(value) ? value : null;
 }

@@ -53,6 +53,32 @@ briefly changed and changed back. **Absence from a listing endpoint is not
 evidence of invalidity**, and one direct call would have settled it — the same
 call that eventually did.
 
+**The second bug, and the one that was actually stopping extraction.** With
+the request shape fixed, every receipt still failed — now with a visible cause,
+because the logging above was in place:
+
+```
+TypeError: Cannot read properties of undefined (reading 'replace')
+```
+
+The tool schema's `required` list was `["confidence", "items"]`, so every other
+field was optional and the model simply omitted the ones it could not read.
+`RecordReceiptInput` typed them all as `string | null`, which was a lie at
+runtime, and `normalizeMoney`'s `raw === null` guard does not catch `undefined`.
+It threw **after a successful, billed API call**, which is why three Sonnet
+calls could succeed and the receipt still end up `failed`.
+
+This also finally answers **task 6.3 / D-12's Provisional question**: strict
+mode DOES accept `["string","null"]` unions, on both Haiku 4.5 and Sonnet 5 —
+provided `required` lists every property. Optionality goes in the union, never
+in an omission from `required`. Confirmed live; both models now return every
+key with absent values as explicit `null`.
+
+Fixed in both places on purpose: the schema (the cause) and the normalizers,
+which now treat `undefined` exactly like `null` (the safety net — that file's
+entire job is to not trust the model's output shape). `schema.test.ts` asserts
+completeness as an invariant rather than by re-listing names.
+
 **The gap that made all of this expensive.** ARCHITECTURE.md §6.4 promises the
 UI gets "a status and a job id, not a provider message". Only half was built:
 the provider's message was _discarded_ rather than logged server-side. That

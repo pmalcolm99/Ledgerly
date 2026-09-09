@@ -71,7 +71,31 @@ export function buildRecordReceiptTool(categorySlugs: readonly string[]): Anthro
     input_schema: {
       type: "object",
       additionalProperties: false,
-      required: ["confidence", "items"],
+      // EVERY property, per strict mode's contract: `additionalProperties:
+      // false` plus a complete `required` list, with nullability carried by
+      // the `["string","null"]` unions rather than by omission.
+      //
+      // It was `["confidence", "items"]`, which made every other field
+      // optional — so the model omitted them, `RecordReceiptInput`'s
+      // `string | null` type was a lie at runtime, and `normalizeMoney`
+      // threw on `undefined` after a successful, billed call. That the
+      // union-typed fields are accepted here is task 6.3 / D-12's
+      // Provisional question, now confirmed against the live API.
+      required: [
+        "merchant_name",
+        "merchant_address",
+        "merchant_phone",
+        "transaction_date",
+        "transaction_time",
+        "subtotal",
+        "sales_tax",
+        "tip",
+        "total",
+        "card_last4",
+        "payment_method",
+        "confidence",
+        "items",
+      ],
       properties: {
         merchant_name: NULLABLE_STRING,
         merchant_address: NULLABLE_STRING,
@@ -105,7 +129,7 @@ export function buildRecordReceiptTool(categorySlugs: readonly string[]): Anthro
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["description", "category"],
+            required: ["description", "quantity", "unit_price", "line_total", "category"],
             properties: {
               description: {
                 type: "string",

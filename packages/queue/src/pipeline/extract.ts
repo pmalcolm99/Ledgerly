@@ -402,9 +402,20 @@ export async function processReceiptExtraction(
 
   const input = finalPass.input;
 
-  const merchantName = input.merchant_name;
-  const merchantAddress = input.merchant_address;
-  const merchantPhone = input.merchant_phone;
+  // `?? null` on every passthrough field, for two distinct reasons:
+  //
+  //  - `undefined` reaching drizzle's `.set()` means "leave this column
+  //    alone", so an omitted field would silently PRESERVE a stale value
+  //    from a previous extraction rather than clearing it;
+  //  - the `=== null` checks below that build `missing_fields` would miss it,
+  //    so the user would never be told the field was not read.
+  //
+  // A field the model omitted and a field it returned as null are the same
+  // fact. See normalize.ts's header for the failure this class of hole
+  // actually caused.
+  const merchantName = input.merchant_name ?? null;
+  const merchantAddress = input.merchant_address ?? null;
+  const merchantPhone = input.merchant_phone ?? null;
   let transactionDate = normalizeDate(input.transaction_date);
   const transactionTime = normalizeTime(input.transaction_time);
   const subtotal = normalizeMoney(input.subtotal);
@@ -412,10 +423,13 @@ export async function processReceiptExtraction(
   const tip = normalizeMoney(input.tip);
   const total = normalizeMoney(input.total);
   const cardLast4 = normalizeCardLast4(input.card_last4);
-  const paymentMethod = input.payment_method;
+  const paymentMethod = input.payment_method ?? null;
   const confidence = normalizeConfidence(input.confidence);
 
-  const items = mapItems(input.items, categoryIdBySlug);
+  // `Array.isArray`, not a truthiness check: `items` is the one field the
+  // schema has always required, but this file's contract is to survive any
+  // shape the model returns, and `for (const raw of undefined)` throws.
+  const items = mapItems(Array.isArray(input.items) ? input.items : [], categoryIdBySlug);
 
   const validationInput: ValidationInput = {
     subtotal,

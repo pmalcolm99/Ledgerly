@@ -13,6 +13,21 @@ import { formatMoney, parseMoney } from "@ledgerly/shared/money";
  * out-of-range quantities reach a column write, aborting the whole
  * extraction transaction instead of degrading to null + missing_fields,
  * per ARCHITECTURE.md §6.3's "extraction never fails" rule).
+ *
+ * ## Every input here is `string | null | undefined`, and that is deliberate
+ *
+ * These take model output. The `RecordReceiptInput` TYPE says each field is
+ * `string | null`, but the tool schema's `required` list did not cover them,
+ * so a model that simply omitted a field produced `undefined` — and a
+ * `raw === null` guard does not catch `undefined`. The result was
+ * `TypeError: Cannot read properties of undefined (reading 'replace')`,
+ * thrown after a successful, billed API call, surfacing as the generic
+ * `AI_EXTRACTION_FAILED` and retried twice more.
+ *
+ * The schema is fixed too (schema.ts), but these signatures are the layer
+ * that must hold REGARDLESS of what the schema says, because the whole point
+ * of this file is to not trust the model's output shape. A missing field is
+ * the same fact as a null one: no value. Both become null.
  */
 
 /** `numeric(12,2)` money field: strips stray `$`/`,`/whitespace a model
@@ -20,8 +35,8 @@ import { formatMoney, parseMoney } from "@ledgerly/shared/money";
  * numeric<->cents boundary, which already enforces the numeric(12,2)
  * range), and re-formats to canonicalize (e.g. "12.3" -> "12.30"). Null or
  * unparseable becomes null. */
-export function normalizeMoney(raw: string | null): string | null {
-  if (raw === null) return null;
+export function normalizeMoney(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
   const cleaned = raw.replace(/[$,\s]/g, "");
   try {
     return formatMoney(parseMoney(cleaned));
@@ -39,8 +54,8 @@ const QUANTITY_MAX_MAGNITUDE = 999_999_999.999;
 /** `numeric(12,3)` quantity: one more fractional digit than `parseMoney`
  * accepts (not a money column), so this is a plain decimal-string
  * validator with its own magnitude bound, not routed through money.ts. */
-export function normalizeQuantity(raw: string | null): string | null {
-  if (raw === null) return null;
+export function normalizeQuantity(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
   const cleaned = raw.trim();
   if (!/^-?\d+(\.\d{1,3})?$/.test(cleaned)) return null;
   return Math.abs(Number(cleaned)) <= QUANTITY_MAX_MAGNITUDE ? cleaned : null;
@@ -53,8 +68,8 @@ export function normalizeQuantity(raw: string | null): string | null {
  * at write time. Round-trips through `Date.UTC` and rejects anything that
  * doesn't come back exactly (catches Feb 30, month 13, etc.).
  */
-export function normalizeDate(raw: string | null): string | null {
-  if (raw === null) return null;
+export function normalizeDate(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
   if (!match) return null;
   const [, y, m, d] = match as unknown as [string, string, string, string];
@@ -72,8 +87,8 @@ export function normalizeDate(raw: string | null): string | null {
  * `\d{2}:\d{2}` regex but `receipts.transaction_time` is a real `time`
  * column that would reject it.
  */
-export function normalizeTime(raw: string | null): string | null {
-  if (raw === null) return null;
+export function normalizeTime(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
   const match = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
   if (!match) return null;
   const [, h, mi, s] = match as unknown as [string, string, string, string | undefined];

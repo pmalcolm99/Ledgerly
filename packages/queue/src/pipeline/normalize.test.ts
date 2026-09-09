@@ -100,4 +100,23 @@ describe("normalizeTime", () => {
     expect(normalizeTime(null)).toBeNull();
     expect(normalizeTime("2:30pm")).toBeNull();
   });
+
+  /**
+   * The regression for the production failure: a model that OMITS a field
+   * yields `undefined`, and a `raw === null` guard does not catch it.
+   * `normalizeMoney(undefined)` threw
+   * `TypeError: Cannot read properties of undefined (reading 'replace')`
+   * after a successful, billed API call — surfacing as the generic
+   * AI_EXTRACTION_FAILED and burning two more attempts.
+   *
+   * The schema now requires every field, so this should not arise; these
+   * assertions exist because this file's whole job is to not depend on that.
+   */
+  it("treats undefined exactly like null, never throwing", () => {
+    expect(normalizeMoney(undefined)).toBeNull();
+    expect(normalizeQuantity(undefined)).toBeNull();
+    expect(normalizeDate(undefined)).toBeNull();
+    expect(normalizeTime(undefined)).toBeNull();
+    expect(normalizeConfidence(undefined)).toBe(0);
+  });
 });

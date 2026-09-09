@@ -318,6 +318,29 @@ and `yt-dlp`, and the `chrome-headless` service entirely.
 > endpoint is not evidence of invalidity, and the probe that would have
 > settled it in one call was available the whole time.
 >
+> **Task 6.3 is answered: strict mode DOES accept `["string","null"]`
+> unions.** Confirmed against the live API on both `claude-haiku-4-5` and
+> `claude-sonnet-5`. The condition is that `required` must list **every**
+> property — strict mode's contract is `additionalProperties: false` plus a
+> complete `required`, with optionality expressed by the union, never by
+> omission from `required`.
+>
+> Ledgerly had it the other way round: `required: ["confidence", "items"]`,
+> with every other field optional, while `RecordReceiptInput` typed them all
+> as `string | null`. The type was a lie at runtime. A model that omitted a
+> field produced `undefined`, `normalizeMoney`'s `raw === null` guard did not
+> catch it, and `.replace` threw — **after a successful, billed API call**,
+> surfacing as the generic `AI_EXTRACTION_FAILED` and burning two more
+> attempts. With the complete list, both models now return every key, with
+> genuinely-absent values as explicit `null`.
+>
+> Two fixes, deliberately both: the schema (the cause) and the normalizers,
+> which now treat `undefined` exactly like `null` (the safety net). That file
+> exists to not trust the model's output shape, so it must hold regardless of
+> what the schema says. `schema.test.ts` asserts the completeness as an
+> INVARIANT — every declared property is required — rather than by re-listing
+> names, so adding a field and forgetting `required` fails in CI.
+>
 > **The observability gap this exposed.** ARCHITECTURE.md §6.4 says errors
 > surfaced to the UI carry "a status and a job id, not a provider message".
 > Only half of that was implemented: the provider message was discarded rather
