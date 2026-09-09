@@ -149,8 +149,16 @@ jobs:
       # never have been able to break this job.
       - name: Drop apt repositories this job does not need
         run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
+          # Matched by CONTENT, not by filename. The first attempt at this
+          # removed `google-chrome.list` and the repo was still fetched — the
+          # runner image configures it under a different name, and may use
+          # either the one-line `.list` format or deb822 `.sources`. Grepping
+          # for the host finds it however it is spelled.
+          sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+            | sudo xargs -r rm -f
+          # Not `|| true`: with those repos gone this must now succeed, and a
+          # failure here is a real one worth stopping for.
           sudo apt-get update
 
       # WebKit only — Chromium and Firefox are never used by this suite.
