@@ -4,18 +4,48 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 7 — UI & PWA. **Code complete and reviewed.** The app has screens for
-the first time: onboarding, project list, project dashboard, receipt capture,
-receipt detail, review queue, category settings, and an admin view. Manifest,
-icons, iOS splash screens, offline shell and service worker all ship.
+Phase 8 — Export. **Code complete and reviewed.** Data leaves the system for
+the first time: `GET /api/projects/[id]/export?format=xlsx|csv` streams a
+three-sheet workbook (Line Items, Receipts, Summary) or the line-item sheet as
+CSV, respecting whatever filter is on the dashboard, audited on the way out.
+The dashboard's Export button is wired.
 
-**Not yet gated.** Phase 7's gate is "usable on your phone through the
-tunnel", and that is a manual check only you can make — there is no iOS device
-here and Playwright's WebKit is not Mobile Safari. The checklist is under
-"Blocked / open questions".
+**Not yet gated.** Phase 8's gate is "opens clean in Excel and the totals
+reconcile" — the reconciliation half is asserted programmatically (the suite
+reads the written file back and sums both sheets in integer cents), but
+"opens clean in Excel" is a manual check only you can make; there is no Excel
+here. Two sample workbooks were generated for it and are in `docs/private/`
+(gitignored). See "Blocked / open questions".
 
-Phase 6 remains ungated for its own reason (tasks 6.3 and 6.12 need a real
+Phase 7 remains ungated for its own reason (usable on your phone through the
+tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
 `ANTHROPIC_API_KEY`); D-12 stays Provisional.
+
+## Phase 8 review — what was found and what was done
+
+The `reviewer` pass found 1 high, 3 medium and 4 low. All eight fixed before
+commit; the reviewer separately verified eight areas clean (authorization
+composition, 404-not-403, header injection, audit metadata, client-facing error
+messages, the Luhn boundary, keyset pagination, and column grain).
+
+| Sev      | Finding                                                                                                                                                                                                                                                                                                                                                                                      | Fix                                                                                                                                                                                                                                                           |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **High** | **CSV formula injection.** Seven text columns were written unescaped, so a cell beginning `=`/`+`/`-`/`@` was evaluated on open. `merchant` is the sharp one and it is not an insider threat: the merchant line is **read off a photograph by the model**, typed as an unconstrained string, and the Luhn scrub only touches digits — a receipt printed with `=cmd                           | '/c calc'!A0` reached the spreadsheet verbatim. D-38's own research (Excel re-parses quoted fields) is exactly why quoting was not a mitigation.                                                                                                              | Apostrophe-prefix (OWASP) on any free-text cell with a formula lead, plus the header block. `="…"` deliberately not reused — an Excel string literal caps at 255 chars and `item_description`/`receipt_notes` exceed it. Test verified to fail without the fix. XLSX confirmed unaffected (ExcelJS types a string as `String` unconditionally). D-38 amended, including the sentence it had wrong. |
+| Med      | The detached writer's `PassThrough` had **no `error` listener**, so `destroy(error)` outside the read window is an unhandled `'error'` — a process kill. Reachable: `writeWorkbook` runs synchronously to its first `await` (writer construction, header block, first commits), so a throw there fires the catch _before_ `startProjectExport` returns, when no consumer exists.             | `stream.on("error", () => {})` at construction. The real failure is already reported by `console.error` and the truncated transfer.                                                                                                                           |
+| Med      | **A stalled reader parks the writer indefinitely.** `stream.destroyed` catches a _cancelled_ read, but a client that opens the connection and stops reading without disconnecting produces no `drain`, no `close`, no `error` — the page of rows and the whole ExcelJS workbook stay resident. No rate limit either, unlike upload and `reextract`.                                          | `request.signal` threaded into the paging loop, plus `EXPORT_RATE_LIMIT_PER_MIN` (6/min/user) reusing `rateLimit.ts`. Checked before the project lookup so a limited caller learns nothing about existence — asserted.                                        |
+| Med      | **`uploaded_by` emitted a raw email**, contradicting the policy stated 40 lines away in `resolveFilterLabels` ("this string is written into a file that gets emailed to an accountant"). `displayNameOf` falls back to the address and `display_name` is nullable for everyone, so one export could carry a colleague's address in thousands of cells while the header line refused it once. | `email: null` at all call sites, and `users.email` dropped from the export's select entirely so the fallback is unrepresentable. Writing the test found a **third** instance the review missed — `exportedBy`, the exporter's own address in the header line. |
+| Low      | `addCents`'s safe-integer guard protected a bound ~90x higher than the one that binds: every total renders through `formatMoney`, which throws above `NUMERIC_12_2_MAX_CENTS`. The guard meant to make the failure loud could never fire first.                                                                                                                                              | Guards the real ceiling with an accurate message; `NUMERIC_12_2_MAX_CENTS` exported from `money.ts`.                                                                                                                                                          |
+| Low      | **A truncated CSV is a syntactically valid CSV.** The "a truncated transfer is the correct outcome" reasoning holds for XLSX (a cut zip will not open) but not for CSV, where every complete line before the cut is still a well-formed record and the only signal is whatever the browser says.                                                                                             | A terminal `# end of export: N line items` row, asserted against the actual row count. If it is absent, the file is short.                                                                                                                                    |
+| Low      | The `stream.destroyed` early returns skip `workbook.commit()`, abandoning the writer mid-zip. Not a leak in this configuration (in-memory, collectable) but would orphan a temp file per cancelled download in ExcelJS's file-backed mode.                                                                                                                                                   | Comment at the return, naming the condition under which it would become one.                                                                                                                                                                                  |
+| Low      | The download is a `GET`, so a third-party page can trigger one cross-site with the Access cookie and cause an audit row plus a full project read. No data reaches the attacker.                                                                                                                                                                                                              | Documented at the handler and in D-37: an `export.generated` row means "requested by this identity", not "intended by this user". The rate limit above bounds the cost.                                                                                       |
+
+Two things worth recording about the review itself. It ran against a tree that
+changed underneath it — `fetchItemsForReceipts` gained a scoped `innerJoin` and
+`stream.end()` gained a `destroyed` guard mid-review — and it re-read those
+files at the end rather than reporting stale findings. And it verified its
+claims by running the code (the CSV escape functions, and four `PassThrough`
+destroy/cancel scenarios) rather than reasoning about it, which is what turned
+the `error`-listener finding from a theory into a reachable process kill.
 
 ## Phase 7 review — what was found and what was done
 
@@ -198,6 +228,113 @@ The `reviewer` pass found 2 high, 7 medium and 11 low. Fixed before commit:
   package framework-agnostic. The relocation is right; the document is not.
 
 ## Completed
+
+**Phase 8 (2026-09-09)**
+
+- **The whole phase is shaped around one failure mode.** The brief §1.7,
+  `docs/PHASES.md` 8.3 and the session prompt all name it independently:
+  repeating a receipt total on each of that receipt's line-item rows, so
+  someone drags a SUM down the column and triples their deduction. So the two
+  grains are structurally separate — `LINE_ITEM_COLUMNS` contains no
+  `subtotal`/`sales_tax`/`tip`/`total`, and the test asserts their absence **by
+  header name**, not by checking that no value looks like a total. A future
+  "convenient" total column on sheet 1 would reintroduce the bug and would read
+  as an improvement in a diff; that assertion is what stops it.
+- **D-37: a streaming Route Handler, not a BullMQ `export` job.** Task 8.1 and
+  D-08 specify a queue job; the session prompt specifies a streamed response.
+  Resolved with you in favour of the route. The job version needs an `exports`
+  table, an artifact directory, retention, a startup reconciliation sweep and a
+  polling UI — a phase's worth of surface for a problem this instance does not
+  have. The `export` queue stays reserved and unbuilt; two queues exist, not
+  three. The code lives in `packages/api/src/export/`, **not**
+  `packages/queue/src/pipeline/export.ts` as `PHASES.md` names it: with no job,
+  `apps/web` cannot reach `@ledgerly/queue`, and `queue` already depends on
+  `api`.
+- **One pass over the data, two grains out.** The obvious implementation reads
+  the receipts twice — once per sheet — and is wrong: two reads of a live table
+  are two snapshots that can disagree, and "the totals reconcile" is the gate.
+  Instead each keyset page writes its line items (committed row by row, then
+  freed), buffers eleven receipt-grain scalars, and feeds the summary
+  accumulator. The unbounded dimension streams; the bounded one is capped by
+  `MAX_EXPORT_RECEIPTS` (50,000 → 413). Both sheets and the summary therefore
+  derive from ONE read of each row and cannot disagree.
+- **Excel-usable by construction, not by cleanup.** Money is a real number
+  (`parseMoney` → integer cents → `/100` only at the cell, D-21) with a
+  currency `numFmt`; dates are real dates built with `Date.UTC`; `quantity`
+  goes through `numeric.ts`, never `money.ts` (whose pattern rejects a third
+  decimal); `card_last4` is a text cell so `"0042"` survives; header rows are
+  frozen and columns sized.
+- **A third sheet, Summary**: spend by category, spend by month, and a
+  reconciliation block printing Σ`line_total`, Σ`sales_tax`, Σ`tip`, Σ`total`
+  and the difference. Tax and tip are deliberately not apportioned across
+  categories — `projects.ts` already argued that for the dashboard and it holds
+  harder for a tax record. The block also counts receipts with no line items
+  and receipts with no total, so the gap between the two grains is explained on
+  the sheet rather than discovered by someone summing a column.
+- **Filter parity is asserted against `receipts.list` itself**, not against a
+  re-derived expectation, so a change to one that is not made to the other
+  fails in CI rather than in an accountant's inbox. A category filter selects
+  RECEIPTS (the same correlated `EXISTS`) and then writes every item of each —
+  which is both what was on screen and what keeps the sheets reconciling.
+- **Audited before a byte leaves.** One `export.generated` row per export with
+  the filter set in `metadata` (ids and dates only — no email, no display
+  name), plus `owner_override.performed` when the instance owner exports a
+  project they do not own. In its own transaction, because the export writes
+  nothing and `recordAudit`'s contract is to share the transaction of the write
+  it documents. Deliberately not conditional on the stream completing: a stream
+  that fails halfway has still disclosed what it already sent.
+- **Tests: 567 unit across the workspace, up from 485.** `packages/api` went
+  190 → 233, plus 21 new in `apps/web` (the route handler and the shared filter
+  parser). The centrepiece
+  reads the WRITTEN FILE back through ExcelJS and sums both sheets
+  independently in integer cents — deliberately not a test of the accumulator,
+  which could be perfect while the writer put the numbers in the wrong cells.
+  The authorization matrix mirrors `phase7Permissions.test.ts`, filter parity
+  is asserted against `receipts.list` itself, and the cancel-mid-download path
+  has its own test because it was a real leak (below).
+
+**Notes worth carrying forward**
+
+- **`exceljs` had to become a direct dependency of `apps/web` too**, not just
+  of `packages/api`. This is the identical trap `next.config.ts` documents at
+  length for `sharp`/`bullmq`: a package reachable only transitively is traced
+  into `.next/standalone/packages/*/node_modules/`, which is not on the
+  resolution path the bundled code walks. Verified the same way task 2.8 did —
+  `require.resolve("exceljs", { paths: [".next/standalone/apps/web"] })`
+  against a real build, not assumed.
+- **`exceljs/index.d.ts` line 1 declares a GLOBAL `interface Buffer extends
+ArrayBuffer {}`.** It merges with `@types/node`'s `Buffer<ArrayBuffer>` into a
+  type nothing can satisfy — not `Buffer.concat`'s result, not
+  `Buffer.alloc`'s, not a real `ArrayBuffer` — while `xlsx.load` accepts all
+  three at runtime. The one cast this phase adds is confined to a single test
+  helper (`fixture.test-helper.ts`'s `loadWorkbook`) with that explanation
+  attached, rather than scattered as unexplained `as` across four suites.
+- **A streaming worksheet's `views` is getter-only.** Freeze panes can only be
+  set through `addWorksheet(name, { views })`, and `worksheet.columns` must
+  carry `width` WITHOUT `header` — a `header` makes ExcelJS emit its own header
+  row above everything, which would push sheet 1's metadata block below the
+  headers it introduces. `row.commit()` on every row is what actually frees it;
+  a row added and never committed stays in memory and the streaming property
+  becomes a comment.
+- **`needsReview=0` must not be a 400.** The client reads this parameter as
+  `value === "1"`, so that URL means "off" on the dashboard. The first version
+  of the export's zod schema used `z.literal("1")` and rejected it — the two
+  halves of one feature disagreeing about what a filter means. Caught by the
+  filters test, not by review.
+- **An abandoned export used to leak.** `startProjectExport` returns while a
+  detached writer keeps paging the database; if the client disconnects, an
+  `awaitDrain` waiting on a `drain` that can never arrive never settles, and
+  the writer, its queries and its pool connection leak for the life of the
+  process. Both writers now resolve on `close`/`error` as well as `drain` and
+  bail on `stream.destroyed` between pages. Surfaced as a TRUNCATE deadlock in
+  the test suite, which is the same bug wearing a different hat — every suite
+  that starts an export now drains it.
+- **`image_filename` is derived, not stored.** The schema has `image_key`,
+  which holds only the render's extension; every display render is literally
+  named `display.webp`, so a bare basename would be the same string on every
+  row. The column carries the path relative to `UPLOADS_DIR`
+  (`<project>/<receipt>/display.webp`), which is what locates the image inside
+  a backup archive.
 
 **Phase 7 (2026-09-08)**
 
@@ -740,11 +877,33 @@ up -d`. All three containers healthy; `webapp`'s `next-server` runs as
 
 ## Next
 
-Phase 8 — Export (XLSX/CSV). The dashboard's Export button is already rendered
-and disabled, waiting to be wired.
+Phase 9 — Backups. `pg_dump` + optional image tarball, a manifest with
+checksums, a scheduled repeatable job, retention, and `scripts/restore.sh`.
+Its gate is a restore drill against a scratch database: a backup that has
+never been restored is a hypothesis.
 
 Still outstanding from earlier phases: Phase 6's two live-API tasks (6.3,
-6.12), which need a real `ANTHROPIC_API_KEY`.
+6.12), which need a real `ANTHROPIC_API_KEY`; Phase 7's on-device check; and
+Phase 8's Excel check below.
+
+### Phase 8's manual gate
+
+Two sample workbooks are in `docs/private/` (gitignored), generated from the
+real exporter:
+
+- `kitchen-remodel_2026-09-09.xlsx` — 24 clean receipts. Summary's
+  **Difference** row reads **$0.00**: 11,492.79 line totals + 1,005.63 tax =
+  12,498.42 receipt totals. This is the gate.
+- `kitchen-remodel-messy_2026-09-09.xlsx` — the same exporter over
+  deliberately imperfect data: one receipt whose total never extracted, one
+  with no line items, one `card_last4` of `"0042"`, one with no date.
+  Difference is $854.23 and the Summary says why. The gap is surfaced, not
+  hidden — that is the intended behaviour, not a defect.
+
+What to confirm by hand: both open without a repair prompt; dates are dates
+and money is money (not text); the header row stays put when you scroll; the
+`0042` card keeps its leading zero in BOTH the .xlsx and the .csv; and a pivot
+over the Line Items sheet works without any cleanup first.
 
 ### Running the browser suite locally
 
@@ -827,6 +986,15 @@ Decisions taken by the user this session:
 - Category taxonomy → seeded global list, user-extensible (D-20)
 
 ## Blocked / open questions
+
+- **Phase 8's gate is half-closed.** "The totals reconcile" is verified
+  programmatically and in CI — the suite reads the written workbook back
+  through ExcelJS and sums both sheets in integer cents, asserting exact
+  equality. "Opens clean in Excel" is not, because there is no Excel in this
+  environment and LibreOffice is not Excel for the two things that actually go
+  wrong (a `.csv` double-click open eating a leading zero, and a date cell
+  landing a day early). Two sample workbooks are in `docs/private/` and the
+  checklist is under "Next → Phase 8's manual gate".
 
 - **Phase 7's gate is unverified, and only you can close it.** The gate is
   "usable on your phone through the tunnel". There is no iOS device in this

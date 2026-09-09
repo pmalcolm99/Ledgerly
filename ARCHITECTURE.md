@@ -579,5 +579,78 @@ until the user cleared site data.
 | D-28 | `protectedProcedure` implies onboarded                                  |
 | D-29 | Explicit JWKS TTL, cooldown, and fetch timeout                          |
 | D-30 | Middleware file is `middleware.ts`; `proxy.ts` is inert on Next 15      |
+| D-37 | Export streams from a Route Handler; the `export` queue stays unbuilt   |
+| D-38 | `card_last4` is written as `="0042"` in CSV so Excel keeps the zero     |
 
 Full rationale for each in `DECISIONS.md`.
+
+---
+
+## 11. Export
+
+Sits logically after §6 and is numbered last only so the existing section
+numbers — referenced from code comments as `§7.2`, `§8.1`, `§8.3` — keep
+meaning what they meant.
+
+```
+GET /api/projects/<id>/export?format=xlsx|csv&from=&to=&category=&uploadedBy=&needsReview=1
+
+  1. identity      requireAuthRoute() — the Node-layer re-verification (D-24)
+  2. authorize     scopedProjects(user, "read") composed into the project lookup
+                   404, never 403 — no existence oracle (as §5's image serving)
+  3. preflight     receipt count + distinct currencies; > 50,000 receipts -> 413
+  4. audit         one export.generated row, BEFORE any byte leaves
+  5. stream        exceljs WorkbookWriter -> PassThrough -> Response body
+```
+
+A Route Handler, not a tRPC procedure: tRPC speaks JSON over superjson and
+cannot stream a binary body — the same reason upload and image serving are
+Route Handlers. There is **no queue job**; see D-37 for why, and for what the
+reserved `export` queue would have cost.
+
+### 11.1 Two grains, one pass
+
+The XLSX has three sheets. The first two are two different **grains**, and
+keeping them apart is the point:
+
+| Sheet         | Grain             | Carries                                        |
+| ------------- | ----------------- | ---------------------------------------------- |
+| 1. Line Items | one row an item   | no receipt-level total, ever                   |
+| 2. Receipts   | one row a receipt | `subtotal`, `sales_tax`, `total`, `item_count` |
+| 3. Summary    | aggregates        | by category, by month, and the reconciliation  |
+
+Repeating a receipt `total` on each of its item rows is how a spreadsheet
+export triples someone's deduction when they drag a SUM down the column.
+`LINE_ITEM_COLUMNS` therefore contains no `subtotal`/`sales_tax`/`tip`/`total`,
+and the test asserts their absence **by header name** — a future "convenient"
+total column on sheet 1 would reintroduce the bug and would read as an
+improvement in review.
+
+Both sheets and the summary come from ONE pass over the data. Line items — the
+unbounded dimension — stream and are freed row by row; the receipt-grain
+scalars are buffered, bounded by `MAX_EXPORT_RECEIPTS`. Two passes would read
+two snapshots of a live table and could disagree, and "the totals reconcile" is
+the phase gate.
+
+### 11.2 What makes it usable in Excel
+
+Money is a real number (`parseMoney` -> cents -> `/100` only at the cell, per
+D-21) with a currency `numFmt`; a date is a real date built with `Date.UTC`
+(a locally-parsed `"2026-03-04"` lands a day early west of Greenwich);
+`card_last4` is text so `"0042"` survives; the header row is frozen and columns
+are sized. Sheet 1 opens with a metadata block naming the applied filter and
+the export timestamp, so an export is reproducible later — the CSV carries the
+same block, because it is the same sheet.
+
+Tax and tip are **not** apportioned pro-rata across categories on the summary.
+An unallocated remainder is a fact; a per-category share of it would be an
+invention, and this is a tax record.
+
+### 11.3 Filter parity
+
+The export composes the same filter block as `receipts.list`, including the
+correlated `EXISTS` for `categoryId`, and forwards the dashboard's own query
+string. A category filter therefore selects **receipts** and then writes every
+item of each — which is both what was on screen and what keeps the two sheets
+reconciling. Parity is asserted against `receipts.list` itself in the test
+suite, not against a re-derived expectation.

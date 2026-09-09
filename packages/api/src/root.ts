@@ -15,8 +15,13 @@ import { router } from "./trpc";
  * (Phase 4 projects/members; Phase 5 receipts delete — upload and image
  * serving are Route Handlers, not tRPC; Phase 6 admin AI usage; Phase 7
  * everything the UI reads and writes — receipt list/get/update, line items,
- * categories, the user directory, project rollups, the admin overview;
- * Phase 8 export — still to come).
+ * categories, the user directory, project rollups, the admin overview).
+ *
+ * Phase 8's export is deliberately NOT here. tRPC speaks JSON over superjson
+ * and cannot stream a binary body, so the export is a Route Handler at
+ * `/api/projects/[id]/export` over `packages/api/src/export/` — the same
+ * reason upload and image serving are Route Handlers rather than procedures.
+ * See D-37.
  */
 export const appRouter = router({
   auth: authRouter,

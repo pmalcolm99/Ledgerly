@@ -966,3 +966,111 @@ assertions. Filling a dismissed field also clears its dismissal. The review
 predicate stays `missing_fields <> '{}' OR extraction_status <> 'ok'`, with no
 set-difference in it, so `receipts_needs_review_idx` remains a plain partial
 index the planner can match.
+
+---
+
+## D-37 — Export streams from a Route Handler; the `export` queue stays unbuilt. **Settled** (user decision).
+
+**Context.** `docs/PHASES.md` task 8.1 specifies XLSX "generated as an `export`
+queue job for large projects", and D-08 reserves `export` as one of three
+BullMQ queues. Phase 8's own brief, however, asks for the response to be
+streamed and for the workbook never to be built in memory. Those pull in
+opposite directions: a queue job writes a file and hands back an id, which is
+the opposite of streaming a response.
+
+**Why the route.** The queue design needs machinery Phase 8 has no other use
+for — an `exports` table to authorize a download against, an artifact
+directory, a retention sweep to stop it filling the disk, a reconciliation
+sweep at worker startup, and a polling UI. That is a phase's worth of surface
+to solve a problem this instance does not have: a 2,000-item project streams
+in a couple of seconds, and the work is I/O-bound, so it never blocks the event
+loop in any meaningful sense. `packages/api/src/export/` streams with bounded
+memory instead (see the one-pass note below), which satisfies task 8.1's actual
+concern — not building the workbook in memory — without any of it.
+
+**Consequence.** `GET /api/projects/[id]/export?format=xlsx|csv`, a Route
+Handler for the same reason upload and image serving are: tRPC speaks JSON over
+superjson and cannot stream a binary body. The code lives in
+`packages/api/src/export/`, **not** `packages/queue/src/pipeline/export.ts` as
+`docs/PHASES.md` names it — with no job, `apps/web` cannot reach
+`@ledgerly/queue`, and `queue` already depends on `api`, so `api` is the only
+package it can live in.
+
+**Consequence.** The `export` queue named in D-08 remains reserved and
+unbuilt. Two queues exist, not three. If a project ever grows large enough that
+a synchronous export is genuinely painful, the job version is still the right
+answer and this decision is the place to revisit.
+
+**Consequence, accepted.** The export holds no long-lived transaction, so it
+reads the receipt table across several keyset pages rather than from one
+snapshot. Keyset pagination cannot duplicate or skip a row under concurrent
+inserts or deletes; the only way to move a row out from under the loop is to
+edit a not-yet-read receipt's `transaction_date` mid-export. Pinning a pool
+connection open for the whole duration of a client's download — which is what a
+REPEATABLE READ transaction would mean — is the worse trade on a single-user
+instance.
+
+**Consequence.** The export relies on **write-time** Luhn scrubbing rather than
+scrubbing on the way out. Every path that writes free text scrubs it —
+`receipts.update`, `receiptItems.create`/`update`, and the extraction pipeline
+before persistence — and `card_last4` is `char(4)` with a digits-only CHECK, so
+the database is the boundary. Worth knowing because it means a future write path
+that skips the scrub is not just a storage bug, it is an export leak.
+
+**Consequence.** The download is a `GET`, so a third-party page can trigger one
+cross-site with the Access cookie attached. Nothing reaches the attacker (no
+CORS headers, and the response is an attachment), but an `export.generated`
+audit row should be read as "an export was requested by this identity", not as
+proof the user intended one. A per-user rate limit
+(`EXPORT_RATE_LIMIT_PER_MIN`) bounds the cost, and `request.signal` stops the
+paging loop when the client goes away.
+
+**Consequence.** Both sheets and the summary are produced in ONE pass over the
+data. Line items stream and are committed row by row; the eleven receipt-grain
+scalars per receipt are buffered, capped by `MAX_EXPORT_RECEIPTS` (50,000, over
+which the request is a 413). That is what makes the two sheets reconcile by
+construction rather than by luck — a two-pass implementation reads two
+different snapshots and can disagree, and "the totals reconcile" is Phase 8's
+entire gate.
+
+---
+
+## D-38 — `card_last4` is written as `="0042"` in CSV. **Settled.**
+
+**Context.** `receipts.card_last4` is `char(4)` with a digits-only CHECK, so
+`"0042"` is a value the database holds and an export must preserve. Task 8.4's
+acceptance criterion is "CSV opens in Excel with no mangled dates or lost
+leading zeros on `card_last4`". Excel strips the leading zero from a bare
+`0042` on a double-click open, and — the part that is easy to get wrong —
+**also** from a quoted `"0042"`.
+
+**Why.** `="0042"` is the only form that survives that path with the zero
+intact. Since the acceptance criterion names Excel, and opening the file in
+Excel is what a user of this app will actually do, Excel wins.
+
+**Consequence, accepted.** A non-Excel reader — pandas, `csv.reader`, a
+database import — sees the literal text `="0042"` rather than `0042`, and has
+to strip it. This is recorded rather than left as a surprise. The XLSX path has
+no such problem — the cell is a real string with `numFmt: "@"` and needs no
+trick.
+
+**Amendment (Phase 8 security review, H-1).** The observation this decision
+rests on — that Excel re-parses the contents of a quoted CSV field — has a
+second consequence that the first draft of this entry got wrong. It originally
+claimed the escape was "confined to `card_last4` … so nothing else in the file
+carries it". That was true and was the bug: **every other free-text column was
+being written unescaped**, so a value beginning `=`, `+`, `-` or `@` was
+evaluated as a formula on open. `merchant` is the sharp case, because a merchant
+line is read off a photograph by the model and stored unconstrained — a receipt
+printed with `=cmd|'/c calc'!A0` on it reached the spreadsheet verbatim. Quoting
+was not a mitigation, for exactly the reason this decision exists.
+
+Free-text cells whose first character is `=`, `+`, `-`, `@`, tab or CR are now
+prefixed with a single apostrophe (the OWASP mitigation), which every
+spreadsheet reads as "the rest of this cell is text". The `="…"` form is
+deliberately **not** reused for them: an Excel string literal caps at 255
+characters and `item_description`/`receipt_notes` are `text` columns that
+routinely exceed it. The cost is a possibly-visible apostrophe on the handful
+of cells that need one. The XLSX path was verified unaffected — ExcelJS types a
+JS string as `Cell.Types.String` unconditionally, and a formula requires an
+explicit `{formula: …}`.

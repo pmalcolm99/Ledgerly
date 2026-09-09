@@ -34,6 +34,14 @@ const SHARED_FORBIDDEN_IMPORTS = [
     message: "packages/shared must not import sharp (ARCHITECTURE.md §2.1).",
   },
   {
+    // Phase 8. `exceljs` is CJS, pulls archiver/unzipper, and is server-only
+    // — the same class of dependency as the four above, added to the list at
+    // the same time it entered the repo rather than after someone imported
+    // it from a Client Component.
+    group: ["exceljs", "exceljs/*"],
+    message: "packages/shared must not import exceljs (ARCHITECTURE.md §2.1).",
+  },
+  {
     group: ["@anthropic-ai/sdk", "@anthropic-ai/sdk/*"],
     message: "packages/shared must not import the Anthropic SDK (ARCHITECTURE.md §2.1).",
   },

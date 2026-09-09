@@ -4,6 +4,7 @@ import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { categories, receiptItems, receipts } from "@ledgerly/db/schema";
+import { slugify as derive } from "@ledgerly/shared/slug";
 
 import { recordAudit } from "../audit";
 import type { Tx } from "../audit";
@@ -39,14 +40,14 @@ const SLUG_UNIQUE = "categories_slug_live_key";
  * the stable key an export is written against and the value the extraction
  * tool enum is built from at call time (D-20) — a client-supplied slug lets a
  * user collide with, or impersonate, a seeded system category.
+ *
+ * The derivation itself moved to `@ledgerly/shared/slug` in Phase 8, once the
+ * export filename needed the same rule; this wrapper is only the router's
+ * "unsluggable name" error policy. `shared` cannot throw a `TRPCError`, which
+ * is exactly why the split is here and not there.
  */
 function slugify(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80)
-    .replace(/-+$/g, "");
+  const slug = derive(name);
   if (!slug) {
     throw new TRPCError({
       code: "BAD_REQUEST",

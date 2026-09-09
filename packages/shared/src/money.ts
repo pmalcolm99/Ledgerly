@@ -16,7 +16,11 @@ const NUMERIC_PATTERN = /^(-)?(\d+)(?:\.(\d{1,2}))?$/;
  * `22003` (`numeric_value_out_of_range`) at insert time (task 4.8 review
  * finding L-5).
  */
-const NUMERIC_12_2_MAX_CENTS = 999_999_999_999;
+/** The largest magnitude `numeric(12,2)` can hold, in cents. Exported
+ *  since Phase 8: the export's summary accumulator guards its running totals
+ *  against the bound that actually binds (this one) rather than against
+ *  `Number.isSafeInteger`, which is ~90x higher and could never fire first. */
+export const NUMERIC_12_2_MAX_CENTS = 999_999_999_999;
 
 function assertWithinNumeric12_2(cents: bigint | number, source: string): void {
   const abs = typeof cents === "bigint" ? (cents < 0n ? -cents : cents) : Math.abs(cents);

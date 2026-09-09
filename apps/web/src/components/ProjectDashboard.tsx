@@ -1,12 +1,13 @@
 "use client";
 
 import { useSearchParams } from "next/navigation";
-import { Button, Card, CardBody, Skeleton, Tooltip } from "@heroui/react";
+import { Card, CardBody, Skeleton } from "@heroui/react";
 import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
-import { Download } from "lucide-react";
 
 import { trpc } from "../lib/trpc";
+import { hasAnyFilter, parseReceiptFilters } from "../lib/receiptFilters";
 import { Capture } from "./Capture";
+import { ExportButton } from "./ExportButton";
 import { Filters } from "./Filters";
 import { MemberManager } from "./MemberManager";
 import { ReceiptRow } from "./ReceiptRow";
@@ -24,13 +25,9 @@ import { formatDateRange } from "../lib/dates";
 export function ProjectDashboard({ projectId }: { projectId: string }) {
   const searchParams = useSearchParams();
 
-  const filters = {
-    from: searchParams.get("from") || undefined,
-    to: searchParams.get("to") || undefined,
-    categoryId: searchParams.get("category") || undefined,
-    uploadedBy: searchParams.get("uploadedBy") || undefined,
-    needsReview: searchParams.get("needsReview") === "1" || undefined,
-  };
+  // Render-time read only. The export button rebuilds its own URL from
+  // `window.location.search` at click time — see ExportButton.tsx.
+  const filters = parseReceiptFilters(searchParams);
 
   const stats = trpc.projects.stats.useQuery({
     projectId,
@@ -67,21 +64,9 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
                   {formatDateRange(project.startDate, project.endDate)}
                 </p>
               </div>
-              {/* Phase 8 owns export. Rendered and disabled rather than
-                  hidden, so the capability is discoverable and its absence is
-                  explained rather than mysterious. */}
-              <Tooltip content="Export arrives in the next phase">
-                <span>
-                  <Button
-                    size="sm"
-                    variant="flat"
-                    isDisabled
-                    startContent={<Download className="h-4 w-4" />}
-                  >
-                    Export
-                  </Button>
-                </span>
-              </Tooltip>
+              {/* Exports whatever filter is currently applied, so what
+                  leaves matches what is on screen. */}
+              <ExportButton projectId={projectId} />
             </div>
 
             <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1">
@@ -139,7 +124,7 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
             <CardBody className="items-center gap-1 p-8 text-center">
               <p className="font-medium">No receipts match</p>
               <p className="text-sm text-default-500">
-                {Object.values(filters).some(Boolean)
+                {hasAnyFilter(filters)
                   ? "Try clearing the filters."
                   : "Add your first receipt with the button above."}
               </p>

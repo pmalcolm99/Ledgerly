@@ -24,7 +24,12 @@ const nextConfig: NextConfig = {
   // where the runtime require() calls can actually find them — verified by
   // running `node -e "require('./apps/web/node_modules/sharp')"` etc.
   // against a real `next build` output.
-  serverExternalPackages: ["sharp", "bullmq", "ioredis"],
+  // exceljs joins them in Phase 8 for the same two reasons: it is CJS with
+  // dynamic requires (it pulls archiver/unzipper), and it reaches apps/web
+  // only through @ledgerly/api, so apps/web/package.json lists it as a
+  // direct dependency too — see the tracing note above, which applies to it
+  // verbatim.
+  serverExternalPackages: ["sharp", "bullmq", "ioredis", "exceljs"],
 
   async headers() {
     return [

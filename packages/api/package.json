@@ -11,7 +11,8 @@
     "./root": "./src/root.ts",
     "./scope": "./src/scope.ts",
     "./storage": "./src/storage.ts",
-    "./rateLimit": "./src/rateLimit.ts"
+    "./rateLimit": "./src/rateLimit.ts",
+    "./export": "./src/export/index.ts"
   },
   "scripts": {
     "lint": "eslint .",
@@ -25,6 +26,7 @@
     "@ledgerly/shared": "workspace:*",
     "@trpc/server": "^11.0.0",
     "drizzle-orm": "^0.41.0",
+    "exceljs": "^4.4.0",
     "server-only": "^0.0.1",
     "superjson": "^2.2.2",
     "zod": "^3.24.1"

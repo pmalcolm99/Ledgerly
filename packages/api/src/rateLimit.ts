@@ -110,3 +110,19 @@ export async function checkReextractRateLimit(
 ): Promise<RateLimitResult> {
   return checkRateLimit(redis, `reextract_rate:${userId}`, 1, REEXTRACT_RATE_LIMIT_PER_MIN);
 }
+
+// Phase 8, review finding M-2. An export is the heaviest read in the app and
+// the only one that can be parked: a client that opens the connection and
+// stops reading (without disconnecting) leaves the writer holding a page of
+// rows plus the whole ExcelJS workbook until the request is torn down.
+// `MAX_EXPORT_RECEIPTS` bounds one export; this bounds how many a single user
+// can have in flight. Same reasoning, and the same fixed-not-configurable
+// judgment, as `REEXTRACT_RATE_LIMIT_PER_MIN` above.
+export const EXPORT_RATE_LIMIT_PER_MIN = 6;
+
+export async function checkExportRateLimit(
+  redis: RateLimitRedis,
+  userId: string,
+): Promise<RateLimitResult> {
+  return checkRateLimit(redis, `export_rate:${userId}`, 1, EXPORT_RATE_LIMIT_PER_MIN);
+}
