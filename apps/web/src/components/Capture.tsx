@@ -24,13 +24,24 @@ import { mapWithConcurrency, uploadOneFile } from "../lib/upload";
  * pipeline has rasterised PDFs since Phase 5 — D-10 — it was only ever the
  * `accept` attribute keeping them out of the picker).
  *
- * OPTIMISTIC UI. A card appears the instant files are chosen, showing a local
- * object-URL preview — the user never waits on a round trip to see that their
- * photo registered. As each upload returns a receiptId the card binds to the
- * real row, and a poll then watches those rows until extraction finishes.
- * The local preview is kept until the server thumbnail actually loads, because
- * `/api/images/<id>/thumb` 404s until ingest has written the render — binding
- * to it eagerly would flash a broken image on every upload.
+ * OPTIMISTIC UI, AND IT HANDS OVER. A card appears the instant files are
+ * chosen, showing a local object-URL preview — the user never waits on a round
+ * trip to see that their photo registered. The card's job ends the moment the
+ * real row exists: once the upload returns and `receipts.list` has refetched,
+ * the entry is retired and the row below takes over, carrying its own
+ * `ReviewBadge` that says "Reading…", then "Complete" or "Needs review", and
+ * that updates itself because the dashboard polls while anything is pending.
+ *
+ * It did NOT used to hand over, and that was a visible bug: a successful
+ * upload's card sat there spinning "Reading the receipt…" for the life of the
+ * tab, directly above a row that had already finished and filled in. Nothing
+ * ever removed it — only the error branch's Dismiss button could — so the one
+ * element still claiming work was in progress was the one element with no way
+ * to learn otherwise. Two things on screen described the same receipt and only
+ * one of them was right.
+ *
+ * A failed upload's card stays, because nothing else represents it: there is
+ * no row to hand over to. That one is dismissed by hand.
  */
 
 const UPLOAD_CONCURRENCY = 3;
@@ -84,6 +95,25 @@ export function Capture({ projectId }: { projectId: string }) {
   // Polling now belongs to the query that renders the rows, keyed on whether
   // any visible row is still extracting. See lib/extractionPolling.ts.
 
+  /**
+   * Retires the optimistic cards for uploads that succeeded, once their rows
+   * are on screen.
+   *
+   * The revokes happen OUTSIDE the state updater. A `setState` updater must be
+   * pure — React may invoke it more than once for a single update, and in
+   * StrictMode reliably does — so revoking a blob URL inside one would fire
+   * twice and, worse, would run even for an update React later discards.
+   */
+  const retireUploaded = useCallback((retiring: { key: string; previewUrl: string }[]) => {
+    if (retiring.length === 0) return;
+    const keys = new Set(retiring.map((item) => item.key));
+    setPending((current) => current.filter((item) => !keys.has(item.key)));
+
+    for (const { previewUrl } of retiring) URL.revokeObjectURL(previewUrl);
+    const revoked = new Set(retiring.map((item) => item.previewUrl));
+    objectUrls.current = objectUrls.current.filter((url) => !revoked.has(url));
+  }, []);
+
   const onFiles = useCallback(
     async (files: FileList | null) => {
       if (!files || files.length === 0) return;
@@ -103,13 +133,20 @@ export function Capture({ projectId }: { projectId: string }) {
       });
       setPending((current) => [...started, ...current]);
 
+      // Collected here rather than read back off `pending` afterwards: the
+      // outcome is known at this point, and a later read of state would race a
+      // second batch started in the meantime.
+      const uploaded: { key: string; previewUrl: string }[] = [];
+
       await mapWithConcurrency(chosen, UPLOAD_CONCURRENCY, async (file, index) => {
-        const key = started[index]!.key;
+        const entry = started[index]!;
+        const key = entry.key;
         const outcome = await uploadOneFile(file, projectId, (fraction) => {
           setPending((current) =>
             current.map((item) => (item.key === key ? { ...item, progress: fraction } : item)),
           );
         });
+        if (outcome.ok) uploaded.push({ key, previewUrl: entry.previewUrl });
         setPending((current) =>
           current.map((item) =>
             item.key === key
@@ -121,12 +158,17 @@ export function Capture({ projectId }: { projectId: string }) {
         );
       });
 
-      // The list now has rows the server knows about.
+      // The list now has rows the server knows about. Awaited before retiring
+      // the cards — `invalidate()` resolves once the refetch has landed, so the
+      // row is in the cache before its stand-in disappears and there is no
+      // frame where the receipt is represented by nothing at all.
       await utils.receipts.list.invalidate({ projectId });
+      retireUploaded(uploaded);
+
       await utils.projects.list.invalidate();
       await utils.projects.stats.invalidate({ projectId });
     },
-    [projectId, utils],
+    [projectId, retireUploaded, utils],
   );
 
   function dismiss(key: string) {
