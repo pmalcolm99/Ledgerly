@@ -15,10 +15,16 @@ import {
 import { getEnv } from "@ledgerly/config/env";
 import { displayNameOf } from "@ledgerly/shared/personName";
 
-import { describeAiKey, validateAiKeyShape } from "../aiKey";
+import {
+  describeAiKey,
+  resolveAiKey,
+  testAiKey as runAiKeyTest,
+  validateAiKeyShape,
+} from "../aiKey";
 import { recordAudit } from "../audit";
 import { isUniqueViolation } from "../errors";
 import { NEEDS_REVIEW_SQL } from "../receiptAccess";
+import { checkRateLimit } from "../rateLimit";
 import { scopedProjects } from "../scope";
 import { SECRET_KEYS, deleteSecret, writeSecret } from "../secrets";
 import { ownerProcedure, router } from "../trpc";
@@ -491,6 +497,55 @@ export const adminRouter = router({
     const requeued = cleared ? await requeueKeyBlockedReceipts(ctx) : 0;
     return { ok: true as const, cleared, requeued };
   }),
+
+  /**
+   * Checks the configured key against the live API, at zero token cost.
+   *
+   * Worth having because the two failures that stopped extraction on this
+   * instance were indistinguishable from the UI: a rejected key and an
+   * unresolvable model id both surfaced as `AI_REQUEST_REJECTED`, and the
+   * label blamed the key. This separates them.
+   *
+   * Rate-limited: an owner-only button that makes an outbound request has no
+   * reason to be allowed at click speed.
+   */
+  testAiKey: ownerProcedure.mutation(async ({ ctx }) => {
+    if (ctx.rateLimitRedis) {
+      const limit = await checkRateLimit(
+        ctx.rateLimitRedis,
+        `ai_key_test:${ctx.user.id}`,
+        1,
+        AI_KEY_TEST_RATE_LIMIT_PER_MIN,
+      );
+      if (!limit.allowed) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "Too many tests. Try again shortly.",
+        });
+      }
+    }
+
+    const env = getEnv();
+    const { apiKey, source } = await resolveAiKey(ctx.db, env.MASTER_KEY, env.ANTHROPIC_API_KEY);
+
+    if (source === "undecryptable") {
+      return {
+        ok: false,
+        message:
+          "A key is stored but cannot be decrypted — MASTER_KEY does not match this database. Clear it and paste the key again.",
+        models: [] as { id: string; ok: boolean }[],
+      };
+    }
+    if (!apiKey) {
+      return {
+        ok: false,
+        message: "No key is configured.",
+        models: [] as { id: string; ok: boolean }[],
+      };
+    }
+
+    return runAiKeyTest(apiKey, [env.AI_MODEL_PASS1, env.AI_MODEL_PASS2]);
+  }),
 });
 
 /**
@@ -500,6 +555,10 @@ export const adminRouter = router({
  * `worker.ts` and this list must be changed together. Both are covered by
  * `aiKey.test.ts`.
  */
+/** An owner-only outbound probe. Generous enough that a genuine
+ *  diagnose-and-retry loop never hits it. */
+const AI_KEY_TEST_RATE_LIMIT_PER_MIN = 10;
+
 const KEY_BLOCKED_ERRORS = ["ANTHROPIC_KEY_NOT_CONFIGURED", "ANTHROPIC_KEY_UNDECRYPTABLE"];
 
 /**

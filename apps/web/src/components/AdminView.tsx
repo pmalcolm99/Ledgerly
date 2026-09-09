@@ -179,17 +179,31 @@ export function AdminView() {
                     {project.name}
                   </NextLink>
                   {project.status === "archived" ? (
-                    <Chip size="sm" variant="flat">
+                    <Chip size="sm" variant="flat" className="shrink-0">
                       Archived
                     </Chip>
                   ) : null}
-                  <span className="text-default-500">{project.owner.name}</span>
-                  <span className="text-default-500">{project.memberCount} members</span>
-                  <span className="text-default-500">{project.receiptCount} receipts</span>
+                  {/* The name link already truncates correctly. These trailing
+                      cells did not: with nothing stopping them from claiming
+                      their full content width, `flex-wrap` threw them onto a
+                      second line and the row silently doubled in height
+                      instead of the long value truncating. The owner name is
+                      the one that can overflow on its own, so it gets
+                      `min-w-0 truncate`; the rest are short and just need to
+                      stop shrinking. */}
+                  <span className="min-w-0 max-w-[10rem] truncate text-default-500">
+                    {project.owner.name}
+                  </span>
+                  <span className="shrink-0 text-default-500">{project.memberCount} members</span>
+                  <span className="shrink-0 text-default-500">{project.receiptCount} receipts</span>
                   {project.needsReviewCount > 0 ? (
-                    <span className="text-warning">{project.needsReviewCount} to review</span>
+                    <span className="shrink-0 text-warning">
+                      {project.needsReviewCount} to review
+                    </span>
                   ) : null}
-                  <span className="tabular-nums">{formatMoneyDisplay(project.totalSpend)}</span>
+                  <span className="shrink-0 tabular-nums">
+                    {formatMoneyDisplay(project.totalSpend)}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -207,19 +221,29 @@ export function AdminView() {
               {overview.data.users.map((user) => (
                 <li key={user.id} className="flex flex-wrap items-center gap-3 py-2 text-sm">
                   <span className="min-w-0 flex-1 truncate font-medium">{user.name}</span>
-                  <span className="truncate text-default-500">{user.email}</span>
+                  {/* `min-w-0` is what makes `truncate` work here. A flex item
+                      defaults to `min-width: auto`, which refuses to shrink
+                      below its content — so `truncate` alone did nothing and a
+                      long address pushed the whole row wide. `basis-full
+                      sm:basis-auto` gives the email its own line on a phone
+                      rather than fighting the name for the same one. */}
+                  <span className="min-w-0 basis-full truncate text-default-500 sm:basis-auto sm:max-w-[16rem]">
+                    {user.email}
+                  </span>
                   {user.role === "owner" ? (
-                    <Chip size="sm" variant="flat" color="primary">
+                    <Chip size="sm" variant="flat" color="primary" className="shrink-0">
                       Instance owner
                     </Chip>
                   ) : null}
                   {!user.onboardedAt ? (
-                    <Chip size="sm" variant="flat">
+                    <Chip size="sm" variant="flat" className="shrink-0">
                       Not onboarded
                     </Chip>
                   ) : null}
-                  <span className="text-default-500">{user.projectsOwned} owned</span>
-                  <span className="text-default-500">{user.receiptsUploaded} uploaded</span>
+                  <span className="shrink-0 text-default-500">{user.projectsOwned} owned</span>
+                  <span className="shrink-0 text-default-500">
+                    {user.receiptsUploaded} uploaded
+                  </span>
                 </li>
               ))}
             </ul>

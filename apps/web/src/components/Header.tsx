@@ -17,8 +17,9 @@ import {
   NavbarMenuItem,
   NavbarMenuToggle,
 } from "@heroui/react";
+import { useIsFetching } from "@tanstack/react-query";
 import { THEMES, type ThemeId } from "@ledgerly/shared/themes";
-import { Receipt } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 
 import { trpc } from "../lib/trpc";
 import { applyTheme } from "../lib/applyTheme";
@@ -50,6 +51,7 @@ export function Header({
   theme: ThemeId;
 }) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const isFetching = useIsFetching();
   /**
    * The selected theme, tracked locally.
    *
@@ -103,11 +105,16 @@ export function Header({
           aria-label={isMenuOpen ? "Close menu" : "Open menu"}
         />
         <NavbarBrand>
+          {/* The receipt glyph that used to sit here is removed on purpose —
+              we are trying the wordmark alone. To put it back: re-import
+              `Receipt` from lucide-react and drop
+              `<Receipt className="h-5 w-5 text-primary" aria-hidden />`
+              immediately before the span. Nothing else changes; the `gap-2`
+              below is already sized for it. */}
           <NextLink href="/" className="flex items-center gap-2">
-            <Receipt className="h-5 w-5 text-primary" aria-hidden />
             {/* The wordmark, in the vendored script face (layout.tsx sets the
                 variable). `leading-none` plus the nudge because a script face
-                sits high in its box and would otherwise ride above the icon. */}
+                sits high in its box. */}
             <span className="font-brand translate-y-[0.06em] text-2xl leading-none">Ledgerly</span>
           </NextLink>
         </NavbarBrand>
@@ -127,6 +134,24 @@ export function Header({
       </NavbarContent>
 
       <NavbarContent justify="end">
+        {/* Left of the user's name, deliberately. An installed iOS PWA has no
+            URL bar, no reload button and no pull-to-refresh, so there is
+            otherwise NO way to force a refetch short of killing the app. */}
+        <NavbarItem>
+          <Button
+            isIconOnly
+            size="sm"
+            variant="light"
+            aria-label="Refresh"
+            onPress={() => void utils.invalidate()}
+          >
+            {/* Driven by `useIsFetching`, not by local state: the spin then
+                reflects work actually in flight — including a background
+                extraction poll — rather than a fixed animation that lies
+                about what the app is doing. */}
+            <RefreshCw className={`h-4 w-4 ${isFetching > 0 ? "animate-spin" : ""}`} aria-hidden />
+          </Button>
+        </NavbarItem>
         <Dropdown>
           <DropdownTrigger>
             <Button variant="flat" size="sm">

@@ -143,3 +143,70 @@ export function validateAiKeyShape(
     return { ok: false, message: "That key is longer than any API key we expect." };
   return { ok: true, key };
 }
+
+export type AiKeyTestResult = {
+  ok: boolean;
+  /** Safe to show a user. Never contains the key. */
+  message: string;
+  /** Per-model resolution, so a bad model id is distinguishable from a bad key. */
+  models: { id: string; ok: boolean }[];
+};
+
+/**
+ * Checks a configured key against the live API, without spending tokens.
+ *
+ * `GET /v1/models/{id}` for each configured model: it authenticates the key
+ * AND resolves the model id, which are the two failures that look identical
+ * from the outside. A 401 means the key; a 404 means the id.
+ *
+ * Deliberately a plain `fetch`, not `@anthropic-ai/sdk`. That package lives in
+ * `packages/queue` only, so the credential-consuming client is unreachable
+ * from anything `apps/web` bundles; adding it here to save a few lines would
+ * throw that away for a request with no body.
+ *
+ * What this does NOT prove, stated plainly because the last outage was exactly
+ * this gap: it does not exercise the extraction REQUEST SHAPE. A key and a
+ * model can both be perfect while `thinking` + a forced `tool_choice` returns
+ * 400 on every receipt. Only a real extraction proves that.
+ */
+export async function testAiKey(
+  apiKey: string,
+  models: string[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<AiKeyTestResult> {
+  const results: { id: string; ok: boolean }[] = [];
+  let firstFailure: string | null = null;
+
+  for (const id of models) {
+    let response: Response;
+    try {
+      response = await fetchImpl(`https://api.anthropic.com/v1/models/${encodeURIComponent(id)}`, {
+        headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      results.push({ id, ok: false });
+      firstFailure ??= `Could not reach the Anthropic API (${error instanceof Error ? error.name : "network error"}).`;
+      continue;
+    }
+
+    results.push({ id, ok: response.ok });
+    if (response.ok) continue;
+
+    // The status carries the whole diagnosis; the body may not be JSON.
+    if (response.status === 401 || response.status === 403) {
+      firstFailure ??= "The API key was rejected (401/403). Check the key itself.";
+    } else if (response.status === 404) {
+      firstFailure ??= `The key works, but the model "${id}" was not found (404). Check AI_MODEL_PASS1 / AI_MODEL_PASS2.`;
+    } else {
+      firstFailure ??= `The Anthropic API returned ${response.status} for "${id}".`;
+    }
+  }
+
+  if (firstFailure) return { ok: false, message: firstFailure, models: results };
+  return {
+    ok: true,
+    message: `Key accepted, and both models resolve. This does not exercise the extraction request itself — scan a receipt for that.`,
+    models: results,
+  };
+}

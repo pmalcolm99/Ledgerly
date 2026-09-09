@@ -40,10 +40,13 @@ export function AiKeyCard() {
     setRawDraft(value);
     setSaved(false);
     setError(null);
+    // A result from before the key changed is worse than none.
+    setTestResult(null);
   };
 
   const onSettled = async () => {
     setRawDraft("");
+    setTestResult(null);
     await utils.admin.aiKey.invalidate();
   };
 
@@ -59,6 +62,12 @@ export function AiKeyCard() {
     },
   });
 
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const test = trpc.admin.testAiKey.useMutation({
+    onSuccess: (result) => setTestResult({ ok: result.ok, message: result.message }),
+    onError: (e) => setTestResult({ ok: false, message: e.message }),
+  });
+
   const clear = trpc.admin.clearAiKey.useMutation({
     onSuccess: async () => {
       setError(null);
@@ -68,7 +77,7 @@ export function AiKeyCard() {
     onError: (e) => setError(e.message),
   });
 
-  const busy = save.isPending || clear.isPending;
+  const busy = save.isPending || clear.isPending || test.isPending;
 
   return (
     <Card shadow="sm">
@@ -100,11 +109,14 @@ export function AiKeyCard() {
               setDraft={setDraft}
               busy={busy}
               label="API key"
+              placeholder="sk-ant-..."
               onSave={() => save.mutate({ apiKey: draft })}
               saving={save.isPending}
               onClear={() => clear.mutate()}
               clearing={clear.isPending}
               showClear
+              onTest={() => test.mutate()}
+              testing={test.isPending}
             />
             {error ? <p className="text-sm text-danger">{error}</p> : null}
           </>
@@ -147,6 +159,7 @@ export function AiKeyCard() {
               setDraft={setDraft}
               busy={busy}
               label={status.data.source === "app_config" ? "Replace key" : "API key"}
+              placeholder={status.data.hint ? `Currently set — ${status.data.hint}` : "sk-ant-..."}
               onSave={() => save.mutate({ apiKey: draft })}
               saving={save.isPending}
               onClear={() => clear.mutate()}
@@ -154,6 +167,8 @@ export function AiKeyCard() {
               showClear={
                 status.data.source === "app_config" || status.data.source === "undecryptable"
               }
+              onTest={status.data.source === "none" ? undefined : () => test.mutate()}
+              testing={test.isPending}
             />
 
             {/* The one thing an operator most needs to know before pressing
@@ -166,6 +181,11 @@ export function AiKeyCard() {
               </p>
             ) : null}
 
+            {testResult ? (
+              <p className={`text-sm ${testResult.ok ? "text-success" : "text-danger"}`}>
+                {testResult.message}
+              </p>
+            ) : null}
             {error ? <p className="text-sm text-danger">{error}</p> : null}
             {saved ? (
               <p className="text-sm text-success">
@@ -213,11 +233,17 @@ function KeyForm(props: {
   setDraft: (value: string) => void;
   busy: boolean;
   label: string;
+  /** The stored key's hint, shown as the placeholder. The input is write-only
+   *  and therefore always starts empty, which on its own reads as "nothing is
+   *  configured" — exactly the wrong impression when a key IS set. */
+  placeholder: string;
   onSave: () => void;
   saving: boolean;
   onClear: () => void;
   clearing: boolean;
   showClear: boolean;
+  onTest?: () => void;
+  testing?: boolean;
 }) {
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
@@ -225,7 +251,7 @@ function KeyForm(props: {
         type="password"
         size="sm"
         label={props.label}
-        placeholder="sk-ant-..."
+        placeholder={props.placeholder}
         autoComplete="off"
         value={props.draft}
         onValueChange={props.setDraft}
