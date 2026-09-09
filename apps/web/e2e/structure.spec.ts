@@ -125,7 +125,13 @@ test.describe("no nested forms (task 7.11)", () => {
 
   test("project dashboard", async ({ page }) => {
     await openProject(page);
-    await expect(page.getByRole("button", { name: "Add receipts" })).toBeVisible();
+    // Two capture controls, not one. `capture="environment"` does not mean
+    // "prefer the camera" on iOS — it removes Photo Library and Files from
+    // the sheet entirely, so a single input carrying it can never reach an
+    // existing photo or a PDF. Both must be present, and this is the WebKit
+    // suite, which is the browser engine the distinction actually matters on.
+    await expect(page.getByRole("button", { name: "Take photo" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Choose files" })).toBeVisible();
     await assertNoNestedForms(page, "project dashboard");
   });
 
