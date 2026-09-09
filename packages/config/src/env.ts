@@ -68,7 +68,13 @@ const rawSchema = z.object({
   // MASTER_KEY, wins when present. A fresh instance has to be able to boot
   // with no key at all, or there is no way to reach the screen that sets one.
   ANTHROPIC_API_KEY: z.string().default(""),
-  AI_MODEL_PASS1: z.string().min(1).default("claude-haiku-4-5"),
+  // `claude-haiku-4-5` is NOT a valid model id — verified against
+  // `GET /v1/models` with a real key: the only Haiku 4.5 entry is
+  // `claude-haiku-4-5-20251001`. D-12 asserted "model IDs are exact and carry
+  // no date suffix", which holds for Sonnet 5 and not for Haiku 4.5, so every
+  // pass-1 call 404'd and surfaced as AI_REQUEST_REJECTED. See D-12's
+  // amendment.
+  AI_MODEL_PASS1: z.string().min(1).default("claude-haiku-4-5-20251001"),
   AI_MODEL_PASS2: z.string().min(1).default("claude-sonnet-5"),
   AI_ESCALATE_BELOW: z.coerce.number().min(0).max(1).default(0.6),
   AI_CONCURRENCY: z.coerce.number().int().positive().default(3),

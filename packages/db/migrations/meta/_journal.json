@@ -29,6 +29,13 @@
       "when": 1788929423565,
       "tag": "0003_flowery_vermin",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788962926740,
+      "tag": "0004_chubby_betty_ross",
+      "breakpoints": true
     }
   ]
 }

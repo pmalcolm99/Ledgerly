@@ -13,10 +13,16 @@ import { mapWithConcurrency, uploadOneFile } from "../lib/upload";
  * The loudest thing on the dashboard, because the actual use is standing in a
  * parking lot with a receipt in one hand.
  *
- * `capture="environment"` asks for the rear camera directly; `multiple` still
- * allows a camera-roll multi-select on both platforms. Both attributes on one
- * input is the combination that gives "photograph now" and "pick several"
- * without two separate controls.
+ * TWO inputs, not one. `capture="environment"` does not mean "prefer the
+ * camera" on iOS — it means "the camera is the ONLY source", and Safari drops
+ * the Photo Library and Files options from the sheet entirely. A single input
+ * carrying it can therefore never reach an existing photo or a PDF, which is
+ * most of what a receipt actually is by the time you sit down to file them.
+ *
+ * So: one input with `capture` behind "Take photo", and one without it behind
+ * "Choose files", which accepts images AND `application/pdf` (the ingest
+ * pipeline has rasterised PDFs since Phase 5 — D-10 — it was only ever the
+ * `accept` attribute keeping them out of the picker).
  *
  * OPTIMISTIC UI. A card appears the instant files are chosen, showing a local
  * object-URL preview — the user never waits on a round trip to see that their
@@ -41,7 +47,8 @@ type Pending = {
 
 export function Capture({ projectId }: { projectId: string }) {
   const [pending, setPending] = useState<Pending[]>([]);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const utils = trpc.useUtils();
 
   /**
@@ -138,10 +145,10 @@ export function Capture({ projectId }: { projectId: string }) {
     <div className="flex flex-col gap-3">
       <Card shadow="sm" className="border-2 border-dashed border-primary-300 bg-primary-50/40">
         <CardBody className="items-center gap-3 p-6">
-          {/* One input, no form around it — this posts via XHR, and wrapping
-              it in a form would add a submit target that does nothing. */}
+          {/* No form around either input — this posts via XHR, and a form
+              would add a submit target that does nothing. */}
           <input
-            ref={inputRef}
+            ref={cameraInputRef}
             type="file"
             accept="image/*"
             capture="environment"
@@ -153,18 +160,43 @@ export function Capture({ projectId }: { projectId: string }) {
               event.target.value = "";
             }}
           />
-          <Button
-            color="primary"
-            size="lg"
-            className="h-14 w-full text-base"
-            startContent={<Camera className="h-5 w-5" />}
-            onPress={() => inputRef.current?.click()}
-          >
-            Add receipts
-          </Button>
-          <p className="flex items-center gap-1.5 text-xs text-default-500">
-            <Images className="h-3.5 w-3.5" aria-hidden />
-            Take a photo, or pick several from your camera roll
+          <input
+            ref={fileInputRef}
+            type="file"
+            // No `capture` here — that is the whole point of the second
+            // input. `application/pdf` is listed explicitly because
+            // `image/*` excludes it, and iOS matches the Files picker against
+            // this list.
+            accept="image/*,application/pdf,.pdf,.heic,.heif"
+            multiple
+            className="sr-only"
+            onChange={(event) => {
+              void onFiles(event.target.files);
+              event.target.value = "";
+            }}
+          />
+          <div className="flex w-full flex-col gap-2 sm:flex-row">
+            <Button
+              color="primary"
+              size="lg"
+              className="h-14 flex-1 text-base"
+              startContent={<Camera className="h-5 w-5" />}
+              onPress={() => cameraInputRef.current?.click()}
+            >
+              Take photo
+            </Button>
+            <Button
+              variant="flat"
+              size="lg"
+              className="h-14 flex-1 text-base"
+              startContent={<Images className="h-5 w-5" />}
+              onPress={() => fileInputRef.current?.click()}
+            >
+              Choose files
+            </Button>
+          </div>
+          <p className="text-center text-xs text-default-500">
+            Photos, or PDFs. Pick several at once — the first page of a PDF is used.
           </p>
         </CardBody>
       </Card>

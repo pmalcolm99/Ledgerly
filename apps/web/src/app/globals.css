@@ -26,6 +26,43 @@
     -webkit-text-size-adjust: 100%;
   }
 
+  /* Landscape on a phone.
+     
+     The third of the three portrait measures (see components/PortraitLock.tsx).
+     It is the ONLY one with any effect on iOS, which implements neither the
+     manifest's `orientation` nor `screen.orientation.lock`.
+
+     Scoped by `max-height`, not by `orientation` alone: a landscape iPad or a
+     laptop is a perfectly good way to use this app and must not get the
+     overlay. 520px of viewport height in landscape is a phone. */
+  #portrait-notice {
+    display: none;
+  }
+
+  @media (orientation: landscape) and (max-height: 520px) and (pointer: coarse) {
+    #portrait-notice {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.75rem;
+      padding: 2rem;
+      text-align: center;
+      background: hsl(var(--heroui-background));
+      color: hsl(var(--heroui-foreground));
+    }
+  }
+
+  /* The wordmark face, set as a variable by layout.tsx's `next/font/local`.
+     A utility rather than a Tailwind theme extension: it is used in exactly
+     one place, and Tailwind 4's config lives in CSS anyway (D-32). */
+  .font-brand {
+    font-family: var(--font-brand), "Snell Roundhand", "Apple Chancery", "Segoe Script", cursive;
+  }
+
   body {
     min-height: 100dvh;
     line-height: 1.5;

@@ -174,6 +174,32 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
           : isUnrecoverable && error.message
             ? error.message
             : "AI_EXTRACTION_FAILED";
+
+      // The terminal failure, logged with the underlying error attached.
+      //
+      // `AI_EXTRACTION_FAILED` is the fallback for anything that is NOT an
+      // `ExtractError` — a constraint violation on persist, a bug in the
+      // mapping, a driver error. Those are precisely the failures whose
+      // reason code says nothing useful, and until now the only record of
+      // what actually happened was discarded here. A receipt can burn three
+      // paid API calls and leave an operator with a five-word status and no
+      // way to find out why.
+      //
+      // The stack is included only for the non-`ExtractError` case: an
+      // `ExtractError`'s reason IS the diagnosis, and `logProviderError` in
+      // extract.ts has already logged the provider's side of it.
+      if (error instanceof ExtractError) {
+        console.error(
+          `[ledgerly] extraction failed receipt=${job.data.receiptId} reason=${reason}`,
+        );
+      } else {
+        console.error(
+          `[ledgerly] extraction failed receipt=${job.data.receiptId} reason=${reason} — ` +
+            "unclassified, so the underlying error follows:",
+          error,
+        );
+      }
+
       try {
         await db
           .update(receipts)

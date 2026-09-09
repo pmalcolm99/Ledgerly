@@ -103,6 +103,30 @@ function isRecordReceiptInputShape(value: unknown): value is RecordReceiptInput 
  * distinction. `worker.ts`'s BullMQ-level backoff is what actually retries
  * (task 6.9); this classifies both the "why" that ends up in
  * `extraction_error` and (M-4) whether retrying can possibly help. */
+/**
+ * One line an operator can act on, for a call that never returned.
+ *
+ * `[ledgerly] ai call failed receipt=<id> model=<model> pass=<n>
+ *  status=404 type=not_found_error message=model: claude-haiku-4-5`
+ *
+ * Deliberately server-side only. The UI still gets a status and a reason code
+ * (ARCHITECTURE.md §6.4: "errors surfaced to the UI carry a status and a job
+ * id, not a provider message") — this is the other half of that sentence,
+ * which was never written.
+ */
+function logProviderError(receiptId: string, model: string, pass: number, error: unknown): void {
+  const where = `receipt=${receiptId} model=${model} pass=${pass}`;
+  if (error instanceof Anthropic.APIError) {
+    const body = error.error as { type?: string; message?: string } | undefined;
+    console.error(
+      `[ledgerly] ai call failed ${where} status=${error.status ?? "none"} ` +
+        `type=${body?.type ?? error.name} message=${body?.message ?? error.message}`,
+    );
+    return;
+  }
+  console.error(`[ledgerly] ai call failed ${where}:`, error);
+}
+
 function classifyAnthropicError(error: unknown): ExtractError {
   // Most-specific-first: RateLimitError/InternalServerError both extend
   // APIError, and APIConnectionError extends APIError too -- checking the
@@ -177,6 +201,17 @@ async function runPass(params: {
     // No `usage` exists at all for a call that never got a response --
     // nothing to record here (M-5 covers the two branches below, which DO
     // have billable usage despite failing).
+    //
+    // Log the PROVIDER's own account of the failure, server-side. Without
+    // this the operator sees only a reason code: a 404 for an invalid model
+    // id and a 401 for a revoked key both arrive as AI_REQUEST_REJECTED, and
+    // the UI's advice ("check the API key") sends them after the wrong thing
+    // entirely — which is exactly what happened with `claude-haiku-4-5`.
+    //
+    // Status, error type and message only. Never the request (it carries the
+    // receipt image) and never the key: `Anthropic.APIError` does not include
+    // headers in these fields, and nothing here touches `client`.
+    logProviderError(receiptId, model, pass, error);
     throw classifyAnthropicError(error);
   }
   const latencyMs = Date.now() - startedAt;

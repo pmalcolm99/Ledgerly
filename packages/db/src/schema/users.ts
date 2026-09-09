@@ -14,7 +14,11 @@ export const users = pgTable(
     lastName: text("last_name"),
     displayName: text("display_name"),
     role: userRoleEnum("role").notNull().default("user"),
-    theme: text("theme").notNull().default("dark"),
+    // D-41: the beige light theme is the default. Only affects NEW rows —
+    // an account already holding an explicit theme keeps it, which is why
+    // migration 0004 changes the column default and deliberately does not
+    // rewrite existing values.
+    theme: text("theme").notNull().default("light"),
     onboardedAt: timestamp("onboarded_at", { withTimezone: true }),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

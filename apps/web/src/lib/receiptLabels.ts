@@ -76,7 +76,13 @@ const EXTRACTION_ERROR_LABELS: Record<string, string> = {
   AI_OVERLOADED: "The extraction service was overloaded. Try re-extracting shortly.",
   AI_API_ERROR: "The extraction service returned an error.",
   AI_CONNECTION_FAILED: "Couldn't reach the extraction service.",
-  AI_REQUEST_REJECTED: "The extraction service rejected the request. Check the server's API key.",
+  // Deliberately names BOTH causes. This code covers 400/401/403/404, and
+  // the first real failure in production was a 404 for an invalid model id
+  // (`claude-haiku-4-5`, which does not exist) while the key was perfectly
+  // good — the old wording sent the operator after the wrong thing entirely.
+  // The server log now carries the provider's own status and message.
+  AI_REQUEST_REJECTED:
+    "The extraction service rejected the request — usually an invalid API key or a model id that doesn't exist. Check the server log for the provider's reason.",
   AI_CALL_FAILED: "The extraction call failed.",
   AI_NO_TOOL_USE: "The extraction service didn't return any structured data.",
   AI_INVALID_RESPONSE: "The extraction service returned something unreadable.",

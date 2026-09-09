@@ -287,6 +287,30 @@ and `yt-dlp`, and the `chrome-headless` service entirely.
 
 ## D-12 — Two-pass Haiku 4.5 -> Sonnet 5 extraction ladder. **Provisional — Phase 6 confirms.**
 
+> **Amendment (first run against a real API key).** This decision asserted
+> "Model IDs are exact and carry no date suffix", and `packages/config`
+> defaulted `AI_MODEL_PASS1` to `claude-haiku-4-5` on that basis. **That is
+> not a real model id.** Checked against `GET /v1/models` with a live key: the
+> only Haiku 4.5 entry is `claude-haiku-4-5-20251001`. `claude-sonnet-5` does
+> exist, so the claim held for pass 2 and failed for pass 1 — which is why the
+> symptom was every upload dying on its first call while a manual re-extract
+> (`forcePass2`, Sonnet) succeeded.
+>
+> The 404 arrives as `NotFoundError`, which `classifyAnthropicError` correctly
+> treats as non-retryable and reports as `AI_REQUEST_REJECTED`. The user-facing
+> label for that code said "Check the server's API key", which was actively
+> misleading: the key was fine. Both the default and the label are fixed, and
+> the provider's own status/type/message is now logged server-side — see the
+> note below, which is the real lesson.
+>
+> **The observability gap this exposed.** ARCHITECTURE.md §6.4 says errors
+> surfaced to the UI carry "a status and a job id, not a provider message".
+> Only half of that was implemented: the provider message was discarded rather
+> than logged. An operator had a five-word status and no way to reach the
+> cause. `pipeline/extract.ts` now logs status, error type and message
+> server-side on every failed call, and `worker.ts` logs the underlying error
+> whenever the reason falls back to the generic `AI_EXTRACTION_FAILED`.
+
 **Context.** The brief §1.6 specifies the ladder. `docs/STATE.md` carried "AI
 model default" as open, because Forkd pins `AI_MODEL=claude-opus-4-7`, which is
 stale.
@@ -1194,3 +1218,82 @@ rules, a cart glyph and a dollar sign — and at a 16px browser-tab favicon it
 reads as a shape rather than a picture. That is a property of the mark, not of
 the pipeline, and is left as-is rather than silently substituting a simplified
 glyph that would then disagree with the home-screen icon.
+
+---
+
+## D-41 — The default theme is a beige light theme drawn from the app icon. **Settled** (user decision).
+
+**Context.** D-31 set Ledgerly's accent to teal and made `dark` the default,
+before there was an icon. D-40 then brought in an icon that is cream and dark
+green, so the installed app's home-screen tile and its first screen shared no
+colour at all.
+
+**Why.** User decision: a light, beige scheme "similar to the logo", with dark
+kept but no longer default. Both colours are sampled from the icon rather than
+invented — `#faf4eb` is the tile, `#324136` is the mark — so the two cannot
+drift.
+
+**Consequence.** The `light` theme id is REUSED rather than a new `beige` id
+added. Ids are what `users.theme` stores, and a new id would strand every row
+holding `light` on a theme that no longer exists. The label changes to
+"Ledgerly Beige"; anyone who had explicitly chosen the old white light theme
+gets the beige one, which on a self-hosted instance is the intent.
+
+**Consequence.** `DEFAULT_THEME` moves to `light`, and migration `0004` moves
+`users.theme`'s column default with it. The migration deliberately does **not**
+rewrite existing rows: an account holding an explicit `dark` chose it, and a
+theme change is not something a deployment should make on a user's behalf.
+The practical effect is that an existing account — including the instance
+owner's — stays dark until it picks the new theme from the switcher once.
+
+**Consequence.** The four dark themes keep their accents, so D-31's teal
+survives in `dark`. Only the light theme is restyled.
+
+**Consequence.** `THEMES` entries gain an `accent`. The switcher's swatch
+showed `background` alone, and four of the five themes are near-black, so the
+swatch conveyed nothing about what you were selecting; it now shows page
+colour and accent split down the middle.
+
+---
+
+## D-42 — The wordmark is set in a vendored script face. **Settled** (user decision).
+
+**Context.** User request: the app title should be cursive.
+
+**Why vendored, not `next/font/google`.** `next/font/google` self-hosts the
+file but fetches it at BUILD time. Ledgerly builds in CI and inside a Docker
+image, and a self-hosted app that cannot build without reaching
+`fonts.googleapis.com` has acquired exactly the kind of third-party dependency
+the rest of the design avoids. `apps/web/src/app/fonts/` holds a 25 KB latin
+subset of Dancing Script (SIL OFL 1.1), loaded with `next/font/local`. Builds
+are offline and byte-identical.
+
+**Consequence.** The CSS generic `cursive` keyword was rejected as the primary:
+it resolves to Snell Roundhand on Apple, Segoe Script on Windows and anything
+at all on Linux, so the wordmark would differ per device. Those faces remain
+the FALLBACK stack, for the pre-swap frame and for the case where the woff2
+fails to load.
+
+---
+
+## D-43 — Portrait orientation is enforced as far as each platform allows, and no further. **Settled.**
+
+**Context.** User request: keep the app in portrait on iOS and Android.
+
+**What actually works.** Three mechanisms, because no single one covers both
+platforms:
+
+1. `orientation: "portrait"` in the web manifest — honoured by an **installed**
+   PWA on Android. Already present since task 7.9.
+2. `screen.orientation.lock("portrait")` — honoured by Android Chrome in
+   standalone/fullscreen. **iOS Safari does not implement
+   `ScreenOrientation.lock` at all.**
+3. A CSS overlay shown only on a landscape phone (`orientation: landscape`
+   AND `max-height: 520px` AND `pointer: coarse`, so a landscape iPad or a
+   laptop is untouched). The only one of the three with any effect on iOS.
+
+**Consequence, stated plainly because it would otherwise be discovered the
+hard way.** On Android, installed, this is a real lock. **On iOS it is not a
+lock and cannot be made one from a web page** — it is a request the OS ignores
+plus a message asking the user to rotate back. A native wrapper is the only
+way to genuinely lock orientation on iOS.

@@ -50,6 +50,28 @@ export function Header({
   theme: ThemeId;
 }) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  /**
+   * The selected theme, tracked locally.
+   *
+   * `theme` is a prop resolved during the server render. `chooseTheme` swaps
+   * the class on <html> and persists to the database, but the PROP cannot
+   * change until the next full server render — so the checkmark stayed on
+   * whichever theme was active at page load, no matter what you picked. The
+   * page looked right and the menu lied about it.
+   *
+   * Adjusted DURING RENDER when the prop changes, rather than in an effect:
+   * that is React's documented pattern for deriving state from a prop, and an
+   * effect here would be a cascading render (and is what
+   * `react-hooks/set-state-in-effect` flags). It also keeps the local value
+   * correct when the server sends a different theme — a fresh navigation, or
+   * this account switching theme in another tab.
+   */
+  const [selected, setSelected] = useState<ThemeId>(theme);
+  const [lastServerTheme, setLastServerTheme] = useState<ThemeId>(theme);
+  if (lastServerTheme !== theme) {
+    setLastServerTheme(theme);
+    setSelected(theme);
+  }
   const pathname = usePathname();
   const utils = trpc.useUtils();
 
@@ -63,6 +85,7 @@ export function Header({
     // Swapped on the document immediately so the change is instant, then
     // persisted. The server render is what makes it stick on the next load.
     applyTheme(next);
+    setSelected(next);
     setTheme.mutate({ theme: next });
   }
 
@@ -80,9 +103,12 @@ export function Header({
           aria-label={isMenuOpen ? "Close menu" : "Open menu"}
         />
         <NavbarBrand>
-          <NextLink href="/" className="flex items-center gap-2 text-xl font-bold">
+          <NextLink href="/" className="flex items-center gap-2">
             <Receipt className="h-5 w-5 text-primary" aria-hidden />
-            Ledgerly
+            {/* The wordmark, in the vendored script face (layout.tsx sets the
+                variable). `leading-none` plus the nudge because a script face
+                sits high in its box and would otherwise ride above the icon. */}
+            <span className="font-brand translate-y-[0.06em] text-2xl leading-none">Ledgerly</span>
           </NextLink>
         </NavbarBrand>
       </NavbarContent>
@@ -117,13 +143,19 @@ export function Header({
                   textValue={entry.label}
                   onPress={() => chooseTheme(entry.id)}
                   startContent={
+                    // Page colour and accent together, split down the middle.
+                    // The previous swatch showed `background` only, and four
+                    // of the five themes are near-black — so it conveyed
+                    // nothing about which theme you were choosing.
                     <span
                       aria-hidden
-                      className="inline-block h-3 w-3 rounded-full border border-divider"
-                      style={{ background: entry.background }}
+                      className="inline-block h-4 w-4 overflow-hidden rounded-full border border-divider"
+                      style={{
+                        background: `linear-gradient(90deg, ${entry.background} 0 50%, ${entry.accent} 50% 100%)`,
+                      }}
                     />
                   }
-                  endContent={entry.id === theme ? <span aria-hidden>✓</span> : null}
+                  endContent={entry.id === selected ? <span aria-hidden>✓</span> : null}
                 >
                   {entry.label}
                 </DropdownItem>

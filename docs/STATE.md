@@ -22,6 +22,82 @@ Phase 7 remains ungated for its own reason (usable on your phone through the
 tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
 `ANTHROPIC_API_KEY`); D-12 stays Provisional.
 
+## Post-Phase-8 fixes — the first real extraction run, capture, theme, orientation
+
+Five reported issues. The first two were real bugs with the same root cause
+class: something was broken and the system could not tell you what.
+
+### The API key was fine; the MODEL ID was wrong (D-12 amended)
+
+Every upload failed with `AI_REQUEST_REJECTED`, whose label said "Check the
+server's API key". The key was good. `GET /v1/models` against the live key
+settles it: **`claude-haiku-4-5` is not a real model id** — the only Haiku 4.5
+entry is `claude-haiku-4-5-20251001`. `claude-sonnet-5` does exist, which is
+why a manual re-extract (`forcePass2`, Sonnet) succeeded three times while
+every fresh upload died on its pass-1 call. D-12's "model IDs are exact and
+carry no date suffix" held for Sonnet and failed for Haiku.
+
+**The gap worth remembering is the second-order one.** ARCHITECTURE.md §6.4
+promises the UI gets "a status and a job id, not a provider message". Only half
+of that was built: the provider's message was _discarded_ rather than logged
+server-side. Diagnosing this took a live API probe because the 404 existed
+nowhere — not in the logs, not in `ai_usage` (no row is written for a call that
+never returned), not in `extraction_error`. Now:
+
+- `pipeline/extract.ts` logs the provider's status, error type and message on
+  every failed call;
+- `worker.ts` logs the underlying error whenever the reason falls back to the
+  generic `AI_EXTRACTION_FAILED` — the codes that say nothing are exactly the
+  ones whose cause was being thrown away.
+
+A second receipt failed generically after three _successful_ Sonnet calls. That
+one is still unexplained — the failure is after the API call, in mapping or
+persistence — and it is now self-diagnosing on the next occurrence rather than
+needing another archaeology session.
+
+### Capture: `capture="environment"` is not a preference, it is an exclusion
+
+On iOS, `capture` does not mean "prefer the camera" — it removes Photo Library
+and Files from the sheet entirely. A single input carrying it can never reach
+an existing photo or a PDF. Split into two: **Take photo** (with `capture`) and
+**Choose files** (without, accepting `image/*,application/pdf`). The PDF path
+needed no backend work at all — the ingest pipeline has rasterised PDFs since
+Phase 5 (D-10), and the upload route sniffs magic bytes rather than trusting
+`Content-Type`; only the `accept` attribute was keeping them out of the picker.
+
+### Theme (D-41, D-42)
+
+Beige light theme sampled from the icon (`#faf4eb` page, `#324136` accent),
+now the default; `light`'s id is reused so no `users.theme` row is stranded,
+and migration `0004` moves the column default. Existing rows are deliberately
+not rewritten, so an account already holding `dark` stays dark until it picks
+the new theme once.
+
+Both switcher bugs were real:
+
+- **The checkmark never moved** because `theme` is a _server prop_.
+  `chooseTheme` swapped the class on `<html>` and wrote to the database, but
+  the prop cannot change until the next server render — the page looked right
+  and the menu lied about it. Now tracked locally and adjusted during render
+  when the prop changes (React's documented pattern; an effect here is a
+  cascading render, which `react-hooks/set-state-in-effect` correctly flags).
+- **The swatches conveyed nothing** because they showed `background` only, and
+  four of the five themes are near-black. `THEMES` entries gained an `accent`
+  and the swatch is now split page-colour/accent.
+
+The wordmark is set in a vendored 25 KB latin subset of Dancing Script via
+`next/font/local` — not `next/font/google`, which would make every CI and
+Docker build depend on reaching fonts.googleapis.com (D-42).
+
+### Orientation (D-43)
+
+Three mechanisms, because no single one covers both platforms: the manifest's
+`orientation` (installed Android), `screen.orientation.lock` (Android Chrome
+standalone), and a CSS overlay for landscape phones. **On iOS none of the
+first two do anything** — `ScreenOrientation.lock` is not implemented — so
+what iOS gets is a message asking the user to rotate back. Stated plainly in
+D-43 because the alternative is discovering it on a device.
+
 ## Post-Phase-8 work — admin-settable API key, and a new app icon
 
 Two unrelated requests, done together and reviewed together.

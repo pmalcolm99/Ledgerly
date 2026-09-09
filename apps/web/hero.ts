@@ -144,33 +144,43 @@ export default heroui({
       },
     },
 
-    // ---- Ledgerly Light ----------------------------------------------
+    // ---- Ledgerly Beige (default, D-41) ------------------------------
+    //
+    // Both colours are sampled from the app icon rather than invented:
+    // `#faf4eb` is the tile, `#324136` is the mark. Before this the light
+    // theme was plain white with the teal accent, and the icon looked like it
+    // belonged to a different product.
+    //
+    // The content ramp goes UP in lightness from the page (`content1` is
+    // lighter than `background`), which is the opposite of the dark themes and
+    // is what makes a card read as raised on a warm ground rather than as a
+    // hole cut in it.
     light: {
       extend: "light",
       colors: {
-        background: "#ffffff",
-        foreground: "#18181b",
-        divider: "rgba(0,0,0,0.12)",
-        focus: "#2f7d80",
-        content1: "#ffffff",
-        content2: "#f4f4f5",
-        content3: "#e4e4e7",
-        content4: "#d4d4d8",
+        background: "#faf4eb",
+        foreground: "#26302a",
+        divider: "rgba(50,65,54,0.14)",
+        focus: "#324136",
+        content1: "#fffdf8",
+        content2: "#f3ecdf",
+        content3: "#e8e0d0",
+        content4: "#dbd2be",
         primary: {
-          50: "#ecf6f6",
-          100: "#d5eaea",
-          200: "#aed5d6",
-          300: "#82bec0",
-          400: "#58a5a7",
-          500: "#3a8b8d",
-          600: "#2f7d80",
-          700: "#256366",
-          800: "#1c4a4c",
-          900: "#15302f",
-          DEFAULT: "#2f7d80",
-          foreground: "#ffffff",
+          50: "#eef2ef",
+          100: "#d9e2dc",
+          200: "#b6c5bb",
+          300: "#90a89a",
+          400: "#6d8b79",
+          500: "#4f705d",
+          600: "#3d5846",
+          700: "#324136",
+          800: "#26322a",
+          900: "#1a231d",
+          DEFAULT: "#324136",
+          foreground: "#faf4eb",
         },
-        secondary: { DEFAULT: "#d4d4d8", foreground: "#18181b" },
+        secondary: { DEFAULT: "#ddd3c0", foreground: "#26302a" },
       },
     },
   },
