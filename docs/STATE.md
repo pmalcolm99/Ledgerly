@@ -27,22 +27,38 @@ tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
 Five reported issues. The first two were real bugs with the same root cause
 class: something was broken and the system could not tell you what.
 
-### The API key was fine; the MODEL ID was wrong (D-12 amended)
+### The API key was fine, and so was the model id — the REQUEST SHAPE was wrong (D-12 amended)
 
-Every upload failed with `AI_REQUEST_REJECTED`, whose label said "Check the
-server's API key". The key was good. `GET /v1/models` against the live key
-settles it: **`claude-haiku-4-5` is not a real model id** — the only Haiku 4.5
-entry is `claude-haiku-4-5-20251001`. `claude-sonnet-5` does exist, which is
-why a manual re-extract (`forcePass2`, Sonnet) succeeded three times while
-every fresh upload died on its pass-1 call. D-12's "model IDs are exact and
-carry no date suffix" held for Sonnet and failed for Haiku.
+Every upload failed with `AI_REQUEST_REJECTED`, whose label blamed the API key.
+The actual error, once it was possible to see it:
 
-**The gap worth remembering is the second-order one.** ARCHITECTURE.md §6.4
-promises the UI gets "a status and a job id, not a provider message". Only half
-of that was built: the provider's message was _discarded_ rather than logged
-server-side. Diagnosing this took a live API probe because the 404 existed
-nowhere — not in the logs, not in `ai_usage` (no row is written for a call that
-never returned), not in `extraction_error`. Now:
+```
+400 invalid_request_error
+"Thinking may not be enabled when tool_choice forces tool use."
+```
+
+Haiku 4.5 takes the older `thinking: {type:"enabled", budget_tokens:N}` form,
+which cannot be combined with a forced `tool_choice`. Sonnet 5's
+`{type:"adaptive"}` can — so pass 2 worked in production while pass 1 never
+did, which is precisely why the symptom read as a credentials problem. Haiku
+now sends no `thinking` field; forced tool use is the property worth keeping.
+`anthropicRequest.test.ts` asserts the absence of the field.
+
+**A wrong turn, recorded because the reasoning was seductive.** The first
+diagnosis was that `claude-haiku-4-5` is not a real model id — `GET /v1/models`
+returns only `claude-haiku-4-5-20251001`. True observation, false conclusion:
+that endpoint lists concrete snapshots, not aliases, and calling the bare alias
+directly works fine. D-12's "no date suffix" rule stands; the default was
+briefly changed and changed back. **Absence from a listing endpoint is not
+evidence of invalidity**, and one direct call would have settled it — the same
+call that eventually did.
+
+**The gap that made all of this expensive.** ARCHITECTURE.md §6.4 promises the
+UI gets "a status and a job id, not a provider message". Only half was built:
+the provider's message was _discarded_ rather than logged server-side. That
+400 existed nowhere — not in the logs, not in `ai_usage` (no row is written for
+a call that never returned), not in `extraction_error`. Diagnosing it required
+a live API probe. Now:
 
 - `pipeline/extract.ts` logs the provider's status, error type and message on
   every failed call;

@@ -22,11 +22,9 @@ describe("parseEnv", () => {
     const env = parseEnv(baseEnv());
     expect(env.APP_PORT).toBe(3000);
     expect(env.REDIS_URL).toBe("redis://redis:6379");
-    // The DATE SUFFIX is the point. `claude-haiku-4-5` is not a real model
-    // id — verified against `GET /v1/models`, where the only Haiku 4.5 entry
-    // is this one — and the bare alias 404s, surfacing as AI_REQUEST_REJECTED
-    // on every pass-1 call. D-12 amended.
-    expect(env.AI_MODEL_PASS1).toBe("claude-haiku-4-5-20251001");
+    // Undated, per D-12. The bare alias resolves against the live API; it is
+    // simply absent from `GET /v1/models`, which lists snapshots not aliases.
+    expect(env.AI_MODEL_PASS1).toBe("claude-haiku-4-5");
     expect(env.AI_MODEL_PASS2).toBe("claude-sonnet-5");
     expect(env.DEFAULT_CURRENCY).toBe("USD");
     expect(env.DEV_AUTH_BYPASS).toBe(false);

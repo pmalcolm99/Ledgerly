@@ -287,29 +287,46 @@ and `yt-dlp`, and the `chrome-headless` service entirely.
 
 ## D-12 — Two-pass Haiku 4.5 -> Sonnet 5 extraction ladder. **Provisional — Phase 6 confirms.**
 
-> **Amendment (first run against a real API key).** This decision asserted
-> "Model IDs are exact and carry no date suffix", and `packages/config`
-> defaulted `AI_MODEL_PASS1` to `claude-haiku-4-5` on that basis. **That is
-> not a real model id.** Checked against `GET /v1/models` with a live key: the
-> only Haiku 4.5 entry is `claude-haiku-4-5-20251001`. `claude-sonnet-5` does
-> exist, so the claim held for pass 2 and failed for pass 1 — which is why the
-> symptom was every upload dying on its first call while a manual re-extract
-> (`forcePass2`, Sonnet) succeeded.
+> **Amendment (first run against a real API key).** Pass 1 failed on every
+> upload with `AI_REQUEST_REJECTED`. The cause is a REQUEST-SHAPE
+> incompatibility, not a key or a model id:
 >
-> The 404 arrives as `NotFoundError`, which `classifyAnthropicError` correctly
-> treats as non-retryable and reports as `AI_REQUEST_REJECTED`. The user-facing
-> label for that code said "Check the server's API key", which was actively
-> misleading: the key was fine. Both the default and the label are fixed, and
-> the provider's own status/type/message is now logged server-side — see the
-> note below, which is the real lesson.
+> ```
+> 400 invalid_request_error
+> "Thinking may not be enabled when tool_choice forces tool use."
+> ```
+>
+> Haiku 4.5 takes the older `thinking: {type:"enabled", budget_tokens:N}` form,
+> and that form cannot be combined with `tool_choice: {type:"tool"}`. Sonnet
+> 5's `{type:"adaptive"}` can — which is exactly why pass 2 succeeded in
+> production while pass 1 never did, and why the symptom looked like a
+> credentials problem. `capabilityForModel` now sends **no `thinking` field**
+> for Haiku; forced tool use is the property worth keeping, since this
+> pipeline needs a `record_receipt` call rather than prose, and reading a
+> receipt is perception rather than reasoning. Verified against the live API:
+> Haiku with no `thinking` and a forced tool choice returns a correct
+> extraction. `anthropicRequest.test.ts` asserts the absence of the field.
+>
+> **A wrong turn worth recording, because the reasoning was seductive.** The
+> first diagnosis was that `claude-haiku-4-5` is not a real model id, on the
+> evidence that `GET /v1/models` lists only `claude-haiku-4-5-20251001`. That
+> is a real observation and a false conclusion: `/v1/models` enumerates
+> concrete snapshots, not aliases, and the bare alias resolves perfectly well
+> — confirmed by calling it directly. This decision's "model IDs are exact and
+> carry no date suffix" stands. The default was briefly changed and has been
+> changed back. The lesson is narrow and repeatable: absence from a listing
+> endpoint is not evidence of invalidity, and the probe that would have
+> settled it in one call was available the whole time.
 >
 > **The observability gap this exposed.** ARCHITECTURE.md §6.4 says errors
 > surfaced to the UI carry "a status and a job id, not a provider message".
 > Only half of that was implemented: the provider message was discarded rather
-> than logged. An operator had a five-word status and no way to reach the
-> cause. `pipeline/extract.ts` now logs status, error type and message
-> server-side on every failed call, and `worker.ts` logs the underlying error
-> whenever the reason falls back to the generic `AI_EXTRACTION_FAILED`.
+> than logged. The 400 above existed nowhere an operator could reach it — not
+> in the logs, not in `ai_usage` (no row is written for a call that never
+> returned), not in `extraction_error`. `pipeline/extract.ts` now logs the
+> provider's status, error type and message server-side on every failed call,
+> and `worker.ts` logs the underlying error whenever the reason falls back to
+> the generic `AI_EXTRACTION_FAILED`.
 
 **Context.** The brief §1.6 specifies the ladder. `docs/STATE.md` carried "AI
 model default" as open, because Forkd pins `AI_MODEL=claude-opus-4-7`, which is
