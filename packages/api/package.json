@@ -14,7 +14,8 @@
     "./rateLimit": "./src/rateLimit.ts",
     "./export": "./src/export/index.ts",
     "./aiKey": "./src/aiKey.ts",
-    "./secrets": "./src/secrets.ts"
+    "./secrets": "./src/secrets.ts",
+    "./smtp": "./src/smtp.ts"
   },
   "scripts": {
     "lint": "eslint .",

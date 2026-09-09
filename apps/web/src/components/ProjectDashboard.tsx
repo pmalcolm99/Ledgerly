@@ -11,6 +11,7 @@ import { Capture } from "./Capture";
 import { ExportButton } from "./ExportButton";
 import { Filters } from "./Filters";
 import { MemberManager } from "./MemberManager";
+import { ProjectEmailSettings } from "./ProjectEmailSettings";
 import { ReceiptRow } from "./ReceiptRow";
 import { SpendByCategory } from "./SpendByCategory";
 import { formatDateRange } from "../lib/dates";
@@ -160,6 +161,8 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
           </ul>
         )}
       </section>
+
+      <ProjectEmailSettings projectId={projectId} />
 
       <MemberManager projectId={projectId} />
     </div>

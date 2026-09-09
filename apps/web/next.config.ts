@@ -29,6 +29,19 @@ const nextConfig: NextConfig = {
   // only through @ledgerly/api, so apps/web/package.json lists it as a
   // direct dependency too — see the tracing note above, which applies to it
   // verbatim.
+  //
+  // `nodemailer` (D-44) is deliberately NOT on this list, which makes it the
+  // one exception to the pattern above — so the reasoning is recorded rather
+  // than left to look like an oversight. This list is for packages webpack
+  // must not bundle, and that is exactly what creates the resolution problem
+  // the note above describes. nodemailer has no `__dirname`, no
+  // `createRequire`, no `import.meta.url` and no dynamic requires in its
+  // `dist/`, so webpack inlines it cleanly and there is no runtime
+  // `require("nodemailer")` left to resolve — verified three ways against a
+  // real standalone build: the SMTP transport appears inside the emitted
+  // chunk, the containerised `receipt-email` worker starts and registers its
+  // queue, and a receipt email was actually delivered through smtp2go from
+  // that container.
   serverExternalPackages: ["sharp", "bullmq", "ioredis", "exceljs"],
 
   async headers() {

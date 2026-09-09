@@ -33,6 +33,12 @@ const PDF_RASTER_DPI = 200;
 const DISPLAY_MAX_EDGE = 1600;
 const THUMB_MAX_EDGE = 320;
 const EXTRACTION_MAX_EDGE = 2200;
+// D-44. Small enough that a mail relay accepts it without argument and a
+// phone downloads it over cellular, large enough that the printed total is
+// still readable when the recipient pinches in — which is the entire point of
+// attaching it rather than just linking to the app.
+const EMAIL_MAX_EDGE = 1200;
+const EMAIL_WARN_BYTES = 300_000;
 const DISPLAY_WARN_BYTES = 300_000; // "target under 300 KB" -- a tuning signal, not a hard failure
 
 function isEnoent(error: unknown): boolean {
@@ -274,6 +280,54 @@ export async function renderExtraction(
     })
     .jpeg({ quality: 88 })
     .toBuffer();
+}
+
+/**
+ * The attachment for a receipt email (D-44): longest edge 1200, JPEG q75.
+ *
+ * JPEG, not WebP. The display render this reads from is already WebP and
+ * re-encoding costs a little quality, but Outlook — the client most likely to
+ * be opening a receipt at a desk — still will not preview a WebP attachment,
+ * and an attachment nobody can see is worse than one that is slightly softer.
+ *
+ * Reads the DISPLAY render rather than the original, and that is the whole
+ * story on this instance: `RETAIN_ORIGINALS=false`, so a PDF invoice's source
+ * file is discarded after ingest and page 1's render is all that exists. There
+ * is no higher-quality source to prefer, which is why this takes no
+ * `hasOriginal` branch the way `regenerateExtractionRender` does.
+ */
+export async function renderEmailAttachment(params: {
+  uploadsDir: string;
+  projectId: string;
+  receiptId: string;
+  maxMegapixels: number;
+}): Promise<Buffer> {
+  const displayPath = receiptFilePath(
+    params.uploadsDir,
+    params.projectId,
+    params.receiptId,
+    "display",
+    "webp",
+  );
+  const bytes = await readReceiptFile(displayPath);
+  const attachment = await sharp(bytes, { limitInputPixels: params.maxMegapixels * 1_000_000 })
+    .rotate()
+    .resize({
+      width: EMAIL_MAX_EDGE,
+      height: EMAIL_MAX_EDGE,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 75 })
+    .toBuffer();
+
+  if (attachment.length > EMAIL_WARN_BYTES) {
+    console.warn(
+      `[ledgerly] receipt ${params.receiptId}: email attachment exceeded the 300 KB target ` +
+        `(${attachment.length} bytes)`,
+    );
+  }
+  return attachment;
 }
 
 export type RegenerateExtractionResult = {

@@ -8,6 +8,7 @@ import { isOnboarded, resolveIdentityFromHeaders } from "@ledgerly/auth";
 import type { AuthUser } from "@ledgerly/auth";
 
 import type { RateLimitRedis } from "./rateLimit";
+import type { SmtpConfig } from "./smtp";
 
 /**
  * packages/api/src/trpc.ts — context and the procedure ladder
@@ -29,10 +30,33 @@ export type EnqueueReceiptExtract = (params: {
   forcePass2: boolean;
 }) => Promise<void>;
 
+/** Enqueues a `receipt-email` job. Injected for the same reason as
+ * `enqueueReceiptExtract` above. `receipts.emailReceipt` is the only caller;
+ * it never sends, it only asks the queue to. */
+export type EnqueueReceiptEmail = (params: {
+  receiptId: string;
+  toUserId: string;
+  requestedBy: string;
+}) => Promise<void>;
+
+/** Sends one message NOW, used only by `admin.testSmtp`. Injected because
+ * `nodemailer` lives in `packages/queue` (which already depends on this
+ * package, so the import would be circular) and because the credential-
+ * consuming client must stay unreachable from anything `apps/web` bundles.
+ * Every other send in the app goes through the queue. */
+export type SendEmail = (params: {
+  config: SmtpConfig;
+  to: string;
+  subject: string;
+  text: string;
+}) => Promise<void>;
+
 export type Context = {
   db: Database;
   user: AuthUser | null;
   enqueueReceiptExtract?: EnqueueReceiptExtract;
+  enqueueReceiptEmail?: EnqueueReceiptEmail;
+  sendEmail?: SendEmail;
   /** Same injection reasoning as `enqueueReceiptExtract` above (Redis
    * lives behind `@ledgerly/queue`, which cannot be imported back into
    * this package). Used by `receipts.reextract` (review finding M-3) to
@@ -49,12 +73,16 @@ export type Context = {
 export async function createContext(opts: {
   headers: Headers;
   enqueueReceiptExtract?: EnqueueReceiptExtract;
+  enqueueReceiptEmail?: EnqueueReceiptEmail;
+  sendEmail?: SendEmail;
   rateLimitRedis?: RateLimitRedis;
 }): Promise<Context> {
   return {
     db: getDb(),
     user: await resolveIdentityFromHeaders(opts.headers),
     enqueueReceiptExtract: opts.enqueueReceiptExtract,
+    enqueueReceiptEmail: opts.enqueueReceiptEmail,
+    sendEmail: opts.sendEmail,
     rateLimitRedis: opts.rateLimitRedis,
   };
 }
@@ -78,6 +106,14 @@ const CLIENT_SAFE_CODES = new Set([
   "CONFLICT",
   "BAD_REQUEST",
   "TOO_MANY_REQUESTS",
+  // D-44. A capability that exists and FAILS — the receipt-email enqueue
+  // losing Redis — needs to tell the caller that nothing was sent, which the
+  // flattened "Internal server error." cannot. Safe to admit as a class
+  // because tRPC never SYNTHESISES this code: `getErrorFromUnknown` maps every
+  // unrecognised throw to INTERNAL_SERVER_ERROR, so the only way a
+  // SERVICE_UNAVAILABLE reaches here is a `new TRPCError` written in this
+  // repository, whose message is therefore ours and not a driver's.
+  "SERVICE_UNAVAILABLE",
 ]);
 
 const t = initTRPC.context<Context>().create({

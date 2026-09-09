@@ -126,3 +126,77 @@ export async function checkExportRateLimit(
 ): Promise<RateLimitResult> {
   return checkRateLimit(redis, `export_rate:${userId}`, 1, EXPORT_RATE_LIMIT_PER_MIN);
 }
+
+/**
+ * The same atomic check, against a window that is not one minute.
+ *
+ * The per-minute limits above all guard CPU or spend that recovers the moment
+ * the burst stops. A relay quota does not: it is a monthly allowance, and the
+ * sending reputation behind it is shared with everything else the operator
+ * sends and is slow and unpleasant to repair. A per-minute cap alone bounds
+ * the burst and not the total — 5/min sustained is over 7,000 messages a day,
+ * which exhausts a typical 10,000/month relay plan in under two days.
+ *
+ * Same fixed-window trade-off as `checkRateLimit`, and it matters even less
+ * here: the boundary overshoot is one extra day's budget at a day boundary.
+ */
+export async function checkWindowedRateLimit(
+  redis: RateLimitRedis,
+  key: string,
+  cost: number,
+  limit: number,
+  windowSeconds: number,
+): Promise<RateLimitResult> {
+  const bucket = Math.floor(Date.now() / (windowSeconds * 1000));
+  const result = await redis.eval(
+    RATE_LIMIT_SCRIPT,
+    1,
+    `${key}:${bucket}`,
+    cost,
+    limit,
+    windowSeconds,
+  );
+  if (result === 1) return { allowed: true, retryAfterSeconds: 0 };
+  const secondsIntoWindow = Math.floor(Date.now() / 1000) % windowSeconds;
+  return { allowed: false, retryAfterSeconds: windowSeconds - secondsIntoWindow };
+}
+
+// D-44. An on-demand receipt email is user-triggered outbound mail. Unlike an
+// export, the cost of abuse is not this instance's CPU — it is the sending
+// reputation of the relay, which is shared across everything the operator
+// sends and is slow and unpleasant to repair. Lower than every other limit
+// here for that reason, and still far above any real "send that one again".
+export const EMAIL_RECEIPT_RATE_LIMIT_PER_MIN = 5;
+
+// The one that actually bounds the bill. `emailReceipt` needs only READ on the
+// project, so any member of any shared project can drive it; the per-minute
+// cap bounds the burst but 5/min sustained is >7,000 messages/day, enough to
+// exhaust a typical relay plan in under two days. 60/day is far above any
+// genuine "send me that one again" and nowhere near a plan-destroying volume.
+export const EMAIL_RECEIPT_RATE_LIMIT_PER_DAY = 60;
+
+const ONE_DAY_SECONDS = 24 * 60 * 60;
+
+export async function checkEmailReceiptRateLimit(
+  redis: RateLimitRedis,
+  userId: string,
+): Promise<RateLimitResult> {
+  const perMinute = await checkRateLimit(
+    redis,
+    `email_receipt_rate:${userId}`,
+    1,
+    EMAIL_RECEIPT_RATE_LIMIT_PER_MIN,
+  );
+  if (!perMinute.allowed) return perMinute;
+
+  // Checked second, and it consumes from the daily budget only once the
+  // per-minute budget has already admitted the request — so a client hammering
+  // past the minute limit cannot burn the day's allowance doing it.
+  return checkWindowedRateLimit(
+    redis,
+    `email_receipt_daily:${userId}`,
+    1,
+    EMAIL_RECEIPT_RATE_LIMIT_PER_DAY,
+    ONE_DAY_SECONDS,
+  );
+}

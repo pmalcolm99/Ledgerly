@@ -20,6 +20,7 @@ import { AlertTriangle, ArrowLeft, RefreshCw, Trash2 } from "lucide-react";
 import type { EditableReceiptColumn, MissingFieldToken } from "@ledgerly/shared/receiptFields";
 
 import { trpc } from "../lib/trpc";
+import { EmailReceiptButton } from "./EmailReceiptButton";
 import { extractionRefetchInterval } from "../lib/extractionPolling";
 import { receiptImageUrl } from "../lib/images";
 import {
@@ -218,6 +219,14 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
       {update.isError ? (
         <p className="rounded bg-danger-50 p-3 text-sm text-danger">{update.error.message}</p>
       ) : null}
+
+      <div className="flex flex-wrap items-start gap-2 border-t border-divider pt-4">
+        {/* Outside the canEdit block on purpose. `receipts.emailReceipt`
+            requires READ, not edit: a read-only member forwarding a receipt to
+            a fellow member discloses nothing either of them could not already
+            open. */}
+        <EmailReceiptButton receiptId={receiptId} projectId={projectId} />
+      </div>
 
       {canEdit ? (
         <div className="flex flex-wrap items-center gap-2 border-t border-divider pt-4">

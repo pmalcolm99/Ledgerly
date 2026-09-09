@@ -22,6 +22,102 @@ Phase 7 remains ungated for its own reason (usable on your phone through the
 tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
 `ANTHROPIC_API_KEY`); D-12 stays Provisional.
 
+## Email Receipts (D-44)
+
+Commit 3 of the post-Phase-8 batch, and the only genuinely new feature in it:
+an SMTP relay configured by the instance owner, a per-project setting that
+emails the project owner once per scanned receipt, and an on-demand send for
+any single receipt.
+
+### The shape, and why
+
+**SMTP settings are one encrypted `app_config` blob**, reusing D-39's
+`secrets.ts` machinery. `packages/api/src/smtp.ts` mirrors `aiKey.ts`,
+including `undecryptable` as a real state and a description type with **no
+field capable of holding the password** — which is the mechanism, not the
+discipline. No environment fallback: the Claude key needs one because a fresh
+instance must extract before anyone visits the admin screen, and email has no
+equivalent bootstrap problem.
+
+**Sending is a third queue, `receipt-email`,** not a step inside extraction.
+This is the decision that matters most. An inline send would put a mail relay
+in the retry path of a job that spends money — a relay hiccup would burn two
+more paid Anthropic calls and then write `extraction_status='failed'` on a
+receipt whose extraction succeeded. The enqueue happens after
+`processReceiptExtraction` returns, outside its persistence transaction, and is
+wrapped so that even a Redis failure cannot fail the extraction job.
+
+**`receipts.receipt_email_sent_at` is load-bearing.** `receipts.reextract` sets
+`forcePass2` and re-enters persistence, so without a durable marker every
+manual re-extract would send again. Written after the send, not before, so a
+failure retries rather than being suppressed by a marker for mail that never
+went.
+
+**The recipient is a user id, never an address.** `receipts.emailReceipt` takes
+`toUserId`, checked against membership in the procedure and again in the
+worker. Mailing a receipt to an arbitrary address is not a validation failure —
+it is an operation the API cannot express. Read access is enough to send:
+forwarding to a fellow member discloses nothing either could not already open.
+
+**`nodemailer` is in `packages/queue` only.** `pipeline/email.ts` takes the
+transport as a structurally-typed dependency and never names the library. The
+one synchronous send is `admin.testSmtp`, and even that reaches the library
+through an injected context capability supplied by `apps/web`'s route handler.
+
+### Fixed while in the file
+
+The **Test button on the Claude API key card did not exist**. Commit 1 added
+`admin.testAiKey`, wired `onTest`/`testing` through `KeyForm`'s props — and
+never rendered the button. The procedure, its rate limit and its six tests were
+all real; the control was not. Now rendered, and it tests the STORED key rather
+than the draft, so it stays available while the input is empty, which is its
+normal state.
+
+### Verification
+
+**670 unit tests**, up from 638 — 16 for the message rendering (null merchant,
+no line items, an uncategorised item, a credit rendered negative, HTML escaping
+of every interpolated field), 10 DB-backed for the send (once-only marker,
+setting read at send time, soft-deleted receipt, non-member recipient, the
+attachment's JPEG magic bytes and size ceiling), and 12 for the API surface
+(owner-only, password never in the response, blank-password-means-unchanged,
+the audit row carrying the host and neither credential).
+
+`nodemailer` is webpack-bundled rather than external, so the pnpm standalone
+tracing trap that forced `sharp`/`bullmq`/`exceljs` to be direct dependencies
+of `apps/web` does not apply. Verified three ways against a real standalone
+build rather than argued: the SMTP transport is present inside the emitted
+chunk, the containerised `receipt-email` worker starts and registers its queue
+in Redis, and **a receipt email was delivered end to end through smtp2go from
+that container** — settings saved from the admin screen, sent on demand from a
+receipt, audited, with the automatic-send marker correctly left null.
+
+### Review — what was found and what was done
+
+The `reviewer` pass found 1 high, 3 medium and 5 low, and separately traced
+clean: secret disclosure across every path (return types, the error formatter,
+zod issue payloads, superjson, the relay's own error text, worker logs, audit
+metadata, the client bundle), authorization on `emailReceipt`, HTML escaping and
+header injection, attachment EXIF/metadata hygiene, card-number scrubbing on
+every field the email renders, failure containment around the extraction job,
+the migration's lock behaviour, and money/null handling. All nine findings
+fixed before commit.
+
+| Sev      | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Fix                                                                                                                                                                                                                                                                                                    |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **High** | **A terminally-failed auto email blocked that receipt from ever auto-emailing again.** `removeOnFail: {count: 50}` retained the job hash, and BullMQ's `addStandardJob` returns early — reporting SUCCESS — when a hash with the same id exists. So the stable `<receiptId>:auto` job id stayed parked and every later enqueue was a silent no-op that threw nothing to catch. Turn the project toggle on before configuring SMTP, and every receipt uploaded in that window could never auto-email afterwards — including via re-extract, the obvious remedy and the entire reason the marker exists. | `removeOnFail: {count: 0}`, matching the other two queues, which use it for exactly this reason. The durable record of a failure is the `failed` handler's log line, not the Redis-resident job.                                                                                                       |
+| Med      | **A failed marker write turned one send into up to five.** The write is after the send so a crash costs one duplicate — accepted. But letting it THROW made the job retryable after a successful send, and the retry re-read a marker still null. Pool saturation while several extractions land at once — exactly when these fire — would deliver five copies.                                                                                                                                                                                                                                        | The marker write is wrapped and logged, never rethrown. Caps the damage at one possible duplicate on a later re-extract, which the design already accepts.                                                                                                                                             |
+| Med      | **Any project reader could burn the operator's relay quota.** `emailReceipt` needs only `read`, and 5/min sustained is >7,000 messages a day — enough to exhaust a 10,000/month plan in under two days and take the sending reputation with it.                                                                                                                                                                                                                                                                                                                                                        | A second budget, 60/day, via a new `checkWindowedRateLimit`. Charged only after the per-minute check admits, so hammering the minute limit cannot burn the day's allowance. The project flag deliberately still does NOT gate on-demand sends — that was an explicit requirement.                      |
+| Low      | **The audit row committed before the enqueue**, so a Redis failure left the log asserting an email that was never queued, and the caller saw the flattened "Internal server error."                                                                                                                                                                                                                                                                                                                                                                                                                    | Renamed to `receipt.email_requested` (the honest claim, and `reextract`'s own convention), the enqueue failure is caught and logged, and it now returns `SERVICE_UNAVAILABLE` — added to `CLIENT_SAFE_CODES`, which is safe as a class because tRPC never synthesises that code from an unknown throw. |
+| Low      | **`secretHint` disclosed too much of an SMTP password.** Its last-four rule is argued for a 100-plus character API key; relay passwords are routinely 12–20, where four characters is a third of the secret.                                                                                                                                                                                                                                                                                                                                                                                           | The SMTP hint is a length only.                                                                                                                                                                                                                                                                        |
+| Low      | **`nodemailer` was the one deviation** from the documented `serverExternalPackages` tracing pattern.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Verified rather than assumed (above), and the reasoning is now recorded in `next.config.ts` so it does not read as an oversight.                                                                                                                                                                       |
+| Low      | **On-demand sends reported "Queued" even with no SMTP configured**, and non-owners cannot read `admin.smtp` to find out why nothing arrived.                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `emailReceipt` checks the config before it audits or enqueues, and returns a plain "Email is not set up on this instance."                                                                                                                                                                             |
+| Low      | A comment claimed the project owner has no `project_members` row. `projects.create` does insert one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Comment corrected; the code was already right, since the owner branch is tested first and deliberately does not depend on that row.                                                                                                                                                                    |
+
+One process note: `prettier --write` across the repo also reformatted nine files
+untouched by this work (the `docs/reference/` Forkd analyses and three agent
+definitions). Reverted — a formatting sweep is not part of this change.
+
 ## Post-Phase-8 batch 3 — UI, live updating, credits, setup guide
 
 Thirteen reported items, delivered as three commits so the visible fixes reach

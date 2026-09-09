@@ -124,6 +124,10 @@ const updateInput = z
     description: z.string().trim().max(4000).nullable().optional(),
     startDate: z.string().date().nullable().optional(),
     endDate: z.string().date().nullable().optional(),
+    // D-44. Not ordinary metadata: this decides whether receipt data leaves
+    // the system, which is why the mutation below audits it unconditionally
+    // while a name or date change still audits nothing.
+    emailReceipts: z.boolean().optional(),
   })
   .refine(
     (v) =>
@@ -347,6 +351,7 @@ export const projectsRouter = router({
       if (input.description !== undefined) patch.description = input.description;
       if (input.startDate !== undefined) patch.startDate = input.startDate;
       if (input.endDate !== undefined) patch.endDate = input.endDate;
+      if (input.emailReceipts !== undefined) patch.emailReceipts = input.emailReceipts;
 
       if (Object.keys(patch).length === 0) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "No fields to update." });
@@ -373,6 +378,25 @@ export const projectsRouter = router({
           .where(eq(projects.id, row.id))
           .returning();
         if (!updated) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+
+        // D-44. Turning receipt email on or off changes WHERE FINANCIAL DATA
+        // GOES, so unlike every other field on this form it is audited
+        // unconditionally — by the person who did it, and to what value. The
+        // rest of this mutation deliberately audits nothing for an ordinary
+        // edit (see the header comment); this is the exception, and the
+        // reason for the exception is that "who turned this on" is a question
+        // someone will eventually need answered.
+        if (input.emailReceipts !== undefined && input.emailReceipts !== row.emailReceipts) {
+          await recordAudit(tx, {
+            actorUserId: ctx.user.id,
+            action: input.emailReceipts
+              ? "project.email_receipts_on"
+              : "project.email_receipts_off",
+            entityType: "project",
+            entityId: row.id,
+            metadata: { via: "projects.update" },
+          });
+        }
 
         // Still no general project.updated row for an ordinary edit (see
         // header comment) — but the override case gets ONE, so that

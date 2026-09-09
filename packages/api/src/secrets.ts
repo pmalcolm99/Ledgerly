@@ -51,7 +51,14 @@ const HEADER_BYTES = 1 + IV_BYTES + TAG_BYTES;
 
 /** The `app_config.key` values this app understands. A closed union rather
  *  than free text so a typo is a type error, not a silently-ignored setting. */
-export const SECRET_KEYS = { anthropicApiKey: "anthropic_api_key" } as const;
+export const SECRET_KEYS = {
+  anthropicApiKey: "anthropic_api_key",
+  /** Phase 9 (D-44). The WHOLE SMTP config as one encrypted JSON blob, not a
+   *  password column beside plaintext host/port/user fields. One read, one
+   *  decrypt, one atomic write — and no field of it can be left in the clear
+   *  by someone adding a column later, because there are no columns. */
+  smtp: "smtp_config",
+} as const;
 export type SecretKey = (typeof SECRET_KEYS)[keyof typeof SECRET_KEYS];
 
 export class SecretError extends Error {

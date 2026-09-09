@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  boolean,
   check,
   date,
   index,
@@ -27,6 +28,11 @@ export const projects = pgTable(
     startDate: date("start_date"),
     endDate: date("end_date"),
     status: projectStatusEnum("status").notNull().default("active"),
+    // Phase 9 (D-44). When true, each receipt emails the project owner once
+    // after its extraction finishes. Defaults to false: turning on an
+    // outbound path that carries financial data is a decision someone has to
+    // make, not one they inherit from an upgrade.
+    emailReceipts: boolean("email_receipts").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
     archivedAt: timestamp("archived_at", { withTimezone: true }),

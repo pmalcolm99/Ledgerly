@@ -55,10 +55,15 @@ export async function register(): Promise<void> {
     const { startIngestWorker } = await import("@ledgerly/queue/ingestWorker");
     const ingestWorker = await startIngestWorker(env.REDIS_URL);
 
+    // D-44's third stage. Separate from receipt-extract on purpose: a mail
+    // relay must never sit in the retry path of a job that spends money.
+    const { startEmailWorker } = await import("@ledgerly/queue/emailWorker");
+    const emailWorker = await startEmailWorker(env.REDIS_URL);
+
     // D-19's graceful-shutdown wiring: stop accepting new jobs and let
     // in-flight ones finish on SIGTERM/SIGINT, rather than the process
     // being killed mid-job (`docker stop`, a rolling deploy).
     const { registerGracefulShutdown } = await import("@ledgerly/queue");
-    registerGracefulShutdown([extractWorker, ingestWorker], env.REDIS_URL);
+    registerGracefulShutdown([extractWorker, ingestWorker, emailWorker], env.REDIS_URL);
   }
 }

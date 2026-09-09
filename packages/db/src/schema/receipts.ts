@@ -53,6 +53,15 @@ export const receipts = pgTable(
     thumbKey: text("thumb_key"),
     originalKey: text("original_key"),
 
+    // Phase 9 (D-44): when the once-per-import receipt email was sent.
+    //
+    // Load-bearing, not bookkeeping. `receipts.reextract` sets `forcePass2`
+    // and re-enters the whole persistence path, so without a durable marker
+    // every manual re-extract would send the email again. It records the
+    // AUTOMATIC send only — an on-demand send is a deliberate act that says
+    // nothing about whether the automatic one has happened.
+    receiptEmailSentAt: timestamp("receipt_email_sent_at", { withTimezone: true }),
+
     extractionStatus: extractionStatusEnum("extraction_status").notNull().default("pending"),
     extractionModel: text("extraction_model"),
     extractionPass: smallint("extraction_pass"),

@@ -267,6 +267,20 @@ function KeyForm(props: {
       >
         Save
       </Button>
+      {props.onTest ? (
+        <Button
+          size="sm"
+          variant="flat"
+          // Tests the STORED key, not the draft, so it stays available while
+          // the input is empty — which is its normal state, and the state an
+          // operator is in when they want to know whether the saved key works.
+          isDisabled={props.busy}
+          isLoading={props.testing}
+          onPress={props.onTest}
+        >
+          Test
+        </Button>
+      ) : null}
       {props.showClear ? (
         <Button
           size="sm"

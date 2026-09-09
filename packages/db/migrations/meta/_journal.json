@@ -36,6 +36,13 @@
       "when": 1788962926740,
       "tag": "0004_chubby_betty_ross",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788969797944,
+      "tag": "0005_yummy_chat",
+      "breakpoints": true
     }
   ]
 }

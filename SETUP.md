@@ -266,6 +266,41 @@ You are done.
 
 ---
 
+## 8. Optional: receipt emails
+
+Ledgerly can email you each receipt once it has been scanned, with the image
+attached. It is off by default and needs two things switched on.
+
+### The relay
+
+**Admin → Email (SMTP).** Any relay works — smtp2go, Postmark, SES. You need:
+
+| Field               | Note                                                                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host / Port         | `587` with implicit TLS **off** is the common case. Turn implicit TLS on only for port `465`.                                                      |
+| Username / Password | Stored encrypted with `MASTER_KEY`, like the Claude key. The password is write-only: once saved you see its last four characters and nothing else. |
+| From address        | Must be an address the relay is willing to send as. This is the field that most often causes a rejection.                                          |
+
+Press **Send test email**. It sends a real message to your own address using
+the **saved** settings — so save your changes first. **You should see** a
+success line, and the message in your inbox within a minute.
+
+Editing settings later: leave the password box blank to keep the stored one.
+Only fill it in when you actually want to change it.
+
+### Per project
+
+On a project's page, **Receipt emails → Email me each receipt**. Each new
+receipt then emails the project owner once, after extraction finishes — so the
+email contains the extracted fields rather than an empty shell. A re-extract
+does not send a second copy.
+
+Regardless of that setting, any receipt can be emailed on demand from its own
+page, to any member of that project. There is no free-text address field: to
+send a receipt to someone, add them to the project first.
+
+---
+
 ## Troubleshooting
 
 ### `webapp` restarts in a loop

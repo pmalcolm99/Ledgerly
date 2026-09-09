@@ -27,6 +27,12 @@ import { NEEDS_REVIEW_SQL } from "../receiptAccess";
 import { checkRateLimit } from "../rateLimit";
 import { scopedProjects } from "../scope";
 import { SECRET_KEYS, deleteSecret, writeSecret } from "../secrets";
+import {
+  describeSmtpConfig,
+  mergeSmtpConfig,
+  resolveSmtpConfig,
+  serializeSmtpConfig,
+} from "../smtp";
 import { ownerProcedure, router } from "../trpc";
 import type { Context } from "../trpc";
 
@@ -546,6 +552,185 @@ export const adminRouter = router({
 
     return runAiKeyTest(apiKey, [env.AI_MODEL_PASS1, env.AI_MODEL_PASS2]);
   }),
+
+  /**
+   * The SMTP settings' STATUS — every field except the password (D-44).
+   *
+   * `describeSmtpConfig` returns a type with no `password` field at all, which
+   * is the same by-construction protection `admin.aiKey` gets. What reaches
+   * the client is host/port/security/username/from-address plus a four-
+   * character hint of the password.
+   */
+  smtp: ownerProcedure.query(async ({ ctx }) => {
+    const description = await describeSmtpConfig(ctx.db, getEnv().MASTER_KEY);
+
+    let updatedByName: string | null = null;
+    if (description.updatedBy) {
+      const [row] = await ctx.db
+        .select({
+          displayName: users.displayName,
+          firstName: users.firstName,
+          lastName: users.lastName,
+        })
+        .from(users)
+        .where(eq(users.id, description.updatedBy))
+        .limit(1);
+      updatedByName = row ? displayNameOf({ ...row, email: null }) : null;
+    }
+
+    return { ...description, updatedBy: undefined, updatedByName };
+  }),
+
+  /**
+   * Stores the SMTP config, encrypted with `MASTER_KEY` as one JSON blob.
+   *
+   * `password` is OPTIONAL, and that is load-bearing rather than lenient: the
+   * form cannot round-trip a write-only field, so submitting it with the
+   * password box blank means "keep the stored password". Without that,
+   * changing the port would silently wipe authentication. `mergeSmtpConfig`
+   * owns that rule so it cannot be re-derived differently later.
+   */
+  setSmtp: ownerProcedure
+    .input(
+      z.object({
+        host: z.string().trim().min(1).max(255),
+        port: z.number().int().min(1).max(65535),
+        secure: z.boolean(),
+        user: z.string().trim().max(255),
+        /** Absent means "unchanged". Empty string is not accepted as a way to
+         *  set an empty password — use a server with no username instead. */
+        password: z.string().min(1).max(512).optional(),
+        fromAddress: z.string().trim().email().max(320),
+        fromName: z.string().trim().max(120),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const env = getEnv();
+      const existing = await resolveSmtpConfig(ctx.db, env.MASTER_KEY);
+      if (existing.source === "undecryptable" && input.password === undefined) {
+        // The stored row cannot be read, so there is no password to keep. Say
+        // that plainly rather than merging against null and failing zod with a
+        // message about a field the operator did fill in.
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "The stored settings cannot be decrypted, so the saved password is unrecoverable. Enter the password again.",
+        });
+      }
+
+      const merged = mergeSmtpConfig(existing.config, input);
+      if (!merged.ok) throw new TRPCError({ code: "BAD_REQUEST", message: merged.message });
+
+      await ctx.db.transaction(async (tx) => {
+        await writeSecret(
+          tx,
+          SECRET_KEYS.smtp,
+          serializeSmtpConfig(merged.config),
+          env.MASTER_KEY,
+          ctx.user.id,
+        );
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.updated",
+          entityType: "app_config",
+          entityId: null,
+          // The host is recorded because "where is this instance sending mail"
+          // is the question an audit log should be able to answer. The
+          // username and password are not: `audit.ts`'s contract is that
+          // metadata never carries a credential, and a username is half of one.
+          metadata: { key: SECRET_KEYS.smtp, via: "admin.setSmtp", host: merged.config.host },
+        });
+      });
+
+      return { ok: true as const };
+    }),
+
+  /** Removes the stored SMTP config. There is no environment fallback, so this
+   *  turns receipt email off entirely — which is also the recovery path when
+   *  `MASTER_KEY` no longer matches the row, since it never reads it. */
+  clearSmtp: ownerProcedure.mutation(async ({ ctx }) => {
+    const cleared = await ctx.db.transaction(async (tx) => {
+      const removed = await deleteSecret(tx, SECRET_KEYS.smtp);
+      if (removed) {
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.cleared",
+          entityType: "app_config",
+          entityId: null,
+          metadata: { key: SECRET_KEYS.smtp, via: "admin.clearSmtp" },
+        });
+      }
+      return removed;
+    });
+    return { ok: true as const, cleared };
+  }),
+
+  /**
+   * Sends one test message to the owner's own address.
+   *
+   * Real send, not a connection probe. The AI key's Test button taught the
+   * lesson this reuses: only the actual operation distinguishes a wrong
+   * password from a blocked port from a From address the relay refuses to
+   * accept. All three look identical from a settings form.
+   *
+   * `ctx.sendEmail` is INJECTED, exactly like `enqueueReceiptExtract`, and for
+   * the same structural reason — `nodemailer` lives in `packages/queue`, which
+   * already depends on this package, so importing it here would be circular
+   * AND would put the credential-consuming client one import away from the web
+   * bundle. `apps/web`'s tRPC route handler supplies the implementation.
+   *
+   * Rate-limited: an owner-only button that makes an outbound connection has
+   * no business being clickable at click speed.
+   */
+  testSmtp: ownerProcedure.mutation(async ({ ctx }) => {
+    if (ctx.rateLimitRedis) {
+      const limit = await checkRateLimit(
+        ctx.rateLimitRedis,
+        `smtp_test:${ctx.user.id}`,
+        1,
+        SMTP_TEST_RATE_LIMIT_PER_MIN,
+      );
+      if (!limit.allowed) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "Too many tests. Try again shortly.",
+        });
+      }
+    }
+
+    const { config, source } = await resolveSmtpConfig(ctx.db, getEnv().MASTER_KEY);
+    if (source === "undecryptable") {
+      return {
+        ok: false,
+        message:
+          "Settings are stored but cannot be decrypted — MASTER_KEY does not match this database. Clear them and enter them again.",
+      };
+    }
+    if (!config) return { ok: false, message: "SMTP is not configured." };
+    if (!ctx.sendEmail) {
+      return { ok: false, message: "Email sending is not available in this context." };
+    }
+
+    try {
+      await ctx.sendEmail({
+        config,
+        to: ctx.user.email,
+        subject: "Ledgerly test email",
+        text:
+          `This is a test message from Ledgerly, sent to confirm the SMTP settings work.\n\n` +
+          `Sent via ${config.host}:${config.port}.`,
+      });
+      return { ok: true, message: `Sent to ${ctx.user.email}. Check that it arrives.` };
+    } catch (error) {
+      // The relay's own message is the diagnosis and is worth showing: "535
+      // authentication failed" or "connect ETIMEDOUT" is what tells the
+      // operator which field is wrong. It cannot contain the password — the
+      // password is never echoed by an SMTP server — but it is truncated
+      // regardless, because an error string is not a place to be relaxed.
+      const detail = error instanceof Error ? error.message.slice(0, 300) : "unknown error";
+      return { ok: false, message: `The server rejected the message: ${detail}` };
+    }
+  }),
 });
 
 /**
@@ -558,6 +743,10 @@ export const adminRouter = router({
 /** An owner-only outbound probe. Generous enough that a genuine
  *  diagnose-and-retry loop never hits it. */
 const AI_KEY_TEST_RATE_LIMIT_PER_MIN = 10;
+
+/** Lower than the AI key's: this one actually delivers a message, and a relay
+ *  counts every one against the instance's sending reputation. */
+const SMTP_TEST_RATE_LIMIT_PER_MIN = 3;
 
 const KEY_BLOCKED_ERRORS = ["ANTHROPIC_KEY_NOT_CONFIGURED", "ANTHROPIC_KEY_UNDECRYPTABLE"];
 

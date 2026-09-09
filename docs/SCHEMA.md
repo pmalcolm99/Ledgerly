@@ -130,6 +130,7 @@ CREATE TABLE projects (
   start_date   date,
   end_date     date,
   status       project_status NOT NULL DEFAULT 'active',
+  email_receipts boolean      NOT NULL DEFAULT false,          -- D-44
   created_at   timestamptz    NOT NULL DEFAULT now(),
   updated_at   timestamptz    NOT NULL DEFAULT now(),
   archived_at  timestamptz,
@@ -155,6 +156,10 @@ CREATE INDEX projects_status_idx ON projects (status) WHERE deleted_at IS NULL;
   `deleted_at IS NULL` or they short-circuit on deleted history.
 - `status` is `archived` for read-only projects; `deleted_at` is soft delete.
   They are different states and both are needed.
+- `email_receipts` (D-44) is read at SEND time by the `receipt-email` worker,
+  not at enqueue time, so turning it off stops mail that is already queued.
+  Defaults to `false`: an outbound path carrying financial data is a decision
+  someone makes, not one they inherit from an upgrade.
 
 ---
 
@@ -294,6 +299,8 @@ CREATE TABLE receipts (
   missing_fields        text[]            NOT NULL DEFAULT '{}',
   validation_flags      text[]            NOT NULL DEFAULT '{}',
 
+  receipt_email_sent_at timestamptz,                           -- D-44
+
   user_notes            text,
   reviewed_at           timestamptz,
 
@@ -340,6 +347,12 @@ CREATE INDEX receipts_pending_idx
   receipt, and separate from `extraction_error` (a single string, reserved
   for `extraction_status = 'failed'` from either the ingest or the AI
   stage) because a `partial` receipt is not a failure.
+- `receipt_email_sent_at` (D-44) marks that the **automatic** receipt email
+  has gone. Load-bearing rather than bookkeeping: `receipts.reextract` sets
+  `forcePass2` and re-enters the persistence path, so without a durable marker
+  every manual re-extract would send a second copy. An on-demand send does NOT
+  set it — that is a deliberate act, and says nothing about whether the
+  automatic one has happened.
 - `receipts_date_sane` enforces the brief's "before 2000" check at the database
   level. The future-date and arithmetic checks are _not_ constraints — they set
   `extraction_status = 'partial'` and append to `validation_flags`, because the

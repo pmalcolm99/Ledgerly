@@ -74,3 +74,70 @@ export function getReceiptIngestQueue(redisUrl: string): Queue {
   }
   return sharedReceiptIngestQueue;
 }
+
+/**
+ * `receipt-email` — D-44's notification queue, the third stage after
+ * `receipt-ingest` -> `receipt-extract`. `emailWorker.ts` processes it.
+ *
+ * A separate queue rather than a step inside extraction, for a reason worth
+ * stating at the enqueue site too: a mail relay must never be in the retry
+ * path of a job that spends money. See `pipeline/email.ts`'s header.
+ */
+export const RECEIPT_EMAIL_QUEUE_NAME = "receipt-email";
+
+let sharedReceiptEmailQueue: Queue | undefined;
+
+export function getReceiptEmailQueue(redisUrl: string): Queue {
+  if (!sharedReceiptEmailQueue) {
+    sharedReceiptEmailQueue = new Queue(RECEIPT_EMAIL_QUEUE_NAME, {
+      connection: getRedisConnection(redisUrl),
+      defaultJobOptions: {
+        // More attempts than the other two queues, and a longer first delay.
+        // A relay is a third party with its own rate limits and maintenance
+        // windows, and unlike an Anthropic call a retry here costs nothing.
+        attempts: 5,
+        backoff: { type: "exponential", delay: 30_000 },
+        // BOTH must be `count: 0`, and the failure half is the one that bites.
+        //
+        // BullMQ's `addStandardJob` returns early — reporting SUCCESS — the
+        // moment a job hash with the same id already exists, and
+        // `moveToFinished` only deletes that hash when the retention count is
+        // zero. Retaining failures would therefore leave
+        // `bull:receipt-email:<receiptId>:auto` resident forever after a
+        // terminal failure, and every later enqueue for that receipt would be
+        // a silent no-op that throws nothing for the caller to catch.
+        //
+        // That is not hypothetical: turn the project toggle on before
+        // configuring SMTP and every receipt uploaded in that window fails
+        // with `SMTP_NOT_CONFIGURED`. Retaining those hashes would mean that
+        // once SMTP is configured, those receipts can NEVER auto-email —
+        // including via re-extract, which is the obvious remedy and the whole
+        // reason `receipt_email_sent_at` exists. The durable record of a
+        // failure is the log line in `emailWorker.ts`'s `failed` handler, not
+        // the Redis-resident job.
+        removeOnComplete: { count: 0 },
+        removeOnFail: { count: 0 },
+      },
+    });
+  }
+  return sharedReceiptEmailQueue;
+}
+
+/**
+ * Job ids for `receipt-email`. NOT the bare `receiptId` the other two queues
+ * use.
+ *
+ * Those queues dedup on `receiptId` because a second render or a second
+ * extraction of the same receipt is waste. A second EMAIL is a feature — the
+ * on-demand send exists precisely to send one again. With
+ * `removeOnComplete: {count: 0}` the completed job's id is freed, but a job
+ * still resident (waiting, active, or mid-backoff) would silently swallow the
+ * re-send, and BullMQ reports that as success.
+ *
+ * So: the automatic send gets a stable id, because sending it twice is the one
+ * thing the whole `receipt_email_sent_at` marker exists to prevent; an
+ * on-demand send gets none at all, so every request is its own job.
+ */
+export function autoEmailJobId(receiptId: string): string {
+  return `${receiptId}:auto`;
+}

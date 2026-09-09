@@ -10,7 +10,12 @@ import { receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
 
 import { getRedisConnection } from "./redis";
-import { RECEIPT_EXTRACT_QUEUE_NAME, getReceiptExtractQueue } from "./queue";
+import {
+  RECEIPT_EXTRACT_QUEUE_NAME,
+  autoEmailJobId,
+  getReceiptEmailQueue,
+  getReceiptExtractQueue,
+} from "./queue";
 import { ExtractError, processReceiptExtraction } from "./pipeline/extract";
 import type { ExtractJobData } from "./pipeline/extract";
 
@@ -134,6 +139,34 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
           },
           job.data,
         );
+
+        // D-44. AFTER extraction returns, and deliberately outside its
+        // persistence transaction — an email that succeeds against a
+        // transaction that then rolls back is an email nobody can recall.
+        //
+        // Nothing here is allowed to fail this job. Extraction has already
+        // committed and already been paid for; a Redis hiccup while queueing a
+        // NOTIFICATION must not throw it back into a retry that would spend
+        // two more Anthropic calls to reproduce a result already in the
+        // database. The email queue's own retries are the recovery path, and
+        // if the enqueue itself is lost, the missing email is the whole cost.
+        //
+        // Whether an email is actually wanted is decided at send time, by the
+        // project's `email_receipts` setting and the `receipt_email_sent_at`
+        // marker (pipeline/email.ts) — not here. Reading the setting at this
+        // point would mean a setting toggled off after upload still sent.
+        try {
+          await getReceiptEmailQueue(redisUrl).add(
+            "email",
+            { receiptId: job.data.receiptId, reason: "auto" },
+            { jobId: autoEmailJobId(job.data.receiptId) },
+          );
+        } catch (enqueueError) {
+          console.error(
+            `[ledgerly] failed to enqueue receipt email for ${job.data.receiptId}:`,
+            enqueueError,
+          );
+        }
       } catch (error) {
         // M-4: a 400/401/403/404 from Anthropic (a malformed request, a
         // bad/revoked API key, no model access) cannot succeed on retry --

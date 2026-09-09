@@ -1,20 +1,25 @@
 import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { appRouter, createContext } from "@ledgerly/api";
 import { getEnv } from "@ledgerly/config/env";
-import { getReceiptExtractQueue } from "@ledgerly/queue/queue";
+import { getReceiptEmailQueue, getReceiptExtractQueue } from "@ledgerly/queue/queue";
 import { getRedisConnection } from "@ledgerly/queue/redis";
+import { sendOneEmail } from "@ledgerly/queue/emailWorker";
 
 /**
  * The tRPC HTTP handler. `createContext` resolves identity once per request
  * from the raw headers and passes `ctx.user` down (D-24) — the middleware
  * attaches nothing and is not trusted.
  *
- * `enqueueReceiptExtract` and `rateLimitRedis` are supplied here, not
- * inside `packages/api` (`trpc.ts`'s own comments explain why:
- * `@ledgerly/queue` already depends on `@ledgerly/api`, so the reverse
- * import would be circular). This is the only place in the app a tRPC
- * procedure's queue/Redis side effects are wired up — currently just
- * `receipts.reextract`.
+ * `enqueueReceiptExtract`, `enqueueReceiptEmail`, `sendEmail` and
+ * `rateLimitRedis` are supplied here, not inside `packages/api` (`trpc.ts`'s
+ * own comments explain why: `@ledgerly/queue` already depends on
+ * `@ledgerly/api`, so the reverse import would be circular). This is the only
+ * place in the app a tRPC procedure's queue/Redis side effects are wired up.
+ *
+ * `sendEmail` is the one that actually holds credentials, and it is the only
+ * synchronous send in the application — `admin.testSmtp`, which exists
+ * precisely to fail loudly and immediately. Every other message goes through
+ * `receipt-email`.
  */
 function handler(request: Request): Promise<Response> {
   return fetchRequestHandler({
@@ -31,6 +36,17 @@ function handler(request: Request): Promise<Response> {
             { jobId: receiptId },
           );
         },
+        enqueueReceiptEmail: async ({ receiptId, toUserId, requestedBy }) => {
+          // No `jobId`: an on-demand re-send must never be deduplicated
+          // against a resident job for the same receipt (queue.ts explains).
+          await getReceiptEmailQueue(getEnv().REDIS_URL).add("email", {
+            receiptId,
+            reason: "on_demand",
+            toUserId,
+            requestedBy,
+          });
+        },
+        sendEmail: sendOneEmail,
         rateLimitRedis: getRedisConnection(getEnv().REDIS_URL),
       }),
   });

@@ -1337,3 +1337,84 @@ hard way.** On Android, installed, this is a real lock. **On iOS it is not a
 lock and cannot be made one from a web page** — it is a request the OS ignores
 plus a message asking the user to rotate back. A native wrapper is the only
 way to genuinely lock orientation on iOS.
+
+## D-44 — Receipt emails go through their own queue, and the recipient is a user id. **Settled** (user request).
+
+**Context.** User request: an admin-configured SMTP relay; a per-project
+setting that emails the project owner once per scanned receipt, after the AI
+scan; and the ability to email any single receipt on demand regardless of that
+setting.
+
+**The SMTP config is one encrypted `app_config` blob**, `SECRET_KEYS.smtp`,
+reusing D-39's `secrets.ts` machinery (AES-256-GCM, version byte as AAD).
+Host, port, TLS mode, username, password and From identity are stored as a
+single JSON value rather than a password column beside plaintext fields: one
+read, one decrypt, one atomic write, and no field of it can be left in the
+clear by someone adding a column later, because there are no columns.
+
+Unlike the Claude key there is **no environment fallback**. That key needs one
+because a fresh instance must be able to extract before anyone visits the admin
+screen. Email has no bootstrap problem — an instance with no SMTP config simply
+does not send — so a second source would be a second place to look and nothing
+gained. `undecryptable` remains a distinct state, for D-39's reason: reporting
+a `MASTER_KEY` mismatch as "not configured" sends an operator hunting for a
+setting that is already there.
+
+**Sending is a third BullMQ queue, `receipt-email`, not a step inside
+extraction.** This is the decision that matters most.
+
+An inline send would put a mail relay in the retry path of a job that spends
+money. A relay hiccup would burn two more **paid Anthropic calls** on retry and
+then write `extraction_status='failed'` on a receipt whose extraction actually
+succeeded — inverting the rule `pipeline/extract.ts` is built around. The
+enqueue therefore happens after `processReceiptExtraction` **returns**, outside
+its persistence transaction (an email that succeeds against a transaction that
+then rolls back is an email nobody can recall), and the enqueue itself is
+wrapped so that even a Redis failure cannot fail the extraction job.
+
+Job ids are not the bare `receiptId` the other two queues use. Those dedup
+because a second render or a second extraction is waste; a second _email_ is a
+feature — the on-demand send exists to send one again. The automatic send gets
+`<receiptId>:auto`; an on-demand send gets no job id at all.
+
+**`receipts.receipt_email_sent_at` is load-bearing, not bookkeeping.**
+`receipts.reextract` sets `forcePass2` and re-enters the persistence path, so
+without a durable marker every manual re-extract would send the email again. It
+records the **automatic** send only — an on-demand send is a deliberate act and
+says nothing about whether the automatic one has happened. It is written after
+the send, not before, so a failure retries rather than being suppressed by a
+marker for a message that never went; the cost is a possible duplicate if the
+process dies between the two, which is a far better failure than a silent one.
+
+**The recipient is a user id, never an address.** `receipts.emailReceipt` takes
+`toUserId`, validated against project membership in the procedure and **again**
+in the worker. Mailing a receipt to an arbitrary address is therefore not a
+validation failure — it is an operation the API has no way to express. That is
+a deliberate cost in convenience: "email this to my accountant" requires adding
+the accountant to the project, which is the same disclosure decision, made once
+and visibly, in the members list.
+
+The procedure requires **read**, not edit: a read-only member forwarding a
+receipt to a fellow member discloses nothing either of them could not already
+open.
+
+**`nodemailer` lives in `packages/queue` only**, the same containment
+`@anthropic-ai/sdk` gets and for the same reason. `pipeline/email.ts` takes the
+transport as a structurally-typed dependency and never names the library. The
+one synchronous send in the app is `admin.testSmtp`, whose whole value is that
+it fails immediately and says why — and even that is an injected context
+capability supplied by `apps/web`'s tRPC route handler, never an import from
+`packages/api` (which `packages/queue` already depends on, so the reverse
+import would be circular).
+
+**The attachment is always a JPEG** derived from the display render, longest
+edge 1200, q75. `RETAIN_ORIGINALS=false` on this instance, so a PDF invoice's
+source file is already discarded and page 1's render is all that exists — there
+is no higher-quality source to prefer. JPEG rather than WebP because Outlook
+still will not preview a WebP attachment, and an attachment nobody can see is
+worse than one that is slightly softer.
+
+**Turning the project setting on or off is audited unconditionally**, unlike
+every other field on `projects.update`, which audits nothing for an ordinary
+edit. It decides where financial data goes, and "who turned this on" is a
+question someone will eventually need answered.

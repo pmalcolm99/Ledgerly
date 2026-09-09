@@ -132,7 +132,28 @@ test.describe("no nested forms (task 7.11)", () => {
     // suite, which is the browser engine the distinction actually matters on.
     await expect(page.getByRole("button", { name: "Take photo" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Choose files" })).toBeVisible();
+
+    // The six filter controls now live behind one button. Asserted because
+    // collapsing them is exactly the kind of change that can leave the panel
+    // unreachable on the narrow viewport this suite runs at — which is the
+    // viewport the app is actually used at.
+    const filters = page.getByRole("button", { name: "Filters" });
+    await expect(filters).toBeVisible();
+    await filters.click();
+    await expect(page.getByLabel("From")).toBeVisible();
+
     await assertNoNestedForms(page, "project dashboard");
+  });
+
+  /**
+   * An installed iOS PWA has no URL bar, no reload button and no
+   * pull-to-refresh, so this control is the ONLY way to force a refetch short
+   * of killing the app. It is one line of JSX and would be silently lost by
+   * any header refactor.
+   */
+  test("the header carries a refresh control", async ({ page }) => {
+    await visit(page, "/", "Projects");
+    await expect(page.getByRole("button", { name: "Refresh" })).toBeVisible();
   });
 
   test("category settings", async ({ page }) => {

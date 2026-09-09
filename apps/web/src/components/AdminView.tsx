@@ -7,6 +7,7 @@ import { Database, HardDriveDownload } from "lucide-react";
 
 import { trpc } from "../lib/trpc";
 import { AiKeyCard } from "./AiKeyCard";
+import { SmtpCard } from "./SmtpCard";
 
 /**
  * apps/web/src/components/AdminView.tsx — brief §7: all projects, all users,
@@ -29,6 +30,7 @@ export function AdminView() {
       </div>
 
       <AiKeyCard />
+      <SmtpCard />
 
       <Card shadow="sm">
         <CardBody className="gap-3 p-4">

@@ -4,7 +4,14 @@ import { and, asc, desc, eq, exists, gte, inArray, isNull, lt, lte, or, sql } fr
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { getEnv } from "@ledgerly/config/env";
-import { categories, projects, receiptItems, receipts, users } from "@ledgerly/db/schema";
+import {
+  categories,
+  projectMembers,
+  projects,
+  receiptItems,
+  receipts,
+  users,
+} from "@ledgerly/db/schema";
 import { displayNameOf } from "@ledgerly/shared/personName";
 import { scrubLuhnSequences } from "@ledgerly/shared/scrub";
 
@@ -19,7 +26,7 @@ import {
   loadEditableReceipt,
   recomputeReceiptDerivedState,
 } from "../receiptAccess";
-import { checkReextractRateLimit } from "../rateLimit";
+import { checkEmailReceiptRateLimit, checkReextractRateLimit } from "../rateLimit";
 import type { EditableReceiptColumn } from "../receiptAccess";
 import {
   cardLast4String,
@@ -29,6 +36,7 @@ import {
   receiptTimeString,
 } from "../inputs";
 import { scopedProjects } from "../scope";
+import { resolveSmtpConfig } from "../smtp";
 import { auditOwnerOverrideIfApplicable } from "./projects";
 import { deleteReceiptDir } from "../storage";
 import { protectedProcedure, router } from "../trpc";
@@ -749,6 +757,173 @@ export const receiptsRouter = router({
 
     return { id: receiptId };
   }),
+
+  /**
+   * Emails one receipt on demand (D-44), regardless of the project's
+   * `email_receipts` setting.
+   *
+   * ## The recipient is a user id, never an address
+   *
+   * `toUserId` must be a member of the receipt's project — checked here, and
+   * checked AGAIN in the worker (`pipeline/email.ts`), because this is the
+   * one procedure in the app that causes financial data to leave the system
+   * to a destination the caller chose. A free-text address field would make
+   * "mail this receipt anywhere" a supported operation of the API; with a
+   * user id it is not merely rejected, it is unrepresentable.
+   *
+   * The caller must be able to READ the receipt. Deliberately read, not edit:
+   * a read-only member forwarding a receipt to a fellow member discloses
+   * nothing either of them could not already see.
+   *
+   * ## It enqueues, it does not send
+   *
+   * `nodemailer` lives in `packages/queue`. This procedure hands the queue a
+   * receipt id and a user id and returns; the render, the SMTP connection and
+   * the retries all happen out of band. A relay that is slow must not hold a
+   * request open, and a relay that is down must not turn a click into an
+   * error the user is expected to interpret.
+   */
+  emailReceipt: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), toUserId: z.string().uuid() }))
+    .mutation(async ({ ctx, input }) => {
+      if (ctx.rateLimitRedis) {
+        const limit = await checkEmailReceiptRateLimit(ctx.rateLimitRedis, ctx.user.id);
+        if (!limit.allowed) {
+          throw new TRPCError({
+            code: "TOO_MANY_REQUESTS",
+            message: `Too many emails. Try again in ${limit.retryAfterSeconds}s.`,
+          });
+        }
+      } else {
+        console.warn(
+          "[ledgerly] receipts.emailReceipt: no rateLimitRedis in context, limit not enforced",
+        );
+      }
+
+      // Checked BEFORE the transaction, and before anything is audited.
+      //
+      // The worker is where the transport actually lives, so without this the
+      // procedure happily reports "queued" on an instance with no relay
+      // configured and the message dies in a worker log line the caller
+      // cannot see — non-owners cannot read `admin.smtp` at all. One indexed
+      // read and a decrypt, on a path already capped at 5/min.
+      const smtp = await resolveSmtpConfig(ctx.db, getEnv().MASTER_KEY);
+      if (smtp.source === "undecryptable") {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "Email settings are stored but unreadable. Ask the instance owner to re-enter them.",
+        });
+      }
+      if (!smtp.config) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Email is not set up on this instance.",
+        });
+      }
+
+      const recipientId = await ctx.db.transaction(async (tx) => {
+        // The receipt, scoped. `scopedProjects` is composed INTO the query
+        // (CLAUDE.md's query-layer rule) rather than checked beside it.
+        const [row] = await tx
+          .select({ id: receipts.id, projectId: receipts.projectId, ownerId: projects.ownerId })
+          .from(receipts)
+          .innerJoin(projects, eq(projects.id, receipts.projectId))
+          .where(
+            and(
+              eq(receipts.id, input.id),
+              isNull(receipts.deletedAt),
+              inArray(receipts.projectId, scopedProjects(ctx.user, "read")),
+            ),
+          )
+          .limit(1);
+        // NOT_FOUND rather than FORBIDDEN: a caller with no access to this
+        // project must not be able to learn the receipt exists.
+        if (!row) throw new TRPCError({ code: "NOT_FOUND" });
+
+        // The owner is a member by definition and has no `project_members`
+        // row; everyone else must have one.
+        if (input.toUserId !== row.ownerId) {
+          const [membership] = await tx
+            .select({ userId: projectMembers.userId })
+            .from(projectMembers)
+            .where(
+              and(
+                eq(projectMembers.projectId, row.projectId),
+                eq(projectMembers.userId, input.toUserId),
+              ),
+            )
+            .limit(1);
+          if (!membership) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message: "That person is not a member of this project.",
+            });
+          }
+        }
+
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          // `_requested`, not `.emailed`, and the distinction is the point:
+          // this row commits before the job is queued and long before anything
+          // is delivered, so a row asserting "emailed" would assert an effect
+          // that had not happened — the same defect `clearAiKey` was fixed
+          // for. It records the authorised request, which is exactly what
+          // occurred here. Matches `receipt.reextract_requested`'s convention.
+          action: "receipt.email_requested",
+          entityType: "receipt",
+          entityId: row.id,
+          // The recipient is recorded as an ID, not an address — audit.ts's
+          // no-PII rule. "Who did this leave to" is answerable by joining to
+          // `users`, which is the same disclosure boundary every other row
+          // here respects.
+          metadata: { via: "receipts.emailReceipt", toUserId: input.toUserId },
+        });
+
+        return input.toUserId;
+      });
+
+      if (!ctx.enqueueReceiptEmail) {
+        // Same policy as `reextract`: never crash a mutation over a missing
+        // capability (a test context, or `createCallerFactory` used without
+        // wiring it). The audit row says "requested", which remains true.
+        console.warn(
+          `[ledgerly] receipts.emailReceipt: no enqueueReceiptEmail in context, ` +
+            `receipt ${input.id} was authorized but not enqueued`,
+        );
+        return { ok: true as const, queued: false as const };
+      }
+
+      try {
+        await ctx.enqueueReceiptEmail({
+          receiptId: input.id,
+          toUserId: recipientId,
+          requestedBy: ctx.user.id,
+        });
+      } catch (error) {
+        // A capability that EXISTS and FAILS is a different case from one that
+        // is absent, and it must not reach the client as the errorFormatter's
+        // flat "Internal server error." — that reads as a bug, when the true
+        // statement is "nothing was sent, try again". Logged at the same
+        // volume as the branch above so the committed audit row can be
+        // reconciled against reality.
+        console.error(
+          `[ledgerly] receipts.emailReceipt: enqueue failed for receipt ${input.id} ` +
+            `(the request was authorized and audited, but nothing was queued):`,
+          error,
+        );
+        // SERVICE_UNAVAILABLE, not INTERNAL_SERVER_ERROR: the latter is
+        // outside `CLIENT_SAFE_CODES`, so its message would be replaced with
+        // the flat "Internal server error." and the one fact worth conveying —
+        // that nothing was sent — would be lost.
+        throw new TRPCError({
+          code: "SERVICE_UNAVAILABLE",
+          message: "Couldn't queue the email. Nothing was sent — try again.",
+        });
+      }
+
+      return { ok: true as const, queued: true as const };
+    }),
 });
 
 /** Shapes a list row, collapsing the four uploader columns into one name. */
