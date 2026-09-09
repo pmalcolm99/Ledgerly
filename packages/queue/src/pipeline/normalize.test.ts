@@ -14,6 +14,23 @@ describe("normalizeMoney", () => {
     expect(normalizeMoney("12")).toBe("12.00");
   });
 
+  /**
+   * The Costco credit. This returned null before `canonicalizeMoneySign`
+   * existed: the credit disappeared from the receipt entirely, and its
+   * absence then made `sum(items)` too high.
+   */
+  it("reads a credit in every notation a receipt prints", () => {
+    expect(normalizeMoney("4.50-")).toBe("-4.50");
+    expect(normalizeMoney("(4.50)")).toBe("-4.50");
+    expect(normalizeMoney("-4.50")).toBe("-4.50");
+    expect(normalizeMoney("$4.50-")).toBe("-4.50");
+    expect(normalizeMoney("($1,234.50)")).toBe("-1234.50");
+  });
+
+  it("still degrades an ambiguous double sign to null rather than guessing", () => {
+    expect(normalizeMoney("(-4.50)")).toBeNull();
+  });
+
   it("strips currency symbols, commas, and whitespace", () => {
     expect(normalizeMoney("$12.34")).toBe("12.34");
     expect(normalizeMoney("1,234.56")).toBe("1234.56");

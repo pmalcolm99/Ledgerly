@@ -2,6 +2,7 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { appRouter, createCallerFactory, createContext } from "@ledgerly/api";
 import { isOnboarded } from "@ledgerly/auth";
+import { isThemeId } from "@ledgerly/shared/themes";
 import { Receipt } from "lucide-react";
 
 import { WelcomeForm } from "../../components/WelcomeForm";
@@ -37,9 +38,16 @@ export default async function WelcomePage() {
     // here, so onboarding passes the same authorization as every other
     // caller (D-01) instead of a second, parallel path.
     const caller = createCaller(await createContext({ headers: await headers() }));
+    // `isThemeId` rather than a cast: FormData is user input, and the
+    // procedure's `z.enum` would reject a bad value as a 500-shaped error out
+    // of a Server Action. Dropping an unrecognised value keeps the column
+    // default instead, which is the same outcome as not choosing.
+    const submitted = formData.get("theme");
+    const theme = typeof submitted === "string" && isThemeId(submitted) ? submitted : undefined;
     await caller.auth.completeOnboarding({
       firstName: String(formData.get("firstName") ?? ""),
       lastName: String(formData.get("lastName") ?? ""),
+      ...(theme ? { theme } : {}),
     });
     redirect("/");
   }

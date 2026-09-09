@@ -1,4 +1,4 @@
-import { formatMoney, parseMoney } from "@ledgerly/shared/money";
+import { canonicalizeMoneySign, formatMoney, parseMoney } from "@ledgerly/shared/money";
 
 /**
  * packages/queue/src/pipeline/normalize.ts — turns a model-returned string
@@ -31,13 +31,19 @@ import { formatMoney, parseMoney } from "@ledgerly/shared/money";
  */
 
 /** `numeric(12,2)` money field: strips stray `$`/`,`/whitespace a model
- * might emit despite instructions, parses via `parseMoney` (D-21's sole
- * numeric<->cents boundary, which already enforces the numeric(12,2)
+ * might emit despite instructions, translates accounting sign notation
+ * (`12.34-`, `(12.34)`) to a leading minus, parses via `parseMoney` (D-21's
+ * sole numeric<->cents boundary, which already enforces the numeric(12,2)
  * range), and re-formats to canonicalize (e.g. "12.3" -> "12.30"). Null or
- * unparseable becomes null. */
+ * unparseable becomes null.
+ *
+ * The sign step runs AFTER the strip so that `$ (12.34)` and `( 12.34 )`
+ * reach it as `(12.34)`, and it shares `canonicalizeMoneySign` with the
+ * hand-edit path in `api/src/inputs.ts` — a credit must mean the same thing
+ * whether the model read it or a person typed it. */
 export function normalizeMoney(raw: string | null | undefined): string | null {
   if (raw === null || raw === undefined) return null;
-  const cleaned = raw.replace(/[$,\s]/g, "");
+  const cleaned = canonicalizeMoneySign(raw.replace(/[$,\s]/g, ""));
   try {
     return formatMoney(parseMoney(cleaned));
   } catch {

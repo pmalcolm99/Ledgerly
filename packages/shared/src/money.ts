@@ -9,6 +9,55 @@
 const NUMERIC_PATTERN = /^(-)?(\d+)(?:\.(\d{1,2}))?$/;
 
 /**
+ * Accounting sign notation -> a canonical leading-minus decimal.
+ *
+ * Receipts do not agree on how to print a credit. Costco prints the sign
+ * AFTER the amount (`12.34-`); accounting software and many invoices wrap it
+ * in parentheses (`(12.34)`); the rest use a leading minus. `parseMoney`
+ * accepts only the last of those — correctly, since it is D-21's boundary to
+ * the `numeric(12,2)` column and must stay strict — so the other two parsed
+ * as nothing and the field silently became null. A dropped credit does not
+ * just lose a line: its absence inflates `sum(items)` and raises a FALSE
+ * `arithmetic_mismatch_items` on a receipt that actually balanced.
+ *
+ * This is the one place that translation is written, so model output
+ * (`pipeline/normalize.ts`) and hand-typed input (`api/src/inputs.ts`) can
+ * never disagree about whether a Costco credit is a credit.
+ *
+ * Deliberately narrow. Anything ambiguous — a sign both inside and outside
+ * the parentheses, two trailing minuses — is returned untouched so
+ * `parseMoney` rejects it, rather than guessed at. Inventing a sign for a
+ * money value is worse than refusing to read it.
+ *
+ * U+2212 MINUS SIGN is folded to ASCII `-` on the way in: it is what an OCR
+ * pass returns for a typeset minus, and it means exactly one thing here.
+ */
+export function canonicalizeMoneySign(raw: string): string {
+  const original = raw.trim();
+  let value = original.replace(/\u2212/g, "-");
+  let negative = false;
+
+  const parenthesized = /^\((.*)\)$/.exec(value);
+  if (parenthesized) {
+    negative = true;
+    value = (parenthesized[1] ?? "").trim();
+  }
+
+  if (value.endsWith("-")) {
+    // Parentheses AND a trailing minus is not a notation anyone prints.
+    // Reading it as a double negative would be a guess.
+    if (negative) return original;
+    negative = true;
+    value = value.slice(0, -1).trim();
+  }
+
+  if (!negative) return value;
+  // Already signed inside the wrapper — ambiguous, so leave it to be rejected.
+  if (value.startsWith("-") || value.startsWith("+")) return original;
+  return `-${value}`;
+}
+
+/**
  * `numeric(12,2)` holds 12 significant digits with 2 after the decimal —
  * a max magnitude of 9999999999.99, i.e. 999999999999 cents. This module
  * is the sole boundary to that column type (D-21), so it is the one place

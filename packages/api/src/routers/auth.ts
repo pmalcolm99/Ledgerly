@@ -26,6 +26,12 @@ const THEME_IDS = THEMES.map((entry) => entry.id) as unknown as [string, ...stri
  * else: someone who has not told us their name yet has no business setting a
  * preference, and routing it through the default gate keeps the exemption
  * list at exactly two.
+ *
+ * The welcome page nonetheless offers a theme picker, which is why
+ * `completeOnboarding` takes an optional `theme`: the one moment a
+ * not-yet-onboarded user legitimately sets a preference is the same statement
+ * that stops them being not-yet-onboarded. Carrying it here keeps the
+ * exemption list at two rather than promoting `setTheme` to a third.
  */
 
 export const authRouter = router({
@@ -45,6 +51,9 @@ export const authRouter = router({
       z.object({
         firstName: z.string().trim().min(1).max(100),
         lastName: z.string().trim().min(1).max(100),
+        // Optional: an older client, or a submission where the radio group
+        // was never touched, simply keeps the column default.
+        theme: z.enum(THEME_IDS).optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
@@ -55,6 +64,7 @@ export const authRouter = router({
         .set({
           firstName: input.firstName,
           lastName: input.lastName,
+          ...(input.theme ? { theme: input.theme } : {}),
           onboardedAt: new Date(),
           updatedAt: new Date(),
         })

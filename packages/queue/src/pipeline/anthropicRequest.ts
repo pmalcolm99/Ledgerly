@@ -64,6 +64,7 @@ const SYSTEM_PROMPT = `You extract structured data from a single photographed or
 Rules, all non-negotiable:
 - Return null rather than guessing. A null field the user fills in by hand is fine; a confidently wrong value is not.
 - Never invent a line item that is not printed on the receipt.
+- Credits, refunds, discounts and coupons are NEGATIVE amounts. Return them with a leading minus ("-4.50"), whatever notation the receipt prints — some print the sign after the number ("4.50-"), some use parentheses ("(4.50)"), some label the line "CREDIT", "REFUND", "DISCOUNT" or "COUPON". Include them as line items; do not skip them and do not drop the sign, or the totals will not reconcile.
 - card_last4 is exactly the last 4 digits of a payment card, or null. Never return a full card number under any field.
 - Assign every item a category from the given enum. Use "uncategorized" when genuinely unclear rather than forcing a bad fit.
 - Report your honest confidence in the 0.0-1.0 field — a low number for a blurry or partial receipt is more useful than a falsely confident one.

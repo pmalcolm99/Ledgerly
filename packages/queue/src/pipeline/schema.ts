@@ -48,7 +48,8 @@ export type RecordReceiptInput = {
 
 const MONEY_FIELD = {
   type: ["string", "null"] as const,
-  description: 'Decimal amount as a string, e.g. "12.34". Null if not printed or illegible.',
+  description:
+    'Decimal amount as a string, e.g. "12.34". Use a LEADING minus for a credit, refund or discount, e.g. "-4.50", even when the receipt prints the sign after the number or in parentheses. Null if not printed or illegible.',
 };
 
 const NULLABLE_STRING = { type: ["string", "null"] as const };

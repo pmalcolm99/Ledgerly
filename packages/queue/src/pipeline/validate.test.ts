@@ -95,4 +95,36 @@ describe("runSanityChecks", () => {
     expect(result.validationFlags).toContain("date_too_old");
     expect(result.validationFlags).toHaveLength(2);
   });
+
+  /**
+   * Why parsing credits matters beyond the missing line itself.
+   *
+   * A receipt with a $10 item and a $4 credit has a $6 subtotal. Dropping the
+   * credit leaves `sum(items) = 10.00` against a `subtotal` of `6.00` — a
+   * $4.00 gap, well past the $1.00 tolerance — so the receipt was flagged
+   * `arithmetic_mismatch_items` for review despite being arithmetically
+   * perfect. Carrying the sign makes the check agree with the paper.
+   */
+  it("reconciles a receipt containing a credit line", () => {
+    const withCredit = runSanityChecks(
+      baseInput({
+        subtotal: "6.00",
+        salesTax: "0.00",
+        total: "6.00",
+        items: [{ lineTotal: "10.00" }, { lineTotal: "-4.00" }],
+      }),
+    );
+    expect(withCredit).toEqual({ status: "ok", validationFlags: [] });
+
+    // The same receipt with the credit dropped — the pre-fix behaviour.
+    const creditDropped = runSanityChecks(
+      baseInput({
+        subtotal: "6.00",
+        salesTax: "0.00",
+        total: "6.00",
+        items: [{ lineTotal: "10.00" }],
+      }),
+    );
+    expect(creditDropped.validationFlags).toContain("arithmetic_mismatch_items");
+  });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { addMoney, formatMoney, parseMoney } from "./money";
+import { addMoney, canonicalizeMoneySign, formatMoney, parseMoney } from "./money";
 
 /**
  * A tiny seeded PRNG (mulberry32) so the property tests below are
@@ -134,5 +134,58 @@ describe("money.ts — property: addMoney matches integer-cent ground truth over
       const formatted = formatMoney(cents);
       expect(parseMoney(formatted)).toBe(cents);
     }
+  });
+});
+
+/**
+ * The notations a real receipt actually prints a credit in. Costco puts the
+ * sign after the amount; accounting software parenthesises it. Before this
+ * helper existed both parsed as nothing and the credit silently vanished,
+ * which then inflated `sum(items)` and raised a false
+ * `arithmetic_mismatch_items` on a receipt that balanced perfectly.
+ */
+describe("canonicalizeMoneySign", () => {
+  it("moves a trailing minus to the front (Costco)", () => {
+    expect(canonicalizeMoneySign("12.34-")).toBe("-12.34");
+    expect(parseMoney(canonicalizeMoneySign("12.34-"))).toBe(-1234);
+  });
+
+  it("reads parentheses as negative (accounting notation)", () => {
+    expect(canonicalizeMoneySign("(12.34)")).toBe("-12.34");
+    expect(parseMoney(canonicalizeMoneySign("(4.50)"))).toBe(-450);
+  });
+
+  it("folds U+2212 MINUS SIGN to an ASCII hyphen", () => {
+    expect(canonicalizeMoneySign("\u221212.34")).toBe("-12.34");
+    expect(canonicalizeMoneySign("12.34\u2212")).toBe("-12.34");
+  });
+
+  it("leaves an already-canonical value alone", () => {
+    expect(canonicalizeMoneySign("-12.34")).toBe("-12.34");
+    expect(canonicalizeMoneySign("12.34")).toBe("12.34");
+    expect(canonicalizeMoneySign("  12.34  ")).toBe("12.34");
+  });
+
+  it("tolerates whitespace inside the notation", () => {
+    expect(canonicalizeMoneySign("( 12.34 )")).toBe("-12.34");
+    expect(canonicalizeMoneySign("12.34 -")).toBe("-12.34");
+  });
+
+  /**
+   * The point of the narrowness. A double-signed value is not a notation
+   * anyone prints, so guessing at it would be inventing a sign for a money
+   * amount. Returned untouched means `parseMoney` rejects it and the field
+   * degrades to null + missing_fields — the documented failure mode.
+   */
+  it("refuses to guess at ambiguous double signs", () => {
+    for (const ambiguous of ["(-12.34)", "(12.34-)", "12.34--", "(+12.34)"]) {
+      expect(() => parseMoney(canonicalizeMoneySign(ambiguous))).toThrow();
+    }
+  });
+
+  it("does not turn garbage into a number", () => {
+    expect(() => parseMoney(canonicalizeMoneySign("()"))).toThrow();
+    expect(() => parseMoney(canonicalizeMoneySign("-"))).toThrow();
+    expect(() => parseMoney(canonicalizeMoneySign("(abc)"))).toThrow();
   });
 });

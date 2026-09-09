@@ -5,6 +5,7 @@ import { Card, CardBody, Skeleton } from "@heroui/react";
 import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
 
 import { trpc } from "../lib/trpc";
+import { extractionRefetchInterval } from "../lib/extractionPolling";
 import { hasAnyFilter, parseReceiptFilters } from "../lib/receiptFilters";
 import { Capture } from "./Capture";
 import { ExportButton } from "./ExportButton";
@@ -29,12 +30,31 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
   // `window.location.search` at click time — see ExportButton.tsx.
   const filters = parseReceiptFilters(searchParams);
 
-  const stats = trpc.projects.stats.useQuery({
-    projectId,
-    from: filters.from,
-    to: filters.to,
-  });
-  const receipts = trpc.receipts.list.useQuery({ projectId, ...filters, limit: 50 });
+  // Polls while any receipt on screen is still extracting, and stops as soon
+  // as none is. This query is the one the list below renders, so unlike the
+  // poll that used to live in Capture it can never refresh a different cache
+  // entry than the one being displayed.
+  const receipts = trpc.receipts.list.useQuery(
+    { projectId, ...filters, limit: 50 },
+    {
+      refetchInterval: (q) =>
+        extractionRefetchInterval((q.state.data?.items ?? []).map((r) => r.extractionStatus)),
+    },
+  );
+
+  const pendingInterval = extractionRefetchInterval(
+    (receipts.data?.items ?? []).map((r) => r.extractionStatus),
+  );
+
+  const stats = trpc.projects.stats.useQuery(
+    { projectId, from: filters.from, to: filters.to },
+    {
+      // The header totals are derived from the same rows, so they have to
+      // follow the same clock — otherwise the list fills in and the spend
+      // figure above it stays stale until a navigation.
+      refetchInterval: pendingInterval,
+    },
+  );
 
   if (stats.isError) {
     return (

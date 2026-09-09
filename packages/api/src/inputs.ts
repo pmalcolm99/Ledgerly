@@ -1,7 +1,7 @@
 import "server-only";
 
 import { z } from "zod";
-import { formatMoney, parseMoney } from "@ledgerly/shared/money";
+import { canonicalizeMoneySign, formatMoney, parseMoney } from "@ledgerly/shared/money";
 import { parseQuantityInput } from "@ledgerly/shared/numeric";
 
 /**
@@ -23,11 +23,18 @@ import { parseQuantityInput } from "@ledgerly/shared/numeric";
  * "5.0" and "05.00" all store as "5.00" and no comparison later has to worry
  * about representation.
  *
+ * `canonicalizeMoneySign` runs first so a credit can be typed the way it is
+ * printed — `12.34-` or `(12.34)` as well as `-12.34`. That is not only
+ * convenience: `inputMode="decimal"` surfaces no minus key on the iOS keypad,
+ * so trailing-minus is the form that is actually typeable on the phone this
+ * app is used from.
+ *
  * Never `parseFloat`, never `Number(x).toFixed(2)` — D-21.
  */
 export const moneyString = z
   .string()
   .trim()
+  .transform(canonicalizeMoneySign)
   .superRefine((value, ctx) => {
     try {
       parseMoney(value);
@@ -37,7 +44,7 @@ export const moneyString = z
         message:
           error instanceof Error && error.message.startsWith("Value exceeds")
             ? "That amount is too large."
-            : "Enter an amount like 12.34.",
+            : "Enter an amount like 12.34, or -12.34 for a credit.",
       });
     }
   })

@@ -90,7 +90,7 @@ CREATE TABLE users (
   last_name      text,
   display_name   text,
   role           user_role   NOT NULL DEFAULT 'user',
-  theme          text        NOT NULL DEFAULT 'dark',
+  theme          text        NOT NULL DEFAULT 'light',
   onboarded_at   timestamptz,
   last_seen_at   timestamptz,
   created_at     timestamptz NOT NULL DEFAULT now(),

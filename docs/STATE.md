@@ -22,6 +22,126 @@ Phase 7 remains ungated for its own reason (usable on your phone through the
 tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
 `ANTHROPIC_API_KEY`); D-12 stays Provisional.
 
+## Post-Phase-8 batch 3 — UI, live updating, credits, setup guide
+
+Thirteen reported items, delivered as three commits so the visible fixes reach
+the phone before the heavier work lands. Commits 1 and 2 are described here;
+commit 3 (Email Receipts, D-44) is still to come.
+
+### Commit 1 (`38adc42`) — header, filters, admin overflow, key test
+
+- **The receipt icon is gone from the header**, left of the wordmark. Removed
+  from the render with a one-line comment naming the restore; nothing deleted.
+- **A refresh button** sits left of the user-name dropdown, driven by
+  TanStack's `useIsFetching()` rather than local state, so the spin reflects
+  work actually in flight. It exists because an installed iOS PWA has no URL
+  bar, no reload button and no pull-to-refresh: there was otherwise no way to
+  force a refetch short of killing the app.
+- **The six filter controls collapsed behind one Filters button** with an
+  active-filter count. They occupied ~300px above the receipt list on a phone,
+  always. Not a HeroUI `<Badge>` for the count — that component wraps its
+  target and requires children.
+- **Two genuine flexbox bugs on the admin screen**, not cosmetics: the users
+  row's email had `truncate` but no `min-w-0`, so a flex item's default
+  `min-width: auto` refused to shrink and `truncate` did nothing; the projects
+  row's five unguarded trailing spans wrapped to a second line instead of
+  truncating.
+- **The Claude key card shows the stored hint as its placeholder** (it was
+  write-only and started empty, which read as "not configured") and gained a
+  **Test** button — a rate-limited `ownerProcedure` making one minimal live
+  call. Only a live call distinguishes a bad key from a bad model id from a
+  bad request shape, which is exactly the gap the previous session spent hours
+  in.
+
+### Commit 2 — the reported bug, and a second one next to it
+
+**Nothing live-updated because nothing ever asked again.** `ReceiptDetail`
+called `receipts.get` with no options at all; with `staleTime: 30_000` and
+`refetchOnWindowFocus: false`, the page fetched once and never learned
+extraction had finished. Re-extract _appeared_ to fix it, but only because its
+`onSuccess` invalidate refetched whatever the PREVIOUS background job had
+already written — the re-extract it had just queued was still running. That is
+why it "worked" and why the fields were always one job behind.
+
+`lib/extractionPolling.ts` is now the single rule: poll only while a row is
+genuinely unfinished, stop the moment it is not. A permanent interval on a
+dashboard reached over a Cloudflare Tunnel is a real battery cost on the phone
+this app is used from.
+
+The poll also **moved out of `Capture` and into `ProjectDashboard`**, which
+fixed two things at once. `Capture` polled `{projectId, limit: 50}` while the
+dashboard rendered `{projectId, ...filters, limit: 50}` — with any filter
+active those are different cache entries, so the poll was refreshing something
+the user was not looking at. And `Capture`'s `pending` list was only emptied by
+the _error_ branch's Dismiss button, so after a successful upload its 2.5s poll
+ran forever.
+
+Polling then made a latent bug load-bearing: `EditableField` re-synced its
+draft from the server during render, so a refetch landing mid-sentence would
+replace what the user was typing — at the exact moment they were correcting a
+field the model got wrong. `lib/useEditableDraft.ts` holds that contract now,
+guarded by `!isFocused`, adopting the value it is sending on blur so the
+re-sync cannot clobber the draft before the save returns. Also fixed while in
+the file: `isSaving` was passed to all twelve fields, so editing one disabled
+every other until the round trip returned.
+
+**Line items are a CSS grid, not a `<Table>`.** The table carried a hard
+`min-w-[38rem]` floor inside an `overflow-x-auto`, so every phone scrolled
+sideways by construction — a table cannot reflow. The grid is a stacked card
+per item below `sm` and aligned columns above it, one DOM node either way. All
+four value cells are now inline-editable on the same commit-on-blur contract;
+`receiptItems.update` already accepted every one of them, so this was purely a
+missing UI.
+
+**Credits parse.** A Costco credit prints as `12.34-`, accounting software
+uses `(12.34)`, and only the leading-minus form was accepted — the other two
+silently became null. That does not just lose the line: its absence inflates
+`sum(items)` and raises a FALSE `arithmetic_mismatch_items` on a receipt that
+balanced perfectly. `canonicalizeMoneySign` in `packages/shared/src/money.ts`
+is the one place that translation is written, routed through both
+`normalizeMoney` (model output) and `moneyString` (hand edits), so a credit
+means the same thing whichever way it arrived. `parseMoney` itself stays
+strict — it is D-21's boundary and the column's last defence. The helper is
+deliberately narrow: `(-12.34)` and `12.34--` are returned untouched to be
+rejected, because inventing a sign for a money value is worse than refusing to
+read it. The system prompt and the tool schema now say so too. No migration —
+there was never a CHECK on any money column.
+
+Accepting `12.34-` also solves a phone problem: `inputMode="decimal"` surfaces
+no minus key on the iOS keypad, so trailing-minus is the form that is actually
+typeable.
+
+**Export no longer traps you on iOS.** `window.location.assign` navigates the
+only document a standalone PWA has, so the "Open in 'Excel'" sheet arrived with
+no chrome and no history to go back to; the only way out was to kill the app.
+Now a synthetic `target="_blank"` anchor click. Not `window.open` — passing
+`noopener` in the features string makes it return null BY SPEC, so any "did it
+work?" fallback fires every time and opens the file twice.
+
+**New users pick a theme** on the welcome page — radio inputs inside the
+existing form, previewing live via `applyTheme`. Carried as an optional `theme`
+on `completeOnboarding` rather than by promoting `setTheme` to
+`onboardingProcedure`, which would have added a third member to a two-member
+exemption list `routers/auth.ts` argues explicitly for keeping at two.
+
+**`SETUP.md` exists.** `.env.example` had pointed at it since Phase 1. Bare
+machine to working instance: prerequisites, every variable that needs a
+decision, first boot, the tunnel, the Access application and policy, first
+sign-in becoming owner, the API key. Each step says what you should see.
+Troubleshooting covers the three failures this deployment actually hit — the
+65-character AUD, the `APP_PORT`/tunnel-ingress two-place edit, and an
+extraction failing with a visible reason code.
+
+Also corrected: `docs/SCHEMA.md` still documented `users.theme` defaulting to
+`'dark'`; D-41 moved it to `'light'` and the migration went with it.
+
+**Known test gap:** the plan called for an `EditableField` test proving a
+focused input survives a background refetch. `apps/web` has no DOM test
+environment (no jsdom, no testing-library), and adding one for a single
+assertion was out of scope for this batch. The pure half — when to poll — is
+covered by `extractionPolling.test.ts`; the focus guard is currently only
+covered by use.
+
 ## Post-Phase-8 fixes — the first real extraction run, capture, theme, orientation
 
 Five reported issues. The first two were real bugs with the same root cause

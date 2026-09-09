@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
 import { Button, Input } from "@heroui/react";
 import { AlertTriangle } from "lucide-react";
+
+import { useEditableDraft } from "../lib/useEditableDraft";
 
 /**
  * One inline-editable receipt field, with the "fill in or dismiss" affordance
@@ -42,28 +43,11 @@ export function EditableField({
   onUndismiss?: () => void;
   isSaving?: boolean;
 }) {
-  const [draft, setDraft] = useState(value ?? "");
-  const [lastValue, setLastValue] = useState(value);
-
-  // Re-sync when the server value changes underneath (a re-extract landing,
-  // or another member editing the same receipt).
-  //
-  // Adjusted DURING RENDER rather than in an effect. React re-runs this
-  // component immediately, before touching the DOM, so there is no flash of
-  // the stale value and no second commit — whereas `useEffect(() =>
-  // setDraft(...), [value])` paints the old text first and then repaints.
-  // This is React's documented pattern for "adjust state when a prop
-  // changes", and it is what react-hooks/set-state-in-effect asks for.
-  if (value !== lastValue) {
-    setLastValue(value);
-    setDraft(value ?? "");
-  }
-
-  function commit() {
-    const next = draft.trim() === "" ? null : draft.trim();
-    if (next === value) return;
-    onSave(next);
-  }
+  // The draft/focus/commit contract lives in one place — see
+  // lib/useEditableDraft.ts for why the re-sync must be suppressed while the
+  // field is focused, which became load-bearing once these screens started
+  // polling during extraction.
+  const { draft, setDraft, onFocus, onBlur } = useEditableDraft(value, onSave);
 
   return (
     <div className="flex flex-col gap-1">
@@ -79,7 +63,8 @@ export function EditableField({
         isReadOnly={!canEdit}
         isDisabled={isSaving}
         onValueChange={setDraft}
-        onBlur={commit}
+        onFocus={onFocus}
+        onBlur={onBlur}
         onKeyDown={(event) => {
           if (event.key === "Enter") (event.target as HTMLInputElement).blur();
         }}

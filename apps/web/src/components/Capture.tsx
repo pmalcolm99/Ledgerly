@@ -34,7 +34,6 @@ import { mapWithConcurrency, uploadOneFile } from "../lib/upload";
  */
 
 const UPLOAD_CONCURRENCY = 3;
-const POLL_INTERVAL_MS = 2500;
 
 type Pending = {
   key: string;
@@ -70,20 +69,20 @@ export function Capture({ projectId }: { projectId: string }) {
     };
   }, []);
 
-  const awaitingExtraction = pending
-    .filter((item) => item.receiptId && !item.error)
-    .map((item) => item.receiptId!);
-
-  // Poll only while something is actually in flight, and stop the moment the
-  // list empties — a permanent interval on a dashboard over a tunnel is a
-  // real battery and bandwidth cost.
-  trpc.receipts.list.useQuery(
-    { projectId, limit: 50 },
-    {
-      refetchInterval: awaitingExtraction.length > 0 ? POLL_INTERVAL_MS : false,
-      enabled: awaitingExtraction.length > 0,
-    },
-  );
+  // The extraction poll used to live here and has moved to ProjectDashboard,
+  // which owns the `receipts.list` query this screen actually renders. Two
+  // bugs came from it being here:
+  //
+  //  - It polled `{ projectId, limit: 50 }` while the dashboard renders
+  //    `{ projectId, ...filters, limit: 50 }`. With no filters set those keys
+  //    hash identically so it happened to work; the moment ANY filter was
+  //    active it refreshed a different cache entry than the one on screen.
+  //  - Its stop condition was "the pending list is empty", but entries are
+  //    only removed by the error branch's Dismiss button. A successful upload
+  //    therefore left the 2.5s interval running for the life of the tab.
+  //
+  // Polling now belongs to the query that renders the rows, keyed on whether
+  // any visible row is still extracting. See lib/extractionPolling.ts.
 
   const onFiles = useCallback(
     async (files: FileList | null) => {

@@ -20,6 +20,7 @@ import { AlertTriangle, ArrowLeft, RefreshCw, Trash2 } from "lucide-react";
 import type { EditableReceiptColumn, MissingFieldToken } from "@ledgerly/shared/receiptFields";
 
 import { trpc } from "../lib/trpc";
+import { extractionRefetchInterval } from "../lib/extractionPolling";
 import { receiptImageUrl } from "../lib/images";
 import {
   EXTRACTION_FAILED_HINT,
@@ -42,7 +43,16 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
   const utils = trpc.useUtils();
   const [isDeleteOpen, setDeleteOpen] = useState(false);
 
-  const query = trpc.receipts.get.useQuery({ id: receiptId });
+  // Poll while extraction is still running, stop when it lands. Without
+  // this the page fetched once and never learned the result — the reported
+  // "fields don't populate until you tap re-extract" bug. See
+  // lib/extractionPolling.ts for why re-extract only appeared to fix it.
+  const query = trpc.receipts.get.useQuery(
+    { id: receiptId },
+    {
+      refetchInterval: (q) => extractionRefetchInterval([q.state.data?.receipt.extractionStatus]),
+    },
+  );
 
   const invalidate = async () => {
     await utils.receipts.get.invalidate({ id: receiptId });
@@ -87,6 +97,15 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
   const missing = new Set(receipt.missingFields);
   const dismissed = new Set(receipt.dismissedFields);
 
+  // Which column the in-flight `update` is for, so only THAT field disables
+  // while it saves. `isSaving={update.isPending}` was passed to all twelve,
+  // which meant correcting one value froze the entire form until the round
+  // trip returned — over a tunnel, long enough to feel broken.
+  // `update.variables` is the last input, whose non-`id` key is the column.
+  const savingColumn = update.variables
+    ? Object.keys(update.variables).find((key) => key !== "id")
+    : undefined;
+
   // `tip` is the one editable money column with no missing-field token, so
   // the column type is the token map's keys plus it.
   const field = (
@@ -103,7 +122,7 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
       canEdit={canEdit}
       isMissing={token !== null && missing.has(token)}
       isDismissed={token !== null && dismissed.has(token)}
-      isSaving={update.isPending}
+      isSaving={update.isPending && savingColumn === column}
       onSave={(next) => update.mutate({ id: receiptId, [column]: next })}
       onDismiss={token ? () => dismiss.mutate({ id: receiptId, field: token }) : undefined}
       onUndismiss={token ? () => undismiss.mutate({ id: receiptId, field: token }) : undefined}
