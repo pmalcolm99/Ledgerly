@@ -158,6 +158,10 @@ rather than skipping past the runner's PostgreSQL 16 client. That step is
 `continue-on-error`: a third-party apt outage should cost one run's drill, not
 the whole pipeline, and the guard covers it.
 
+**Confirmed running in CI**, not merely configured to: run `34444999408` reports
+`pg_dump (PostgreSQL) 17.11` and all three round-trip cases executing and
+passing on the runner.
+
 **The guard shipped broken and CI caught it**, which is the argument for having
 run it there at all. `serverMajor()` read `SHOW server_version` and then took
 `.v` off the row — but SHOW names its column after the setting, so the read was
@@ -1696,6 +1700,13 @@ Decisions taken by the user this session:
 
 ## Surprises / notes
 
+- **Installing `postgresql-client-17` does not give you `pg_dump` 17.**
+  `/usr/bin/pg_dump` on Debian/Ubuntu is `pg_wrapper`, which dispatches to the
+  DEFAULT cluster's version rather than the newest installed one. CI printed
+  `pg_dump (PostgreSQL) 16.15` on the line immediately after unpacking 17.11,
+  and the restore drill went on skipping. `/usr/lib/postgresql/17/bin` has to go
+  on `PATH`. Worth knowing before trusting any `apt-get install postgresql-client-N`
+  to change which binary runs.
 - **An unanchored `.gitignore` directory rule matches at every depth.**
   `backups/` was written for the volume at the repo root and quietly excluded
   `apps/web/src/app/api/admin/backups/` in Phase 9 — a whole route plus its
