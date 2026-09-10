@@ -71,6 +71,39 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Phase 9's restore drill (packages/queue/src/pipeline/backupRoundTrip.test.ts)
+      # takes a real pg_dump of the postgres:17 service above. The runner image
+      # ships the PostgreSQL 16 client, and pg_dump REFUSES a server newer than
+      # itself outright — so without this the drill skips, `pnpm test` reads
+      # green, and the one check that proves a backup can actually be restored
+      # never runs. That is the exact silent success Phase 9 exists to prevent.
+      #
+      # `continue-on-error` on purpose: if apt.postgresql.org is down, the drill
+      # skipping is an acceptable outcome for one run, and taking the whole
+      # pipeline down over a third-party repo outage is not. The test's own
+      # version guard handles that case and says so on stderr.
+      #
+      # The scoped `apt-get update` is the lesson from the e2e job's apt
+      # breakage: refresh ONLY the list just added, so an unrelated broken repo
+      # already on the runner cannot fail this step.
+      - name: Install the PostgreSQL 17 client (for the backup restore drill)
+        continue-on-error: true
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          # One line, deliberately: a backslash continuation inside the quotes
+          # would embed a literal newline into the sources.list entry.
+          KEY=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          REPO="https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"
+          echo "deb [signed-by=$KEY] $REPO" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist=sources.list.d/pgdg.list \
+            -o Dir::Etc::sourceparts=- \
+            -o APT::Get::List-Cleanup=0
+          sudo apt-get install -y postgresql-client-17
+          pg_dump --version
+
       - run: pnpm lint
 
       - run: pnpm typecheck

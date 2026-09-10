@@ -74,7 +74,14 @@ async function serverMajor(base: string): Promise<number | null> {
   const client = new Client({ connectionString: base });
   await client.connect();
   try {
-    const result = await client.query<{ v: string }>("SHOW server_version");
+    // `SELECT current_setting(...) AS v`, not `SHOW server_version` — SHOW
+    // names its column after the setting, so reading `.v` off it yields
+    // undefined and this function quietly returns null. It did exactly that in
+    // CI: the guard below never fired, and three tests failed on a version
+    // mismatch they were written to skip.
+    const result = await client.query<{ v: string }>(
+      "SELECT current_setting('server_version') AS v",
+    );
     const match = /^(\d+)/.exec(result.rows[0]?.v ?? "");
     return match ? Number(match[1]) : null;
   } finally {

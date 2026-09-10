@@ -153,7 +153,18 @@ cases assert it REFUSES a damaged archive and a manifest shape it does not
 understand, which are the outcomes that actually protect anyone. So the gate
 does not decay back into a hypothesis after this session. It skips, loudly on stderr, when the client
 tools are absent or when `pg_dump` is older than the server (which it refuses
-outright). `backupScheduler.test.ts` covers task 9.3's acceptance against a real
+outright) — and CI installs `postgresql-client-17` so it actually runs there
+rather than skipping past the runner's PostgreSQL 16 client. That step is
+`continue-on-error`: a third-party apt outage should cost one run's drill, not
+the whole pipeline, and the guard covers it.
+
+**The guard shipped broken and CI caught it**, which is the argument for having
+run it there at all. `serverMajor()` read `SHOW server_version` and then took
+`.v` off the row — but SHOW names its column after the setting, so the read was
+always `undefined`, the guard always saw `null`, and it never fired. The first
+CI run failed with three `PG_DUMP_FAILED`s on exactly the mismatch it was
+written to skip. `SELECT current_setting('server_version') AS v` now, verified
+both ways. `backupScheduler.test.ts` covers task 9.3's acceptance against a real
 Redis: a second `upsertJobScheduler` **replaces** rather than accumulating, so
 changing the cron reschedules without a restart.
 
