@@ -102,7 +102,15 @@ jobs:
             -o Dir::Etc::sourceparts=- \
             -o APT::Get::List-Cleanup=0
           sudo apt-get install -y postgresql-client-17
-          pg_dump --version
+          # PATH, not just the package. `/usr/bin/pg_dump` is Debian's
+          # `pg_wrapper`, which dispatches to the DEFAULT cluster's version —
+          # still 16 on this runner — rather than to the newest installed. So
+          # installing the 17 client alone changes nothing: the first run of
+          # this step did exactly that and the drill still skipped, reporting
+          # `pg_dump (PostgreSQL) 16.15` on the line right after unpacking
+          # 17.11. The versioned binaries are what we actually want.
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
 
       - run: pnpm lint
 
