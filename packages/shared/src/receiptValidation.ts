@@ -4,6 +4,17 @@ import { parseMoney } from "./money";
  * packages/shared/src/receiptValidation.ts — sanity checks (task 6.7,
  * ARCHITECTURE.md §6.3).
  *
+ * ## Acknowledgement
+ *
+ * Some receipts genuinely do not reconcile, and no amount of correcting will
+ * make them. A discounted receipt whose printed subtotal already has the
+ * discount applied, read by a model that then subtracts it again, produces an
+ * `arithmetic_mismatch_items` that is real arithmetic on wrong data — and the
+ * user cannot fix it without inventing a line item that is not on the paper.
+ *
+ * `acknowledgedFlags` is that escape hatch, and it is the reason the return
+ * value is computed from the FILTERED list. See the field's own comment.
+ *
  * Never fails the receipt — each check independently sets
  * `extraction_status='partial'` and appends a flag to `validation_flags`,
  * because CLAUDE.md requires extraction to always save *something*. Money
@@ -24,8 +35,36 @@ import { parseMoney } from "./money";
  * `packages/shared` is the one place both callers can reach.
  */
 
-export type ValidationFlag =
-  "arithmetic_mismatch_total" | "arithmetic_mismatch_items" | "date_in_future" | "date_too_old";
+/**
+ * Every flag the sanity checks can raise, as a runtime list.
+ *
+ * A const array rather than a bare union, for the same reason
+ * `MISSING_FIELD_TOKENS` is one: `receipts.acknowledgeValidationFlag` needs a
+ * `z.enum` of exactly these, and deriving the type from the list means a flag
+ * added below is automatically acknowledgeable rather than silently
+ * un-clearable — which is the bug this whole mechanism exists to fix.
+ */
+export const VALIDATION_FLAGS = [
+  "arithmetic_mismatch_total",
+  "arithmetic_mismatch_items",
+  "date_in_future",
+  "date_too_old",
+] as const;
+
+export type ValidationFlag = (typeof VALIDATION_FLAGS)[number];
+
+/**
+ * Narrows a value read out of `validation_flags`/`acknowledged_flags`.
+ *
+ * Those are `text[]`, so anything the database holds arrives as a plain
+ * string — including a flag written by a version of this app that knew about
+ * one this one does not. Such a value is shown but not offered as actionable,
+ * rather than crashing the page or being silently coerced into a flag the
+ * server would reject. `isMissingFieldToken` exists for the same reason.
+ */
+export function isValidationFlag(value: string): value is ValidationFlag {
+  return (VALIDATION_FLAGS as readonly string[]).includes(value);
+}
 
 export type ValidationInput = {
   subtotal: string | null;
@@ -34,6 +73,23 @@ export type ValidationInput = {
   total: string | null;
   transactionDate: string | null; // ISO YYYY-MM-DD
   items: { lineTotal: string | null }[];
+  /**
+   * Flags the user has looked at and asserted are correct anyway.
+   *
+   * Filtered out of the RESULT rather than skipped during the checks, so the
+   * checks stay a pure function of the numbers and there is one place — here —
+   * where an acknowledgement takes effect. Both callers (the extraction
+   * pipeline and `recomputeReceiptDerivedState`) get the same rule for free,
+   * which is the whole reason this function lives in `shared`.
+   *
+   * This is what makes an acknowledgement mean something: a receipt whose only
+   * remaining complaint has been acknowledged comes back `ok`, and `ok` is what
+   * `NEEDS_REVIEW_SQL` reads to let it out of the review queue. Without the
+   * status following the filtered flags, acknowledging would hide the badge
+   * and leave the receipt in the queue forever — which is the bug it exists to
+   * fix, moved somewhere less visible.
+   */
+  acknowledgedFlags?: readonly string[];
 };
 
 export type ValidationResult = {
@@ -91,5 +147,8 @@ export function runSanityChecks(input: ValidationInput): ValidationResult {
     }
   }
 
-  return { status: flags.length > 0 ? "partial" : "ok", validationFlags: flags };
+  const acknowledged = new Set(input.acknowledgedFlags ?? []);
+  const effective = flags.filter((flag) => !acknowledged.has(flag));
+
+  return { status: effective.length > 0 ? "partial" : "ok", validationFlags: effective };
 }

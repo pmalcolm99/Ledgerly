@@ -383,7 +383,12 @@ export async function processReceiptExtraction(
       escalated: false,
     });
 
-    if (shouldEscalate(pass1.input, escalateBelow)) {
+    // Escalating to the SAME model is a second identical paid call for an
+    // identical answer. With pass 1 on Sonnet (D-12 amended) that is the normal
+    // configuration, not an exotic one, so the ladder has to know when it has
+    // nowhere to climb — otherwise every low-confidence receipt quietly costs
+    // double for nothing.
+    if (modelPass2 !== modelPass1 && shouldEscalate(pass1.input, escalateBelow)) {
       escalated = true;
       finalPass = await runPass({
         db,
@@ -439,7 +444,11 @@ export async function processReceiptExtraction(
     transactionDate,
     items: items.map((item) => ({ lineTotal: item.lineTotal })),
   };
-  const { status, validationFlags } = runSanityChecks(validationInput);
+  // Unacknowledged flags, used below to decide whether a `date_too_old` should
+  // null the date and whether each field belongs in `missing_fields`. The
+  // EFFECTIVE flags — these minus the user's acknowledgements — are derived
+  // inside the transaction, where the stored acknowledgements can be read.
+  const { validationFlags } = runSanityChecks(validationInput);
 
   const missingFields: string[] = [];
   if (merchantName === null) missingFields.push("merchant_name");
@@ -477,7 +486,10 @@ export async function processReceiptExtraction(
     // which makes the user's earlier "this field is genuinely blank"
     // assertions stale rather than authoritative.
     const [existing] = await tx
-      .select({ dismissedFields: receipts.dismissedFields })
+      .select({
+        dismissedFields: receipts.dismissedFields,
+        acknowledgedFlags: receipts.acknowledgedFlags,
+      })
       .from(receipts)
       .where(eq(receipts.id, receiptId))
       .limit(1)
@@ -489,10 +501,24 @@ export async function processReceiptExtraction(
     const dismissed = forcePass2 ? [] : (existing?.dismissedFields ?? []);
     const effectiveMissingFields = missingFields.filter((field) => !dismissed.includes(field));
 
+    // Acknowledged validation flags get exactly the treatment dismissed fields
+    // get, and for the same reason: an automatic re-run must not resurrect a
+    // warning the user has already dealt with, while a MANUAL re-extract is a
+    // request for a fresh opinion and clears the slate.
+    //
+    // Re-run rather than filtered here, so the rule that turns
+    // acknowledgements into flags-and-status lives in exactly one place
+    // (`runSanityChecks`). The input is unchanged, so the unacknowledged flags
+    // it returns are identical to the ones computed above — only the
+    // subtraction and the resulting status differ.
+    const acknowledged = forcePass2 ? [] : (existing?.acknowledgedFlags ?? []);
+    const effective = runSanityChecks({ ...validationInput, acknowledgedFlags: acknowledged });
+
     const updated = await tx
       .update(receipts)
       .set({
         dismissedFields: dismissed,
+        acknowledgedFlags: acknowledged,
         merchantName,
         merchantAddress,
         merchantPhone,
@@ -504,14 +530,14 @@ export async function processReceiptExtraction(
         total,
         cardLast4,
         paymentMethod,
-        extractionStatus: status,
+        extractionStatus: effective.status,
         extractionModel: finalPass.model,
         extractionPass: forcePass2 || escalated ? 2 : 1,
         extractionConfidence: String(confidence),
         extractionRaw: finalPass.rawScrubbed,
         extractionError: null,
         missingFields: effectiveMissingFields,
-        validationFlags,
+        validationFlags: effective.validationFlags,
         updatedAt: new Date(),
       })
       .where(and(eq(receipts.id, receiptId), isNull(receipts.deletedAt)))

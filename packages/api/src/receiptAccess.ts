@@ -199,11 +199,12 @@ export type { EditableReceiptColumn, MissingFieldToken } from "@ledgerly/shared/
  *  - **the `items` token**: present exactly when the receipt has no line
  *    items, unless the user dismissed it.
  *  - **`validation_flags` / `extraction_status`**: re-run of the same sanity
- *    checks extraction uses. Without this, a user who corrects a mistyped
- *    total keeps the `arithmetic_mismatch_total` badge forever — the receipt
- *    now adds up and the app still says it doesn't. Guarded to `ok`/`partial`
- *    only: `pending` and `failed` are pipeline states, and a field edit has
- *    no business asserting a receipt finished extracting.
+ *    checks extraction uses, minus anything in `acknowledged_flags`. Without
+ *    this, a user who corrects a mistyped total keeps the
+ *    `arithmetic_mismatch_total` badge forever — the receipt now adds up and
+ *    the app still says it doesn't. Guarded to `ok`/`partial` only: `pending`
+ *    and `failed` are pipeline states, and a field edit has no business
+ *    asserting a receipt finished extracting.
  *  - **`reviewed_at`**: derived, never set directly, so there is exactly one
  *    definition of "this receipt has left the review queue" and no second
  *    source of truth to disagree with the badge.
@@ -236,6 +237,9 @@ export async function recomputeReceiptDerivedState(tx: Tx, receiptId: string): P
       total: receipt.total,
       transactionDate: receipt.transactionDate,
       items,
+      // Without this the recompute puts an acknowledged flag straight back,
+      // and every acknowledgement would last exactly until the next edit.
+      acknowledgedFlags: receipt.acknowledgedFlags,
     });
     validationFlags = result.validationFlags;
     extractionStatus = result.status;

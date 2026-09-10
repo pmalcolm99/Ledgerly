@@ -423,6 +423,48 @@ pass-1 model question. See `docs/STATE.md`'s "Blocked / open questions."
 
 ---
 
+### Amendment (2026-09-10): pass 1 is Sonnet. The ladder is retained but does not climb.
+
+The ladder escalates on a **missing** answer — null total, null date, no items,
+confidence below `AI_ESCALATE_BELOW`. The failure that actually cost something
+was a **confident wrong** one, and nothing in that list can see it.
+
+The case: a Safelite receipt with a `-34.99` wiper discount. Items summed to
+942.02 and tax was 52.31, which is exactly the 994.33 total — items and total
+agreed perfectly. The subtotal read 907.03, one discount lower, because Haiku
+subtracted the discount a second time when reading a subtotal that already had
+it applied. Confidence was fine, every field was present, so pass 1 stood.
+`runSanityChecks` then raised BOTH arithmetic flags, each off by exactly 34.99,
+and the receipt landed in the review queue with arithmetic the user could not
+fix without inventing a line item.
+
+`AI_MODEL_PASS1` therefore defaults to `claude-sonnet-5`. The alternative
+considered — escalating on failed arithmetic — is cheaper and was the first
+recommendation, but it treats a symptom that only shows up when the numbers
+happen to disagree; a discount misread that still reconciles would sail through.
+The user chose accuracy over the per-receipt saving, and at this instance's
+volume the ladder was optimising an amount that does not signify.
+
+**Consequence.** With both passes on the same model, escalating would be a
+second identical paid call for an identical answer, so `pipeline/extract.ts`
+skips the ladder whenever `modelPass1 === modelPass2`. The machinery is
+retained, not deleted: setting `AI_MODEL_PASS1` back to `claude-haiku-4-5`
+restores the two-pass ladder with no code change, and escalation re-enables
+itself because the guard is a comparison rather than a flag.
+
+**Consequence.** D-12's escalation-rate threshold (~45%) is now unobservable —
+nothing escalates. Task 6.10's admin view will read 0%. That is honest rather
+than broken: the number describes a ladder that is not currently climbing.
+Restoring Haiku on pass 1 restores the measurement.
+
+**What this does NOT fix.** A stronger model reads discounts better; it does not
+make every receipt reconcile. Receipts whose printed arithmetic genuinely does
+not add up still raise flags, which is why they became acknowledgeable in the
+same change — see `receipts.acknowledgeValidationFlag` and
+`receipts.acknowledged_flags`.
+
+---
+
 ## D-13 — gitleaks in CI alongside secretlint in pre-commit. **Settled.**
 
 **Context.** Forkd uses secretlint 8 in lint-staged. The brief asks for gitleaks

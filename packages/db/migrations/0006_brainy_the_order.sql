@@ -1,0 +1,1 @@
+ALTER TABLE "receipts" ADD COLUMN "acknowledged_flags" text[] DEFAULT '{}'::text[] NOT NULL;

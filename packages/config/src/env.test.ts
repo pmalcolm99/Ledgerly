@@ -24,7 +24,7 @@ describe("parseEnv", () => {
     expect(env.REDIS_URL).toBe("redis://redis:6379");
     // Undated, per D-12. The bare alias resolves against the live API; it is
     // simply absent from `GET /v1/models`, which lists snapshots not aliases.
-    expect(env.AI_MODEL_PASS1).toBe("claude-haiku-4-5");
+    expect(env.AI_MODEL_PASS1).toBe("claude-sonnet-5");
     expect(env.AI_MODEL_PASS2).toBe("claude-sonnet-5");
     expect(env.DEFAULT_CURRENCY).toBe("USD");
     expect(env.DEV_AUTH_BYPASS).toBe(false);

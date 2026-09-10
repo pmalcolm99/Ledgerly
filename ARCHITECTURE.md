@@ -309,10 +309,10 @@ Runs in the BullMQ worker, never in a request. See D-08.
 
 ### 6.1 The ladder
 
-| Pass | Model (env)      | Default            | When                                                                                                                 |
-| ---- | ---------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| 1    | `AI_MODEL_PASS1` | `claude-haiku-4-5` | every receipt                                                                                                        |
-| 2    | `AI_MODEL_PASS2` | `claude-sonnet-5`  | pass 1 returned null `total`, null `transaction_date`, zero items, or `confidence < AI_ESCALATE_BELOW` (default 0.6) |
+| Pass | Model (env)      | Default           | When                                                                                                                 |
+| ---- | ---------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------- |
+| 1    | `AI_MODEL_PASS1` | `claude-sonnet-5` | every receipt                                                                                                        |
+| 2    | `AI_MODEL_PASS2` | `claude-sonnet-5` | pass 1 returned null `total`, null `transaction_date`, zero items, or `confidence < AI_ESCALATE_BELOW` (default 0.6) |
 
 Model IDs are exact and carry no date suffix. Both are env-tunable so the ladder
 can be re-pointed without a code change. See D-12 for why these two, and for the
@@ -414,7 +414,7 @@ The schema is also where cross-field invariants live:
 | `ACCESS_ALLOW_SUB_RELINK`   | `false`              | IdP-migration recovery only; WARNs at boot while true (D-27) |
 | `DEV_AUTH_BYPASS`           | `false`              | hard-fails under production                                  |
 | `ANTHROPIC_API_KEY`         | —                    | server-side only                                             |
-| `AI_MODEL_PASS1`            | `claude-haiku-4-5`   |                                                              |
+| `AI_MODEL_PASS1`            | `claude-sonnet-5`    | D-12 amended; equal to pass 2, so the ladder does not climb  |
 | `AI_MODEL_PASS2`            | `claude-sonnet-5`    |                                                              |
 | `AI_ESCALATE_BELOW`         | `0.6`                |                                                              |
 | `AI_CONCURRENCY`            | `3`                  |                                                              |

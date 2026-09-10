@@ -14,6 +14,7 @@ import {
 } from "@ledgerly/db/schema";
 import { displayNameOf } from "@ledgerly/shared/personName";
 import { scrubLuhnSequences } from "@ledgerly/shared/scrub";
+import { VALIDATION_FLAGS } from "@ledgerly/shared/receiptValidation";
 
 import { recordAudit } from "../audit";
 import type { Tx } from "../audit";
@@ -537,6 +538,99 @@ export const receiptsRouter = router({
       });
     }),
 
+  /**
+   * Acknowledges a validation flag: "I have looked at this and the receipt
+   * really does say that."
+   *
+   * `dismissMissingField`'s counterpart for `validation_flags`, and it exists
+   * because there was no way at all to clear one. A flag could only be removed
+   * by editing the numbers until they agreed — which, on a receipt that
+   * genuinely does not reconcile, means inventing data that is not on the
+   * paper. Until then such a receipt sat in the review queue permanently with
+   * a warning nobody could act on.
+   *
+   * The case that forced it: a discounted receipt whose printed subtotal
+   * already has the discount applied, read by a model that subtracts it again.
+   * `arithmetic_mismatch_items` is correct arithmetic over wrong input, and the
+   * user cannot fix the input.
+   *
+   * Removing the flag is not enough on its own — `runSanityChecks` would put it
+   * straight back on the next recompute, so the acknowledgement is recorded and
+   * subtracted there (`acknowledgedFlags`), which is also what lets
+   * `extraction_status` fall back to `ok` and the receipt leave the queue.
+   *
+   * Idempotent, matching `dismissMissingField`.
+   */
+  acknowledgeValidationFlag: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), flag: z.enum(VALIDATION_FLAGS) }))
+    .mutation(async ({ ctx, input }) => {
+      return ctx.db.transaction(async (tx) => {
+        const access = await loadEditableReceipt(tx, input.id, ctx.user);
+        assertMayEditReceipt(access, ctx.user.id);
+        const { receipt } = access;
+
+        const acknowledged = new Set(receipt.acknowledgedFlags);
+        const flags = new Set(receipt.validationFlags);
+        if (acknowledged.has(input.flag) && !flags.has(input.flag)) return receipt;
+
+        acknowledged.add(input.flag);
+
+        await tx
+          .update(receipts)
+          .set({ acknowledgedFlags: [...acknowledged], updatedAt: new Date() })
+          .where(eq(receipts.id, receipt.id));
+
+        // Not a hand-edit of `validation_flags` — the recompute subtracts the
+        // acknowledgement and re-derives both the flags and the status from
+        // one rule. Writing the array here as well would be a second place for
+        // that rule to live, and the two would eventually disagree.
+        await recomputeReceiptDerivedState(tx, receipt.id);
+
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "receipt.flag_acknowledged",
+          entityType: "receipt",
+          entityId: receipt.id,
+          metadata: { flag: input.flag, via: "receipts.acknowledgeValidationFlag" },
+        });
+
+        return selectEditableReceipt(tx, receipt.id);
+      });
+    }),
+
+  /** The mirror of `acknowledgeValidationFlag`. The flag comes back only if the
+   *  numbers still fail the check — the recompute decides that, not this. */
+  unacknowledgeValidationFlag: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), flag: z.enum(VALIDATION_FLAGS) }))
+    .mutation(async ({ ctx, input }) => {
+      return ctx.db.transaction(async (tx) => {
+        const access = await loadEditableReceipt(tx, input.id, ctx.user);
+        assertMayEditReceipt(access, ctx.user.id);
+        const { receipt } = access;
+
+        const acknowledged = new Set(receipt.acknowledgedFlags);
+        if (!acknowledged.has(input.flag)) return receipt;
+        acknowledged.delete(input.flag);
+
+        await tx
+          .update(receipts)
+          .set({ acknowledgedFlags: [...acknowledged], updatedAt: new Date() })
+          .where(eq(receipts.id, receipt.id));
+
+        await recomputeReceiptDerivedState(tx, receipt.id);
+
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "receipt.flag_unacknowledged",
+          entityType: "receipt",
+          entityId: receipt.id,
+          metadata: { flag: input.flag, via: "receipts.unacknowledgeValidationFlag" },
+        });
+
+        return selectEditableReceipt(tx, receipt.id);
+      });
+    }),
+
   /** The mirror of `dismissMissingField`. Without it a mis-dismissal is
    *  unrecoverable through the UI. */
   undismissMissingField: protectedProcedure
@@ -990,6 +1084,7 @@ async function selectEditableReceipt(tx: Tx, receiptId: string) {
       missingFields: receipts.missingFields,
       validationFlags: receipts.validationFlags,
       dismissedFields: receipts.dismissedFields,
+      acknowledgedFlags: receipts.acknowledgedFlags,
       userNotes: receipts.userNotes,
       reviewedAt: receipts.reviewedAt,
       createdAt: receipts.createdAt,

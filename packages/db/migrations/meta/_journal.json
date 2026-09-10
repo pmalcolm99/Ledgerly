@@ -43,6 +43,13 @@
       "when": 1788969797944,
       "tag": "0005_yummy_chat",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789023285218,
+      "tag": "0006_brainy_the_order",
+      "breakpoints": true
     }
   ]
 }

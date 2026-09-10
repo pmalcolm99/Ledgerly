@@ -304,6 +304,99 @@ describe("processReceiptExtraction", () => {
     expect(items).toHaveLength(2);
   });
 
+  /**
+   * Acknowledged validation flags get the same lifecycle as dismissed fields:
+   * preserved across an automatic re-run, cleared by a manual re-extract.
+   *
+   * The first half is the one that matters. `runSanityChecks` recomputes flags
+   * from scratch every run, so without subtracting the stored
+   * acknowledgements, an automatic retry resurrects a warning the user has
+   * already dealt with — and puts the receipt back in the review queue.
+   */
+  it("preserves acknowledged flags across an automatic run and clears them on a manual one", async () => {
+    const { project } = await createTestProjectWithMembers(db, {
+      ownerKey: "owner",
+      members: [],
+    });
+    const receiptId = await insertReceiptWithRender(project.id);
+
+    // Subtotal that disagrees with the items by more than the $1 tolerance —
+    // the discounted-receipt shape, where the printed subtotal has the discount
+    // taken twice.
+    const mismatched = cleanRecordReceiptInput({
+      subtotal: "10.00",
+      sales_tax: "1.00",
+      total: "11.00",
+      items: [
+        {
+          description: "Windshield",
+          quantity: "1",
+          unit_price: "45.00",
+          line_total: "45.00",
+          category: "tools-equipment",
+        },
+      ],
+    });
+    const client = fakeClient([
+      { input: mismatched },
+      { input: mismatched },
+      { input: mismatched },
+    ]);
+
+    await processReceiptExtraction(deps(client), { receiptId });
+    let [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row!.validationFlags).toContain("arithmetic_mismatch_items");
+
+    // The user acknowledges it.
+    await db
+      .update(receipts)
+      .set({ acknowledgedFlags: ["arithmetic_mismatch_items"] })
+      .where(eq(receipts.id, receiptId));
+
+    // An AUTOMATIC re-run (no forcePass2) must not resurrect it.
+    await db
+      .update(receipts)
+      .set({ extractionStatus: "pending" })
+      .where(eq(receipts.id, receiptId));
+    await processReceiptExtraction(deps(client), { receiptId });
+    [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row!.acknowledgedFlags).toEqual(["arithmetic_mismatch_items"]);
+    expect(row!.validationFlags).not.toContain("arithmetic_mismatch_items");
+    expect(row!.extractionStatus).toBe("ok");
+
+    // A MANUAL re-extract is a request for a fresh opinion, so the slate is
+    // cleared and the flag comes back — same rule dismissed fields follow.
+    await processReceiptExtraction(deps(client), { receiptId, forcePass2: true });
+    [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row!.acknowledgedFlags).toEqual([]);
+    expect(row!.validationFlags).toContain("arithmetic_mismatch_items");
+    expect(row!.extractionStatus).toBe("partial");
+  });
+
+  /** With pass 1 and pass 2 on the same model (the D-12-amended default),
+   *  escalating would be a second identical paid call for an identical answer. */
+  it("does not escalate when both passes are the same model", async () => {
+    const { project } = await createTestProjectWithMembers(db, {
+      ownerKey: "owner",
+      members: [],
+    });
+    const receiptId = await insertReceiptWithRender(project.id);
+    // `total: null` would normally escalate.
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput({ total: null }) },
+      { input: cleanRecordReceiptInput({ total: null }) },
+    ]);
+
+    await processReceiptExtraction(
+      { ...deps(client), modelPass1: "claude-sonnet-5", modelPass2: "claude-sonnet-5" },
+      { receiptId },
+    );
+
+    const usage = await db.select().from(aiUsage).where(eq(aiUsage.receiptId, receiptId));
+    expect(usage).toHaveLength(1);
+    expect(usage[0]?.pass).toBe(1);
+  });
+
   it("is a no-op on an already-completed receipt without forcePass2", async () => {
     const { project } = await createTestProjectWithMembers(db, {
       ownerKey: "owner",

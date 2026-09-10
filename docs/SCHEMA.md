@@ -298,6 +298,7 @@ CREATE TABLE receipts (
   extraction_error      text,
   missing_fields        text[]            NOT NULL DEFAULT '{}',
   validation_flags      text[]            NOT NULL DEFAULT '{}',
+  acknowledged_flags    text[]            NOT NULL DEFAULT '{}',
 
   receipt_email_sent_at timestamptz,                           -- D-44
 
@@ -347,6 +348,15 @@ CREATE INDEX receipts_pending_idx
   receipt, and separate from `extraction_error` (a single string, reserved
   for `extraction_status = 'failed'` from either the ingest or the AI
   stage) because a `partial` receipt is not a failure.
+- `acknowledged_flags` is the `validation_flags` counterpart of
+  `dismissed_fields`: checks the user has looked at and asserted are correct
+  anyway. It exists because there was no way to clear a flag at all — a receipt
+  whose printed arithmetic genuinely does not reconcile sat in the review queue
+  permanently, and the only remedy on offer was to edit the numbers until they
+  agreed, i.e. to invent data. `runSanityChecks` subtracts this set, so the flag
+  AND the `partial` status both clear and the receipt actually leaves the queue.
+  Same lifecycle as `dismissed_fields`: preserved across an automatic re-run,
+  cleared by a manual re-extract.
 - `receipt_email_sent_at` (D-44) marks that the **automatic** receipt email
   has gone. Load-bearing rather than bookkeeping: `receipts.reextract` sets
   `forcePass2` and re-enters the persistence path, so without a durable marker

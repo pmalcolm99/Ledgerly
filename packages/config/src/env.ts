@@ -74,7 +74,16 @@ const rawSchema = z.object({
   // aliases; reading that absence as "the id is invalid" was a wrong
   // inference, and the real pass-1 failure was the request shape (see
   // pipeline/anthropicRequest.ts).
-  AI_MODEL_PASS1: z.string().min(1).default("claude-haiku-4-5"),
+  //
+  // PASS 1 IS SONNET (D-12 amended). The ladder was built to spend Haiku money
+  // on the receipts Haiku can read and escalate the rest — but escalation
+  // triggers on a MISSING answer (null total, null date, no items, low
+  // confidence), and the failure that actually hurt was a confident wrong one:
+  // a discounted receipt whose subtotal Haiku read with the discount applied
+  // twice. Nothing in the ladder can see that, so it never escalated, and the
+  // receipt landed in the review queue with arithmetic nobody could fix.
+  // Sonnet on every receipt costs more per receipt and removes the class.
+  AI_MODEL_PASS1: z.string().min(1).default("claude-sonnet-5"),
   AI_MODEL_PASS2: z.string().min(1).default("claude-sonnet-5"),
   AI_ESCALATE_BELOW: z.coerce.number().min(0).max(1).default(0.6),
   AI_CONCURRENCY: z.coerce.number().int().positive().default(3),

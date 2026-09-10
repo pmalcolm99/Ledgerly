@@ -16,8 +16,9 @@ import {
   Skeleton,
   Textarea,
 } from "@heroui/react";
-import { AlertTriangle, ArrowLeft, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Check, RefreshCw, Trash2 } from "lucide-react";
 import type { EditableReceiptColumn, MissingFieldToken } from "@ledgerly/shared/receiptFields";
+import { isValidationFlag } from "@ledgerly/shared/receiptValidation";
 
 import { trpc } from "../lib/trpc";
 import { EmailReceiptButton } from "./EmailReceiptButton";
@@ -62,6 +63,12 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
   const update = trpc.receipts.update.useMutation({ onSuccess: invalidate });
   const dismiss = trpc.receipts.dismissMissingField.useMutation({ onSuccess: invalidate });
   const undismiss = trpc.receipts.undismissMissingField.useMutation({ onSuccess: invalidate });
+  const acknowledge = trpc.receipts.acknowledgeValidationFlag.useMutation({
+    onSuccess: invalidate,
+  });
+  const unacknowledge = trpc.receipts.unacknowledgeValidationFlag.useMutation({
+    onSuccess: invalidate,
+  });
   const reextract = trpc.receipts.reextract.useMutation({ onSuccess: invalidate });
   const remove = trpc.receipts.delete.useMutation({
     onSuccess: async () => {
@@ -158,12 +165,59 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
 
       {receipt.validationFlags.length > 0 ? (
         <Card className="border border-warning-200 bg-warning-50/50" shadow="none">
-          <CardBody className="gap-1 p-4">
+          <CardBody className="gap-2 p-4">
             {receipt.validationFlags.map((flag) => (
-              <p key={flag} className="flex items-center gap-2 text-sm">
+              <div key={flag} className="flex items-center gap-2 text-sm">
                 <AlertTriangle className="h-4 w-4 shrink-0 text-warning" aria-hidden />
-                {validationFlagLabel(flag)}
-              </p>
+                <span className="min-w-0 flex-1">{validationFlagLabel(flag)}</span>
+                {/*
+                  Until this button existed a flag could only be cleared by
+                  editing the numbers until they agreed — which, on a receipt
+                  that genuinely does not reconcile (a discount the model
+                  applied twice), means inventing a line item that is not on the
+                  paper. The receipt sat in the review queue permanently with a
+                  warning nobody could act on.
+                */}
+                {canEdit && isValidationFlag(flag) ? (
+                  <Button
+                    size="sm"
+                    variant="light"
+                    className="shrink-0"
+                    isLoading={acknowledge.isPending && acknowledge.variables?.flag === flag}
+                    onPress={() => acknowledge.mutate({ id: receiptId, flag })}
+                  >
+                    That&apos;s correct
+                  </Button>
+                ) : null}
+              </div>
+            ))}
+          </CardBody>
+        </Card>
+      ) : null}
+
+      {receipt.acknowledgedFlags.length > 0 ? (
+        <Card className="border border-divider" shadow="none">
+          <CardBody className="gap-2 p-4">
+            {receipt.acknowledgedFlags.map((flag) => (
+              <div key={flag} className="flex items-center gap-2 text-sm text-default-500">
+                <Check className="h-4 w-4 shrink-0" aria-hidden />
+                <span className="min-w-0 flex-1">{validationFlagLabel(flag)} — marked correct</span>
+                {/* Recoverable, for the same reason `undismissMissingField`
+                    exists: an acknowledgement made by mistake must not be a
+                    one-way door. The flag only comes back if the numbers still
+                    fail the check — the server's recompute decides that. */}
+                {canEdit && isValidationFlag(flag) ? (
+                  <Button
+                    size="sm"
+                    variant="light"
+                    className="shrink-0"
+                    isLoading={unacknowledge.isPending && unacknowledge.variables?.flag === flag}
+                    onPress={() => unacknowledge.mutate({ id: receiptId, flag })}
+                  >
+                    Undo
+                  </Button>
+                ) : null}
+              </div>
             ))}
           </CardBody>
         </Card>
@@ -239,10 +293,19 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
           >
             Re-extract
           </Button>
-          {receipt.dismissedFields.length > 0 ? (
+          {receipt.dismissedFields.length + receipt.acknowledgedFlags.length > 0 ? (
             <Chip size="sm" variant="flat" className="text-xs">
-              Re-extracting clears {receipt.dismissedFields.length} dismissed field
-              {receipt.dismissedFields.length === 1 ? "" : "s"}
+              Re-extracting clears{" "}
+              {[
+                receipt.dismissedFields.length > 0
+                  ? `${receipt.dismissedFields.length} dismissed field${receipt.dismissedFields.length === 1 ? "" : "s"}`
+                  : null,
+                receipt.acknowledgedFlags.length > 0
+                  ? `${receipt.acknowledgedFlags.length} acknowledged warning${receipt.acknowledgedFlags.length === 1 ? "" : "s"}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" and ")}
             </Chip>
           ) : null}
           <div className="flex-1" />

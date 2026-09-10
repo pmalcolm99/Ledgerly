@@ -204,7 +204,7 @@ demonstrated rather than argued:
 
 ### Verification
 
-**761 unit tests**, up from 670. `pnpm build` still traces
+**781 unit tests**, up from 670. `pnpm build` still traces
 `sharp`/`bullmq`/`ioredis` — and now `cron-parser` — into
 `.next/standalone/node_modules`.
 
@@ -231,6 +231,65 @@ compose mode drives `docker compose` from outside the container and it needs
 `python3`, which ARCHITECTURE.md §8.1 explicitly drops from that image. An
 operator reaches it from a checkout — which is how they got `docker-compose.yml`
 in the first place.
+
+## Discounts, and a warning nobody could clear
+
+Two reported issues, one receipt. A Safelite receipt with a `-34.99` wiper
+discount came back flagged `arithmetic_mismatch_total` AND
+`arithmetic_mismatch_items`, and the warning could not be acknowledged or
+dismissed.
+
+**The arithmetic says exactly what went wrong.** Items summed to 942.02, tax was
+52.31, and 942.02 + 52.31 = 994.33 — the recorded total, to the cent. The items
+and the total agreed perfectly. The subtotal read 907.03, one discount lower,
+because the model subtracted the 34.99 a second time from a subtotal that
+already had it applied. Both flags were off by exactly 34.99. The checks were
+right; the input was wrong, and the user could not correct it from the paper.
+
+### Pass 1 is Sonnet (D-12 amended)
+
+The ladder escalates on a MISSING answer — null total, null date, no items, low
+confidence. This was a CONFIDENT WRONG one, so nothing escalated and Haiku's
+reading stood. Escalating on failed arithmetic was the cheaper fix and was
+recommended first, but it only catches the misreads that happen to break the
+arithmetic; a discount misread that still reconciles sails through. The user
+chose accuracy, and at this instance's volume (25 `ai_usage` rows) the ladder was
+optimising an amount that does not signify.
+
+With both passes on the same model, escalating would be a second identical paid
+call for an identical answer, so the ladder is skipped when
+`modelPass1 === modelPass2`. The machinery is retained rather than deleted —
+setting `AI_MODEL_PASS1` back to `claude-haiku-4-5` restores the two-pass ladder
+with no code change, because the guard is a comparison rather than a flag.
+D-12's escalation-rate figure now reads 0% by construction, which is honest
+rather than broken.
+
+### Validation flags are acknowledgeable (migration `0006`)
+
+**`validation_flags` had no dismissal path at all.** `dismissMissingField`
+handles `missing_fields`; nothing handled these. A flag could only be cleared by
+editing the numbers until they agreed — on a receipt that genuinely does not
+reconcile, that means inventing a line item that is not on the paper. Until
+then the receipt sat in the review queue permanently with a warning nobody could
+act on.
+
+`receipts.acknowledged_flags` is the counterpart of `dismissed_fields`, with the
+same lifecycle: subtracted when flags are recomputed, preserved across an
+automatic re-run, cleared by a manual re-extract because asking the model to
+read the receipt again is a request for a fresh opinion.
+
+**The subtraction happens inside `runSanityChecks`, and that is the whole
+design.** Removing the flag alone would not have worked — `receipts.update`
+recomputes flags on every edit, so an acknowledgement that is not subtracted
+there lasts exactly until the next keystroke. Deriving the STATUS from the
+filtered list is what makes it mean something: `NEEDS_REVIEW_SQL` reads
+`extraction_status <> 'ok'`, so an acknowledgement that cleared the badge but
+left the status `partial` would have hidden the warning and left the receipt in
+the queue — the same bug, somewhere less visible. Both are asserted.
+
+`packages/api/src/routers/validationFlags.test.ts` reproduces the Safelite
+receipt to the cent, and `extract.test.ts` covers the preserved-then-cleared
+lifecycle.
 
 ## The automatic receipt email had never worked (D-44 follow-up)
 

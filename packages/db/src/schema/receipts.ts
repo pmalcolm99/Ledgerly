@@ -98,6 +98,25 @@ export const receipts = pgTable(
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
+    // Validation flags the user has looked at and asserted are correct anyway.
+    // The `validation_flags` counterpart of `dismissed_fields`, added because
+    // there was no way at all to clear one — a receipt that genuinely does not
+    // reconcile sat in the review queue permanently, and the only "fix" on
+    // offer was to edit the numbers until they agreed, i.e. to invent data.
+    //
+    // The case that forced it: a discounted receipt whose printed subtotal
+    // already has the discount applied, read by a model that then subtracts it
+    // a second time. The arithmetic check is doing exactly its job; the input
+    // is what is wrong, and the user cannot correct it from the paper.
+    //
+    // Same lifecycle as dismissed_fields: subtracted when flags are recomputed
+    // (`runSanityChecks`'s `acknowledgedFlags`), preserved across an automatic
+    // re-run, and cleared by a *manual* re-extract, because asking the model to
+    // read the receipt again is a request for a fresh opinion.
+    acknowledgedFlags: text("acknowledged_flags")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
 
     userNotes: text("user_notes"),
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
