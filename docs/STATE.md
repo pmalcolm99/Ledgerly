@@ -204,7 +204,7 @@ demonstrated rather than argued:
 
 ### Verification
 
-**781 unit tests**, up from 670. `pnpm build` still traces
+**794 unit tests**, up from 670. `pnpm build` still traces
 `sharp`/`bullmq`/`ioredis` — and now `cron-parser` — into
 `.next/standalone/node_modules`.
 
@@ -231,6 +231,77 @@ compose mode drives `docker compose` from outside the container and it needs
 `python3`, which ARCHITECTURE.md §8.1 explicitly drops from that image. An
 operator reaches it from a checkout — which is how they got `docker-compose.yml`
 in the first place.
+
+## Discounts, round two — the prompt was the bug
+
+Sonnet did not fix it, and a second real receipt showed why: **the prompt was
+telling the model to do the wrong thing.** It said credits, refunds, discounts
+and coupons "are NEGATIVE amounts … Include them as line items; do not skip
+them", unconditionally. That is right for one layout and wrong for another, and
+the rule did not distinguish them.
+
+The Lowe's receipt:
+
+```
+295429 GRACO MAGNUM X5      360.05      <- ALREADY the net price
+   379.00 DISCOUNT EACH    -18.95       <- explains the line above
+110249 SCTCH BLUE           33.23           (34.98 - 1.75)
+3487097 PS 12-CT            22.78           (23.98 - 1.20)
+SUBTOTAL: 416.06   TAX: 30.16   TOTAL: 446.22
+TOTAL SAVINGS THIS TRIP: $21.90
+```
+
+360.05 + 33.23 + 22.78 = 416.06. The receipt reconciles perfectly. Read with
+each `DISCOUNT EACH` sub-line as its own item, the items sum to 394.16 — short
+by exactly 21.90, which the receipt itself prints at the bottom as TOTAL
+SAVINGS. The discount was applied twice: once by the store, once by us.
+
+Note this is the OPPOSITE error from Safelite, where the subtotal was the wrong
+number and the items were right. Same symptom, same flag, different cause —
+which is the argument for not fixing either one by pattern-matching the
+symptom.
+
+### The prompt now teaches the structure, not a rule
+
+Two layouts, named and distinguished: a discount that **modifies the line above
+it** (the printed price is already net — emit one item, no separate negative
+row) versus a discount on **its own line** applied to the order (a whole-order
+coupon — emit it negative). And the test that settles which one you are looking
+at, which the model can run on its own output: **the line totals must add up to
+the subtotal.** If the sum falls short by exactly the discounts emitted, they
+have been counted twice.
+
+`anthropicRequest.test.ts` pins both halves. The rule was previously one
+sentence saying "always"; flattening it back would reintroduce the bug, so the
+distinction is asserted rather than left to a comment.
+
+### And a corrective re-read, because a prompt only covers what someone thought of
+
+When pass 1's own line items do not sum to its own subtotal, the receipt is
+read once more with the discrepancy quoted back: _"the line items you returned
+sum to 394.16, but you reported a subtotal of 416.06 — a difference of
+21.90."_
+
+This is deliberately NOT escalation and is not gated on the model differing.
+Escalation answers "the model could not read something", and re-running the
+same model blind returns the same answer. This answers "the model read
+something that cannot be true" and hands it new information, which is worth a
+call even when both passes are the same model.
+
+Three properties, each tested:
+
+- **At most one retry**, only when the numbers disagree.
+- **The retry's answer is kept only if it actually reconciles.** Two readings
+  that both fail to add up are not better than one, and preferring the newer one
+  would make the outcome depend on which wrong answer arrived last.
+- **It can never lose a receipt.** A throw in the second opinion is caught and
+  the first reading stands — extraction has already succeeded and been paid for.
+
+One bug caught by the existing suite while writing it: the reconciliation check
+mapped straight over `input.items`, which is model output and may contain a
+null entry. `drops a malformed item instead of crashing on it` failed
+immediately. `pricedItems` is defensive now, which is this file's standing
+posture (the `undefined`-vs-null lesson from the first real extraction run).
 
 ## Discounts, and a warning nobody could clear
 

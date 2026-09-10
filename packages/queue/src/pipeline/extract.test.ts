@@ -373,6 +373,200 @@ describe("processReceiptExtraction", () => {
     expect(row!.extractionStatus).toBe("partial");
   });
 
+  /**
+   * The Lowe's receipt, to the cent.
+   *
+   *   295429 GRACO MAGNUM X5      360.05      <- already the NET price
+   *      379.00 DISCOUNT EACH    -18.95      <- explains the line above
+   *   110249 SCTCH BLUE           33.23
+   *      34.98 DISCOUNT EACH      -1.75
+   *   3487097 PS 12-CT            22.78
+   *      23.98 DISCOUNT EACH      -1.20
+   *   SUBTOTAL: 416.06   TAX: 30.16   TOTAL: 446.22
+   *
+   * 360.05 + 33.23 + 22.78 = 416.06, so the receipt reconciles perfectly. Read
+   * with each DISCOUNT EACH sub-line as its own item, the items sum to 394.16
+   * — short by exactly 21.90, the "TOTAL SAVINGS THIS TRIP" printed at the
+   * bottom.
+   */
+  const LOWES_MISREAD = {
+    merchant_name: "LOWE'S HOME CENTERS, LLC",
+    merchant_address: "1200 EAST CYPRESS AVENUE, REDDING, CA 96002",
+    merchant_phone: "(530) 351-0181",
+    transaction_date: "2026-09-06",
+    transaction_time: null,
+    subtotal: "416.06",
+    sales_tax: "30.16",
+    tip: null,
+    total: "446.22",
+    card_last4: null,
+    payment_method: null,
+    confidence: 0.93,
+    items: [
+      {
+        description: "GRACO MAGNUM X5",
+        quantity: "1",
+        unit_price: "379.00",
+        line_total: "360.05",
+        category: "tools-equipment",
+      },
+      {
+        description: "DISCOUNT EACH",
+        quantity: "1",
+        unit_price: "-18.95",
+        line_total: "-18.95",
+        category: "tools-equipment",
+      },
+      {
+        description: "SCTCH BLUE 1.41 PAINTRS T",
+        quantity: "1",
+        unit_price: "34.98",
+        line_total: "33.23",
+        category: "tools-equipment",
+      },
+      {
+        description: "DISCOUNT EACH",
+        quantity: "1",
+        unit_price: "-1.75",
+        line_total: "-1.75",
+        category: "tools-equipment",
+      },
+      {
+        description: "PS 12-CT 9X12 PLSTC DC",
+        quantity: "1",
+        unit_price: "23.98",
+        line_total: "22.78",
+        category: "tools-equipment",
+      },
+      {
+        description: "DISCOUNT EACH",
+        quantity: "1",
+        unit_price: "-1.20",
+        line_total: "-1.20",
+        category: "tools-equipment",
+      },
+    ],
+  };
+
+  /** The same receipt read correctly: net prices, no separate discount rows. */
+  const LOWES_CORRECT = {
+    ...LOWES_MISREAD,
+    items: [
+      {
+        description: "GRACO MAGNUM X5",
+        quantity: "1",
+        unit_price: "379.00",
+        line_total: "360.05",
+        category: "tools-equipment",
+      },
+      {
+        description: "SCTCH BLUE 1.41 PAINTRS T",
+        quantity: "1",
+        unit_price: "34.98",
+        line_total: "33.23",
+        category: "tools-equipment",
+      },
+      {
+        description: "PS 12-CT 9X12 PLSTC DC",
+        quantity: "1",
+        unit_price: "23.98",
+        line_total: "22.78",
+        category: "tools-equipment",
+      },
+    ],
+  };
+
+  it("re-reads a receipt whose items do not sum to the subtotal, and keeps the correction", async () => {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    const receiptId = await insertReceiptWithRender(project.id);
+
+    const client = fakeClient([{ input: LOWES_MISREAD }, { input: LOWES_CORRECT }]);
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    // Two calls: the first reading, then one corrective re-read.
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    // The retry carried the discrepancy back to the model.
+    const retryRequest = vi.mocked(client.messages.create).mock.calls[1]?.[0] as {
+      messages: { content: { type: string; text?: string }[] }[];
+    };
+    const hint = retryRequest.messages[0]?.content.find((c) =>
+      c.text?.includes("does not reconcile"),
+    );
+    expect(hint?.text).toContain("394.16");
+    expect(hint?.text).toContain("416.06");
+    expect(hint?.text).toContain("21.90");
+
+    const items = await db.select().from(receiptItems).where(eq(receiptItems.receiptId, receiptId));
+    expect(items).toHaveLength(3);
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row!.validationFlags).toEqual([]);
+    expect(row!.extractionStatus).toBe("ok");
+  });
+
+  it("keeps the FIRST reading when the re-read still does not reconcile", async () => {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    const receiptId = await insertReceiptWithRender(project.id);
+
+    // Both readings are wrong; the second is wrong differently.
+    const alsoWrong = {
+      ...LOWES_MISREAD,
+      items: [LOWES_MISREAD.items[0]!, LOWES_MISREAD.items[1]!],
+    };
+    const client = fakeClient([{ input: LOWES_MISREAD }, { input: alsoWrong }]);
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    // Six items, not two: two readings that both fail to add up are not better
+    // than one, so the original stands rather than the most recent.
+    const items = await db.select().from(receiptItems).where(eq(receiptItems.receiptId, receiptId));
+    expect(items).toHaveLength(6);
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row!.validationFlags).toContain("arithmetic_mismatch_items");
+  });
+
+  it("does not re-read a receipt that already adds up", async () => {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    const receiptId = await insertReceiptWithRender(project.id);
+
+    const client = fakeClient([{ input: LOWES_CORRECT }]);
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    expect(client.messages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("survives a corrective re-read that throws, keeping the first reading", async () => {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    const receiptId = await insertReceiptWithRender(project.id);
+
+    let call = 0;
+    const client = {
+      messages: {
+        create: vi.fn(async (...args: unknown[]) => {
+          call += 1;
+          if (call === 1) {
+            return (
+              fakeClient([{ input: LOWES_MISREAD }]).messages.create as (
+                ...a: unknown[]
+              ) => Promise<unknown>
+            )(...args);
+          }
+          throw new Error("network down");
+        }),
+      },
+    } as unknown as AnthropicMessagesClient;
+
+    // A receipt that extracted successfully must not be lost to a failure in
+    // an optional second opinion.
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row!.extractionStatus).toBe("partial");
+    expect(row!.validationFlags).toContain("arithmetic_mismatch_items");
+    expect(row!.total).toBe("446.22");
+  });
+
   /** With pass 1 and pass 2 on the same model (the D-12-amended default),
    *  escalating would be a second identical paid call for an identical answer. */
   it("does not escalate when both passes are the same model", async () => {

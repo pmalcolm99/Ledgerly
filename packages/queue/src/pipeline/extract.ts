@@ -5,7 +5,7 @@ import { and, eq, isNull } from "drizzle-orm";
 import { aiUsage, categories, receiptItems, receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
 
-import { buildExtractionRequest } from "./anthropicRequest";
+import { arithmeticHint, buildExtractionRequest } from "./anthropicRequest";
 import {
   normalizeConfidence,
   normalizeDate,
@@ -18,6 +18,8 @@ import { buildRecordReceiptTool } from "./schema";
 import type { RecordReceiptInput, RecordReceiptItemInput } from "./schema";
 import { normalizeCardLast4, scrubLuhnSequences } from "./scrub";
 import { runSanityChecks } from "./validate";
+import { itemsReconcile } from "@ledgerly/shared/receiptValidation";
+import { formatMoney } from "@ledgerly/shared/money";
 import type { ValidationInput } from "./validate";
 
 /**
@@ -189,9 +191,10 @@ async function runPass(params: {
   receiptId: string;
   pass: number;
   escalated: boolean;
+  hint?: string;
 }): Promise<PassResult> {
-  const { db, client, model, imageBytes, tool, receiptId, pass, escalated } = params;
-  const request = buildExtractionRequest(model, imageBytes, tool);
+  const { db, client, model, imageBytes, tool, receiptId, pass, escalated, hint } = params;
+  const request = buildExtractionRequest(model, imageBytes, tool, hint);
   const startedAt = Date.now();
 
   let response: Anthropic.Message;
@@ -250,6 +253,94 @@ async function runPass(params: {
 
   await recordUsage(db, { ...usageRow, ok: true });
   return { model, input: scrubbed, rawScrubbed: scrubbed };
+}
+
+/**
+ * The line totals from a model response, defensively.
+ *
+ * `items` is model output, so an entry can be null or missing `line_total`
+ * entirely — this file's whole posture is to not trust its shape (the
+ * `undefined`-vs-null lesson from the first real extraction run). An earlier
+ * version of the reconciliation check mapped straight over the array and
+ * crashed on a null item, which the "drops a malformed item" test caught.
+ */
+function pricedItems(input: RecordReceiptInput): { lineTotal: string | null }[] {
+  return (Array.isArray(input.items) ? input.items : [])
+    .filter((item): item is NonNullable<(typeof input.items)[number]> => item != null)
+    .map((item) => ({ lineTotal: item.line_total ?? null }));
+}
+
+/**
+ * Re-reads the receipt once, quoting the model its own failed arithmetic.
+ *
+ * Returns the retry's result only if it reconciles; otherwise the original
+ * stands. Two readings that both fail to add up are not better than one, and
+ * silently preferring the newer one would make the outcome depend on which
+ * wrong answer arrived last.
+ *
+ * Never throws. A receipt that extracted successfully must not be lost to a
+ * failure in an optional second opinion — the first reading is already good
+ * enough to persist, and `arithmetic_mismatch_items` will flag it for review
+ * exactly as it did before this existed.
+ */
+async function retryIfItemsDoNotReconcile(params: {
+  db: Database;
+  client: AnthropicMessagesClient;
+  previous: PassResult;
+  model: string;
+  imageBytes: Buffer;
+  tool: Anthropic.Tool;
+  receiptId: string;
+  escalated: boolean;
+}): Promise<PassResult> {
+  const { db, client, previous, model, imageBytes, tool, receiptId, escalated } = params;
+
+  const check = itemsReconcile({
+    subtotal: previous.input.subtotal ?? null,
+    items: pricedItems(previous.input),
+  });
+  if (!check || check.reconciles) return previous;
+
+  console.warn(
+    `[ledgerly] items do not reconcile receipt=${receiptId} ` +
+      `items=${formatMoney(check.itemsCents)} subtotal=${formatMoney(check.subtotalCents)} ` +
+      "— re-reading once with the discrepancy quoted back",
+  );
+
+  try {
+    const retry = await runPass({
+      db,
+      client,
+      model,
+      imageBytes,
+      tool,
+      receiptId,
+      pass: 2,
+      escalated,
+      hint: arithmeticHint({
+        itemsSum: formatMoney(check.itemsCents),
+        subtotal: formatMoney(check.subtotalCents),
+        difference: formatMoney(Math.abs(check.subtotalCents - check.itemsCents)),
+      }),
+    });
+
+    const after = itemsReconcile({
+      subtotal: retry.input.subtotal ?? null,
+      items: pricedItems(retry.input),
+    });
+    if (after?.reconciles) {
+      console.log(`[ledgerly] corrected reading reconciles receipt=${receiptId}`);
+      return retry;
+    }
+    // Kept as a log rather than a flag: `runSanityChecks` is about to raise
+    // `arithmetic_mismatch_items` on the persisted reading anyway, and the user
+    // can acknowledge it if the receipt genuinely does not add up.
+    console.warn(`[ledgerly] re-read still does not reconcile receipt=${receiptId}`);
+    return previous;
+  } catch (error) {
+    console.error(`[ledgerly] corrective re-read failed receipt=${receiptId}:`, error);
+    return previous;
+  }
 }
 
 function shouldEscalate(input: RecordReceiptInput, escalateBelow: number): boolean {
@@ -403,6 +494,36 @@ export async function processReceiptExtraction(
     } else {
       finalPass = pass1;
     }
+
+    // One corrective retry when the reading does not add up.
+    //
+    // Distinct from escalation, and deliberately not gated on the model
+    // differing: escalation answers "the model could not read something", and
+    // re-running the same model blind would produce the same answer. This
+    // answers "the model read something that cannot be true" and hands it the
+    // discrepancy, which is new information. That is why it is worth a call
+    // even when both passes are the same model.
+    //
+    // It exists because a prompt can only describe the receipt layouts someone
+    // thought of. The arithmetic check catches the ones nobody did — the
+    // Lowe's "379.00 DISCOUNT EACH -18.95" sub-line, whose net price is already
+    // on the item line above it, was read as a separate negative item and
+    // subtracted the discount twice. The gap was exactly the receipt's own
+    // printed TOTAL SAVINGS.
+    //
+    // Bounded: at most one retry, only when the numbers disagree, and the
+    // retry's answer is kept only if it actually reconciles — a second wrong
+    // reading must not replace a first wrong reading with more confidence.
+    finalPass = await retryIfItemsDoNotReconcile({
+      db,
+      client: anthropicClient,
+      previous: finalPass,
+      model: escalated ? modelPass2 : modelPass1,
+      imageBytes,
+      tool,
+      receiptId,
+      escalated,
+    });
   }
 
   const input = finalPass.input;

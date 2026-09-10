@@ -106,6 +106,36 @@ function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/**
+ * Whether the line items add up to the subtotal, within the same tolerance the
+ * `arithmetic_mismatch_items` check uses.
+ *
+ * Exported so the extraction pipeline can ask the question BEFORE it persists,
+ * and offer the model a corrective retry — `runSanityChecks` answers it after
+ * the fact, which is too late to do anything about.
+ *
+ * `null` when the question does not apply: no subtotal, or no priced items.
+ * A receipt with nothing to compare is not a receipt that failed to reconcile.
+ */
+export function itemsReconcile(input: {
+  subtotal: string | null;
+  items: { lineTotal: string | null }[];
+}): { reconciles: boolean; itemsCents: number; subtotalCents: number } | null {
+  if (input.subtotal === null) return null;
+  const lineTotals = input.items
+    .map((item) => item.lineTotal)
+    .filter((value): value is string => value !== null);
+  if (lineTotals.length === 0) return null;
+
+  const subtotalCents = parseMoney(input.subtotal);
+  const itemsCents = lineTotals.reduce((sum, value) => sum + parseMoney(value), 0);
+  return {
+    reconciles: Math.abs(itemsCents - subtotalCents) <= ITEMS_TOLERANCE_CENTS,
+    itemsCents,
+    subtotalCents,
+  };
+}
+
 export function runSanityChecks(input: ValidationInput): ValidationResult {
   const flags: ValidationFlag[] = [];
 
