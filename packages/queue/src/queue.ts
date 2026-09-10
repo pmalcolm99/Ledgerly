@@ -137,9 +137,39 @@ export function getReceiptEmailQueue(redisUrl: string): Queue {
  * So: the automatic send gets a stable id, because sending it twice is the one
  * thing the whole `receipt_email_sent_at` marker exists to prevent; an
  * on-demand send gets none at all, so every request is its own job.
+ *
+ * **The separator is a hyphen, and it is not a style choice.** BullMQ builds
+ * its Redis keys as `bull:<queue>:<jobId>` and REJECTS a custom id containing
+ * `:` — `add()` throws `Custom Id cannot contain :`. This function returned
+ * `${receiptId}:auto` from the day it was written, so every automatic enqueue
+ * threw, and `worker.ts` catches enqueue failures on purpose (a Redis hiccup
+ * must not fail an extraction that has already been paid for). The result was
+ * a feature that had never once worked, in a way nothing surfaced: manual
+ * sends were fine because they pass no id at all, and the only trace was one
+ * `console.error` per receipt in the container log.
+ *
+ * `assertUsableJobId` below is what stops the next id from doing it again.
  */
 export function autoEmailJobId(receiptId: string): string {
-  return `${receiptId}:auto`;
+  return assertUsableJobId(`${receiptId}-auto`);
+}
+
+/**
+ * Rejects a job id BullMQ will refuse, at the point it is built rather than at
+ * the point it is added.
+ *
+ * The failure this guards is not "the job errors" — it is "the job is never
+ * created and the caller has already decided that enqueue failures are not
+ * worth failing over". Anything that turns that into a loud, immediate,
+ * testable throw is worth the three lines.
+ */
+export function assertUsableJobId(jobId: string): string {
+  if (jobId.includes(":")) {
+    throw new Error(
+      `BullMQ job ids cannot contain ":" (got "${jobId}") — it is the Redis key separator.`,
+    );
+  }
+  return jobId;
 }
 
 /**

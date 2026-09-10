@@ -232,6 +232,46 @@ compose mode drives `docker compose` from outside the container and it needs
 operator reaches it from a checkout — which is how they got `docker-compose.yml`
 in the first place.
 
+## The automatic receipt email had never worked (D-44 follow-up)
+
+Reported from production: manual sends arrive and show in smtp2go; automatic
+ones never do, with the project toggle on.
+
+**`autoEmailJobId` returned `` `${receiptId}:auto` ``, and BullMQ refuses a
+custom job id containing `:`** — it is the Redis key separator in
+`bull:<queue>:<jobId>`, and `add()` throws `Custom Id cannot contain :`. So
+every automatic enqueue threw. `worker.ts` catches enqueue failures on purpose
+(a Redis hiccup must not fail an extraction that has already been paid for), so
+the throw was swallowed and the only trace was one `console.error` per receipt
+in the container log. `git log -S` confirms the id has had exactly one value
+since the D-44 commit: **the feature had never once worked.**
+
+The manual path was unaffected because it passes no job id at all, which is
+precisely what made the symptom read as "email works, but not automatically".
+
+### Why nothing caught it
+
+- **`autoEmailJobId` had no test of any kind** — not even a string assertion.
+- A string assertion would not have caught it anyway. The id is well-formed;
+  it is BullMQ that refuses it. Only adding a job to a REAL queue proves the
+  contract, and every other test in `packages/queue` injects a fake queue.
+- The D-44 verification exercised the on-demand path end to end and read the
+  null automatic marker as correct behaviour (see above). It was the bug.
+
+`packages/queue/src/autoEmailJobId.test.ts` now adds the real id to a real
+BullMQ queue and asserts a worker picks it up, and pins BullMQ's rejection of a
+colon so an upgrade that changed it would be visible. `assertUsableJobId`
+rejects a colon at id construction, so the next id cannot reintroduce this
+quietly.
+
+**The wider lesson, and it is the same one Phase 9 is built around:** the
+enqueue's catch was right to not fail the extraction, and wrong to be the only
+record. An automatic email that is never queued, skipped, or given up on leaves
+nothing in the product — no state on the receipt, nothing on the project page,
+nothing in the admin view. Diagnosing it required a person sitting beside
+another person watching an inbox. Making that outcome durable is the obvious
+follow-up and is not done yet.
+
 ## Email Receipts (D-44)
 
 Commit 3 of the post-Phase-8 batch, and the only genuinely new feature in it:
@@ -301,6 +341,11 @@ chunk, the containerised `receipt-email` worker starts and registers its queue
 in Redis, and **a receipt email was delivered end to end through smtp2go from
 that container** — settings saved from the admin screen, sent on demand from a
 receipt, audited, with the automatic-send marker correctly left null.
+
+**That last clause was the bug, recorded as a success.** The marker was null
+because the automatic send had never been attempted, not because it correctly
+declined to fire — and the verification only ever exercised the ON-DEMAND path.
+See "The automatic receipt email had never worked" below.
 
 ### Review — what was found and what was done
 
