@@ -60,10 +60,20 @@ export async function register(): Promise<void> {
     const { startEmailWorker } = await import("@ledgerly/queue/emailWorker");
     const emailWorker = await startEmailWorker(env.REDIS_URL);
 
+    // Phase 9's backup worker. Its own queue rather than a step anywhere
+    // else, and its boot sweep is what reconciles the nightly schedule from
+    // `app_config` into Redis — Redis is not in any backup, so after a
+    // `redis_data` loss an unregistered scheduler is the normal state.
+    const { startBackupWorker } = await import("@ledgerly/queue/backupWorker");
+    const backupWorker = await startBackupWorker(env.REDIS_URL);
+
     // D-19's graceful-shutdown wiring: stop accepting new jobs and let
     // in-flight ones finish on SIGTERM/SIGINT, rather than the process
     // being killed mid-job (`docker stop`, a rolling deploy).
     const { registerGracefulShutdown } = await import("@ledgerly/queue");
-    registerGracefulShutdown([extractWorker, ingestWorker, emailWorker], env.REDIS_URL);
+    registerGracefulShutdown(
+      [extractWorker, ingestWorker, emailWorker, backupWorker],
+      env.REDIS_URL,
+    );
   }
 }

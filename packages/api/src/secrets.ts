@@ -58,6 +58,19 @@ export const SECRET_KEYS = {
    *  decrypt, one atomic write — and no field of it can be left in the clear
    *  by someone adding a column later, because there are no columns. */
   smtp: "smtp_config",
+  /**
+   * Phase 9 (D-45). The nightly backup's cron pattern.
+   *
+   * Not a secret, and this is the one member of this union that isn't. It
+   * lives here because `app_config` has exactly one storage format and no
+   * plaintext column — adding one would be a migration and a second code path
+   * through this file to hold a value nobody needs protected. The consequence
+   * is real and is handled rather than ignored: a rotated `MASTER_KEY` makes
+   * the schedule unreadable, so `backupSchedule.ts` treats `undecryptable` as
+   * a first-class state and the admin card says so out loud instead of
+   * reporting "no schedule".
+   */
+  backupSchedule: "backup_schedule",
 } as const;
 export type SecretKey = (typeof SECRET_KEYS)[keyof typeof SECRET_KEYS];
 

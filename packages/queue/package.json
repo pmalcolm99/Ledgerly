@@ -13,7 +13,9 @@
     "./queue": "./src/queue.ts",
     "./pipeline/render": "./src/pipeline/render.ts",
     "./emailWorker": "./src/emailWorker.ts",
-    "./pipeline/email": "./src/pipeline/email.ts"
+    "./pipeline/email": "./src/pipeline/email.ts",
+    "./backupWorker": "./src/backupWorker.ts",
+    "./pipeline/backup": "./src/pipeline/backup.ts"
   },
   "scripts": {
     "lint": "eslint .",
@@ -36,6 +38,8 @@
   "devDependencies": {
     "@types/node": "^22.10.5",
     "@types/nodemailer": "^8.0.1",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.14.0",
     "typescript": "^5.7.2",
     "vitest": "^3.0.2"
   }

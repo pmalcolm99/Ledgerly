@@ -51,12 +51,47 @@ export type SendEmail = (params: {
   text: string;
 }) => Promise<void>;
 
+/** Enqueues a `backup` job against a `backups` row this package has already
+ * inserted (Phase 9). Injected for the same reason as the two above.
+ *
+ * The row is created first and the enqueue happens after, so a Redis failure
+ * leaves a visible `running` row rather than a backup nobody knows was asked
+ * for — `backupWorker.ts`'s boot sweep marks it `failed`, which is the honest
+ * outcome. `admin.createBackup` is the only caller. */
+export type EnqueueBackup = (params: {
+  backupId: string;
+  kind: "manual" | "scheduled";
+}) => Promise<void>;
+
+/** Registers, replaces, or removes the nightly backup's BullMQ job scheduler
+ * (task 9.3, whose acceptance criterion is that changing the cron in the UI
+ * reschedules without a restart — which is exactly what this capability buys).
+ * `null` removes the schedule.
+ *
+ * `app_config` remains the source of truth; this only reconciles Redis to it,
+ * and `backupWorker.ts` does the same reconciliation at boot, so a failure here
+ * is recoverable by restarting rather than being silently permanent. */
+export type RescheduleBackup = (cron: string | null) => Promise<void>;
+
+/** Reports what the backup scheduler in Redis currently holds, so
+ * `admin.backupStatus` can tell "a schedule is configured and registered" from
+ * "a schedule is configured and nothing is going to run it" — the second being
+ * the silent failure Phase 9 exists to prevent. */
+export type ReadBackupScheduleState = () => Promise<{
+  registered: boolean;
+  pattern: string | null;
+  nextRunAt: Date | null;
+}>;
+
 export type Context = {
   db: Database;
   user: AuthUser | null;
   enqueueReceiptExtract?: EnqueueReceiptExtract;
   enqueueReceiptEmail?: EnqueueReceiptEmail;
   sendEmail?: SendEmail;
+  enqueueBackup?: EnqueueBackup;
+  rescheduleBackup?: RescheduleBackup;
+  readBackupScheduleState?: ReadBackupScheduleState;
   /** Same injection reasoning as `enqueueReceiptExtract` above (Redis
    * lives behind `@ledgerly/queue`, which cannot be imported back into
    * this package). Used by `receipts.reextract` (review finding M-3) to
@@ -75,6 +110,9 @@ export async function createContext(opts: {
   enqueueReceiptExtract?: EnqueueReceiptExtract;
   enqueueReceiptEmail?: EnqueueReceiptEmail;
   sendEmail?: SendEmail;
+  enqueueBackup?: EnqueueBackup;
+  rescheduleBackup?: RescheduleBackup;
+  readBackupScheduleState?: ReadBackupScheduleState;
   rateLimitRedis?: RateLimitRedis;
 }): Promise<Context> {
   return {
@@ -83,6 +121,9 @@ export async function createContext(opts: {
     enqueueReceiptExtract: opts.enqueueReceiptExtract,
     enqueueReceiptEmail: opts.enqueueReceiptEmail,
     sendEmail: opts.sendEmail,
+    enqueueBackup: opts.enqueueBackup,
+    rescheduleBackup: opts.rescheduleBackup,
+    readBackupScheduleState: opts.readBackupScheduleState,
     rateLimitRedis: opts.rateLimitRedis,
   };
 }

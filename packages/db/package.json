@@ -10,7 +10,8 @@
     "./schema": "./src/schema/index.ts",
     "./client": "./src/client.ts",
     "./seed": "./src/seed.ts",
-    "./testHarness": "./src/testHarness.ts"
+    "./testHarness": "./src/testHarness.ts",
+    "./tables": "./src/tables.ts"
   },
   "scripts": {
     "lint": "eslint .",

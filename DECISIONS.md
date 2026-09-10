@@ -1418,3 +1418,95 @@ worse than one that is slightly softer.
 every other field on `projects.update`, which audits nothing for an ordinary
 edit. It decides where financial data goes, and "who turned this on" is a
 question someone will eventually need answered.
+
+---
+
+## D-45 — Backups are a queue job; the schedule lives only in `app_config`; the download is a separate route. **Settled** (user decision).
+
+**Context.** Phase 9 (`docs/PHASES.md` 9.1–9.7, `ARCHITECTURE.md` §8.3). Three
+points in the phase brief diverged from what the earlier documents specified,
+and each was put to the user rather than resolved by picking a side.
+
+**The cron lives ONLY in `app_config`.** The brief said "time configurable via
+env"; `ARCHITECTURE.md` §8.3, `docs/SCHEMA.md` §app_config and task 9.3 all said
+`app_config`, with 9.3's acceptance being "changing the cron in the UI
+reschedules without a restart". The documents win. There is no
+`BACKUP_SCHEDULE` environment variable, and a fresh instance has no scheduled
+backup until someone sets one — which the admin card states in a warning
+callout, because "nothing is scheduled" is exactly the silent state this phase
+exists to make loud.
+
+**Consequence.** `SECRET_KEYS` gains `backup_schedule`, and it is the one member
+of that closed union that is not a secret. It is encrypted because `app_config`
+has one storage format and no plaintext column (`value_encrypted bytea NOT
+NULL`); adding one would be a migration and a second code path through
+`secrets.ts` to hold a cron string. The real cost is that a rotated
+`MASTER_KEY` makes the schedule unreadable, so `backupSchedule.ts` treats
+`undecryptable` as a first-class state — as `smtp.ts` does — and the card says
+so out loud rather than reporting "no schedule".
+
+**Consequence.** `admin.backupStatus` reports the cron's own next-fire time and
+the BullMQ scheduler's separately. They agree in every healthy state; the case
+where they do not — a cron configured with no scheduler registered — is
+rendered as an error. Redis holds the scheduler and no backup restores Redis,
+so after a `redis_data` loss that is the ordinary state, not an exotic one. A
+`null` scheduler reading ("we could not ask") is deliberately distinct from
+`registered: false` ("we asked, and nothing is there").
+
+**The job writes the archive; the download is a separate route.** "Back up now"
+enqueues against a `backups` row inserted in the same transaction as its audit
+entry; the row goes `running` → `complete`; the card then triggers a streamed
+download of the finished artifact, and every retained backup gets its own
+Download button. A tee-while-writing design was considered and rejected: the
+manifest checksums the dump, so the dump must be finalised before the archive
+can be described — a streaming version would have to either omit the checksums
+or lie about them — and a client disconnecting mid-download must not be able to
+damage the on-disk copy.
+
+**Consequence.** `GET /api/admin/backups/[id]/download` is a Route Handler for
+the same reason upload, image serving and export are: tRPC speaks JSON over
+superjson and cannot stream a binary body. It follows the _images_ handler
+rather than the export handler, because the artifact already exists with a
+known size, so it sends `content-length`. `backups.path` is never returned by
+any procedure; the route takes a row id and resolves the path server-side, then
+asserts the resolved path is inside `BACKUPS_DIR` after `realpath` — defence in
+depth against a row edited in the database or a symlink planted in the volume,
+not input validation.
+
+**`scripts/restore.sh` targets both the compose stack and an arbitrary
+`--database-url`.** The second form is what the Phase 9 drill uses, so the drill
+exercises the shipped script rather than a hand-run `pg_restore`. It validates
+every member file against `manifest.json`'s SHA-256 before touching a database
+and refuses on a mismatch, with `--ignore-checksum` as an explicitly-named
+escape hatch for the disaster where a damaged archive is all that exists; it
+refuses a non-empty target without `--force`, printing what it found; and it
+handles the schema-version case in words — a backup older than the checkout is
+migrated forward, a backup newer than it is refused, because migrations are
+forward-only and there is nothing honest to do.
+
+**Consequence.** The script is **not** copied into the runner image, contrary to
+the first sketch of this plan. Its compose mode drives `docker compose` from
+outside the container, and it needs `python3`, which the runner image
+deliberately does not have (`ARCHITECTURE.md` §8.1 drops it along with Chromium
+and ffmpeg). An operator reaches it from a checkout — which is how they got
+`docker-compose.yml` in the first place.
+
+**`app_config` is NOT exported as a separate `app_config.json`**, contrary to
+`ARCHITECTURE.md` §8.3's original list. `pg_dump --format=custom` already
+contains the table with its values still encrypted; a second copy would be a
+second thing that can disagree with the first. Forkd wrote one because its
+restore path re-applied those rows by upsert
+(`docs/reference/FORKD_INFRA.md`); ours restores them with the dump.
+
+**Consequence.** Forkd's 10 GB hard cap on total backup size is deliberately not
+ported. `BACKUP_RETENTION_DAYS` is what the brief asks for and what the schema
+documents. If an instance ever grows large enough that thirty days of archives
+is the disk problem, this is the decision to revisit — and a cap that
+soft-deletes the oldest is a small addition to `pruneBackups`.
+
+**Consequence, accepted.** The outer archive is gzipped even though `db.dump`
+arrives already zlib-compressed from pg_dump's custom format and `uploads.tar`
+holds pre-compressed WebP. It earns little on that content; `.tgz` is the shape
+every operator and runbook expects, and `manifest.json` does compress. If backup
+duration ever becomes the complaint, that is the line to revisit — not the
+checksums.

@@ -11,10 +11,18 @@ cert.pem
 .cloudflared/
 tunnel-*.json
 
-# Application data -- receipts live here, never in git
-data/
-uploads/
-backups/
+# Application data -- receipts live here, never in git.
+#
+# ANCHORED to the repo root with a leading slash, and that is load-bearing: an
+# unanchored `backups/` matches a directory of that name at ANY depth, which
+# silently swallowed `apps/web/src/app/api/admin/backups/` — the whole backup
+# download route and its tests — when Phase 9 added it. The feature would have
+# been committed without the endpoint its button calls, and nothing would have
+# failed until someone pressed it. These three only ever meant the volumes at
+# the root.
+/data/
+/uploads/
+/backups/
 *.sqlite
 *.sqlite3
 *.db

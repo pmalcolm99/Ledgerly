@@ -4,23 +4,218 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-Phase 8 — Export, plus two follow-up requests (D-39 admin-settable Claude API
-key, D-40 the new app icon). **Code complete and reviewed.** Data leaves the system for
-the first time: `GET /api/projects/[id]/export?format=xlsx|csv` streams a
-three-sheet workbook (Line Items, Receipts, Summary) or the line-item sheet as
-CSV, respecting whatever filter is on the dashboard, audited on the way out.
-The dashboard's Export button is wired.
+**Phase 9 — Backup and restore. Complete, reviewed, and GATED.** The gate is
+"the restore drill succeeds on a scratch database", and it did — the numbers are
+below and in `docs/private/PHASE9_RESTORE_DRILL.md` (gitignored).
 
-**Not yet gated.** Phase 8's gate is "opens clean in Excel and the totals
-reconcile" — the reconciliation half is asserted programmatically (the suite
-reads the written file back and sums both sheets in integer cents), but
-"opens clean in Excel" is a manual check only you can make; there is no Excel
-here. Two sample workbooks were generated for it and are in `docs/private/`
-(gitignored). See "Blocked / open questions".
+Phase 8's gate stays half-closed on the Excel half, Phase 7's on the on-device
+check, and Phase 6's on the two live-API tasks (6.3, 6.12) that need a real
+`ANTHROPIC_API_KEY`; D-12 stays Provisional. All three are unchanged by this
+phase and still listed under "Blocked / open questions".
 
-Phase 7 remains ungated for its own reason (usable on your phone through the
-tunnel), and Phase 6 for its (tasks 6.3 and 6.12 need a real
-`ANTHROPIC_API_KEY`); D-12 stays Provisional.
+## Phase 9 — Backups (D-45)
+
+Almost all of the scaffolding was already in place: the `backups` table and its
+two enums shipped in migration `0000`, `BACKUPS_DIR`/`BACKUP_RETENTION_DAYS`/
+`BACKUP_INCLUDE_IMAGES` were in `packages/config` since Phase 2, the
+`app_backups` volume and `postgresql17-client`+`tar` were in the compose file
+and the image from the start, and `admin.backups` existed as a read-only query
+behind a **disabled** "Backups arrive in phase 9" button. **Phase 9 needed no
+migration.** It is the job, the schedule, the download, the script and the
+drill.
+
+### The three decisions, all put to you first (D-45)
+
+1. **The cron lives only in `app_config`**, not in the environment. The brief
+   said "configurable via env"; ARCHITECTURE.md §8.3, docs/SCHEMA.md and task
+   9.3's acceptance ("reschedules without a restart") all said `app_config`, and
+   the documents won. There is no `BACKUP_SCHEDULE` variable, and `.env.example`
+   says so explicitly so its absence reads as a decision rather than an
+   oversight.
+2. **The job writes the archive; the download is a separate route.** A
+   tee-while-writing design was rejected because the manifest checksums the
+   dump — the dump has to be finalised before the archive can be described, so
+   a streaming version would have to omit the checksums or lie about them.
+3. **`scripts/restore.sh` targets both** the compose stack and an arbitrary
+   `--database-url`. The drill uses the second form, so **the drill exercises
+   the shipped script** rather than a hand-run `pg_restore`.
+
+### The shape, and why
+
+**Failure is loud by construction, because that is the whole point.** A backup
+system that fails silently is worse than none: it manufactures confidence. So
+every way this can quietly stop working has a visible surface — a reason code on
+the row and a `console.error` from the worker's `failed` handler; a boot sweep
+that marks any row still `running` after a restart as `INTERRUPTED` (a backup
+cannot survive a restart, so such a row is by definition orphaned) and deletes
+`.part`/`.staging` debris; an `undecryptable` schedule reported as itself rather
+than as "not configured"; and a **"configured but not registered"** callout for
+the case where `app_config` holds a cron and Redis holds no scheduler. That last
+one is not exotic: **Redis is not in any backup**, so it is the normal state
+after a `redis_data` loss.
+
+**`admin.backupStatus` reports the two next-run figures separately** — the one
+computed from the stored cron, and the one BullMQ's scheduler actually holds.
+They agree in every healthy state; the case where they disagree is the finding.
+A `null` scheduler reading ("we could not ask") is deliberately distinct from
+`registered: false` ("we asked, and nothing is there"), because the UI must
+raise an alarm on the second and not the first.
+
+**The archive is written under `.part` and renamed on success.**
+`docker-compose.yml` sets `stop_grace_period: 30s` and a real `pg_dump` with
+images can outlive it, so SIGKILL mid-`tar` is reachable, not theoretical. A
+truncated file that looks like a backup is worse than no file.
+
+**The database password never enters argv.** `pgEnvAndFlags` passes host, port,
+user and database as flags and the password in the child's `PGPASSWORD`, because
+argv is world-readable through `/proc/<pid>/cmdline` — a `postgres://user:pass@`
+URI there would put the password in front of anything that can run `ps` in the
+container.
+
+**Row counts come from ONE query.** Counting table by table would let a
+concurrent upload land between two counts and produce a manifest whose numbers
+cannot all be true at once — and the manifest's entire job is to be the thing a
+restore is checked against. The table list is **derived from the drizzle schema**
+(`packages/db/src/tables.ts`) rather than hand-written, so a table added in a
+later phase cannot silently stop being counted while the manifest keeps
+reporting a clean match.
+
+**The schema version is read from `drizzle.__drizzle_migrations`** — what is
+actually applied to the database being dumped, not what the repo happens to
+contain. That is what lets `restore.sh` tell an old backup from a new one and
+migrate forward instead of failing in a SQL error twenty statements deep.
+
+**Retention unlinks the file before it soft-deletes the row.** A crash between
+the two then leaves a row claiming a file that is gone — visible in the admin
+view, which already computes `hasArtifact` from `path IS NOT NULL`, and
+harmless. The other order leaves a file no row admits to: invisible, never
+pruned again, and it fills the disk.
+
+**`backups.path` never reaches a client.** The download route takes a row id,
+resolves the path server-side, and asserts the resolved path is inside
+`BACKUPS_DIR` after `realpath` — defence in depth against a row edited in the
+database or a symlink planted in the volume, not input validation. Owner-only,
+and **404 for a non-owner, byte-identical to the 404 for a nonexistent backup**,
+so the endpoint cannot be used to count how many backups this instance has.
+
+### The restore drill (task 9.6) — the gate
+
+Seven drills, all against `ledgerly-test-db`, never the application database.
+Full detail in `docs/private/PHASE9_RESTORE_DRILL.md`.
+
+**Drill 1 — the gate.** A source database with 3 users, 3 projects (one
+archived), 5 membership rows, 24 receipts across every `extraction_status`, 40
+line items, 10 `ai_usage` rows, 8 `audit_log` rows, an encrypted `app_config`
+row, and a 40-file uploads tree. Backed up by the real pipeline with
+`BACKUP_INCLUDE_IMAGES=true`, restored into a scratch database **by the shipped
+script**:
+
+```
+  ok  ai_usage 10   app_config 1   audit_log 8    backups 2
+  ok  categories 15 instance_state 1 project_members 5
+  ok  projects 3    receipt_items 40 receipts 24   users 3
+  ok  images 40
+==> restore verified against the manifest
+```
+
+`backups` reads 2, not 1, because the manifest counts rows at dump time and the
+backup's own `running` row is in the dump. Correct, and worth stating before
+someone reads it as an off-by-one.
+
+Row counts prove nothing about contents, so the drill went further: an
+`md5(string_agg(t::text))` over **all ten data tables** matches source-to-restore
+on every one; `sum(total)` = **2828.08** and `sum(line_total)` = **1000.00** on
+both sides; the status distribution (`pending=4 ok=12 partial=4 failed=4`) is
+identical; 13 foreign keys, 32 indexes, 16 enum values and 11 check constraints
+survive; the encrypted `app_config` row restores as ciphertext byte for byte;
+and `diff -r` over the two uploads trees is clean.
+
+**Drills 2–7, the refusals** — all pass:
+
+| #   | Drill                                | Outcome                                                                                                                                                                        |
+| --- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2   | Non-empty target, no `--force`       | Refused, and printed what it found (11 tables, 24 receipts, 3 users) before declining                                                                                          |
+| 3   | One byte flipped in `db.dump`        | Checksum mismatch, refused **before touching the database** — and refused even with `--force`, since `--force` covers a non-empty target, not a damaged archive                |
+| 4   | Backup at migration 5, checkout at 6 | Said so plainly, migrated forward, and `receipt_email_sent_at` arrived                                                                                                         |
+| 5   | Backup at migration 7, checkout at 6 | Refused — migrations are forward-only, so there is nothing honest to do                                                                                                        |
+| 6   | `--force` / `--ignore-checksum`      | Both do what they say; `--ignore-checksum` warns twice in the loudest wording the script has                                                                                   |
+| 7   | Compose mode against the live stack  | Detected the running `db`, read `.env` without sourcing it, found the real database (7 receipts, 2 users) and refused. **Read-only — its write path was deliberately not run** |
+
+The production image was checked directly rather than assumed: `pg_dump
+(PostgreSQL) 17.11` on `PATH` inside `ledgerly-webapp-1`, `/app/backups` owned
+by and writable by `node`.
+
+**And the drill is now a standing test.** `pipeline/backupRoundTrip.test.ts`
+takes a real `pg_dump` and restores it into a freshly created scratch database
+**by running `scripts/restore.sh`** — the shipped script, from a directory that
+is not the repo root — then asserts the row counts equal the manifest. Two more
+cases assert it REFUSES a damaged archive and a manifest shape it does not
+understand, which are the outcomes that actually protect anyone. So the gate
+does not decay back into a hypothesis after this session. It skips, loudly on stderr, when the client
+tools are absent or when `pg_dump` is older than the server (which it refuses
+outright). `backupScheduler.test.ts` covers task 9.3's acceptance against a real
+Redis: a second `upsertJobScheduler` **replaces** rather than accumulating, so
+changing the cron reschedules without a restart.
+
+### Review — what was found and what was done
+
+The `reviewer` pass found **2 high, 9 medium and 8 low**, and separately traced
+clean: credential handling through every error, log, audit row and `failedReason`
+path (verified empirically, not read — a rejected `pg_dump` carries host, port,
+user and database but no password, through the whole `[cause]` chain); the
+download route's 404-not-403 uniformity and its `realpath` containment; `path`
+and `manifest` never reaching a client; every new procedure being
+`ownerProcedure`; the BullMQ jobId/`removeOn*` trap; `undecryptable` handling
+and both its recovery paths; and `appTableNames()` returning exactly the real
+tables. All 19 findings are fixed.
+
+Two of them are the phase's own thesis turned against it, and both were
+demonstrated rather than argued:
+
+| Sev      | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Fix                                                                                                                                                                                                                                                                                                                        |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **High** | **"Restore verified against the manifest" could be printed having verified nothing.** Both verification loops are `while … done < <(python3 …)` over `files` and `tables`; an empty or renamed list makes the body never run, the counters stay at zero, and the script reports success. Shown end to end with a plausible future `manifestVersion: 2`: zero files checksummed, zero tables counted, target wiped, declared verified.                                                                                                  | Refuse anything that is not `app: "ledgerly"` and `manifestVersion: 1`, refuse an empty `files` or `tables`, and assert afterwards that the number of entries actually checked equals the number listed. A verification step that silently degrades to a no-op is worse than none — it is the one line the operator reads. |
+| **High** | **The manifest's row counts described a different instant than the dump.** `pg_dump` takes its own snapshot; `countRows` ran afterwards in a separate transaction. One receipt uploaded during a nightly backup and four tables read high — with the bill arriving weeks later, mid-recovery, when `restore.sh` refuses to call a byte-perfect restore verified, after it has already overwritten the target.                                                                                                                          | One REPEATABLE READ READ ONLY transaction exports a snapshot, `pg_dump` is handed it via `--snapshot`, and the counts run inside that same transaction. Same instant by construction. The image count moved from a directory walk to a `tar -tf` of the finished archive, for the identical reason.                        |
+| Med      | **The boot sweep raced the worker that started it.** `autorun: true` meant a job left waiting by a `docker stop` was picked up immediately, so the sweep could delete the staging directory out from under a live `pg_dump` and mark its row `INTERRUPTED` — the sweep's "nothing is running, so anything here is debris" premise was simply false.                                                                                                                                                                                    | `autorun: false`, reconcile, then `worker.run()`. The only worker in the app built that way, and the comment says why.                                                                                                                                                                                                     |
+| Med      | **A stalled job wedged manual backups until a restart.** The `failed` handler returns early while attempts remain, on the assumption a retry is coming; BullMQ's stalled path fails a job without that being true, leaving the row `running` forever — CONFLICT on every press, button disabled, no way out short of a restart.                                                                                                                                                                                                        | Only a `running` row younger than `PG_DUMP_TIMEOUT_MS` blocks a new one. A dump cannot outlive its own timeout, so anything older is not running.                                                                                                                                                                          |
+| Med      | **Archives could orphan on the volume with nothing able to reclaim them.** `pruneBackups` ran inside the try after the row was already `complete`; a throw there failed the job, BullMQ retried, `ensureBackupRow` repointed the same row at a second archive — and the first was invisible to `pruneBackups` (which walks rows) and to `clearBackupWorkspace` (which only removes `.part`).                                                                                                                                           | Retention is housekeeping and now cannot fail the job: its own try/catch, outside everything.                                                                                                                                                                                                                              |
+| Med      | **A stale scheduler rendered as fully healthy.** `getBackupScheduleState` returns the scheduler's own `pattern` and `backupStatus` discarded it. Save the cron, have the reschedule fail on a Redis blip (which reports in success green, deliberately), and Redis keeps the OLD scheduler: `registered: true`, no callout, and a next-run computed from the new cron while backups run at the old time indefinitely.                                                                                                                  | The pattern travels, and the card renders a danger callout when it disagrees with the saved cron. The two next-run figures were collected separately for exactly this and were then never compared.                                                                                                                        |
+| Med      | **Nothing on the card noticed that backups had stopped happening.** "Next scheduled run" is always in the future because it is computed from the cron, and "Last backup" is a bare timestamp. A worker not consuming its queue, or a host off at 3am every night, produced a screen where every individual figure looked fine.                                                                                                                                                                                                         | An overdue callout: the cron's own period, doubled plus a day of slack, capped at the retention window. A nightly backup has to be three days late before it fires.                                                                                                                                                        |
+| Med      | **`scripts/restore.sh` put the database password in argv** — `psql "$URL"`, `pg_restore --dbname="$URL"` — undoing on the restore side exactly what `pgEnvAndFlags` exists to prevent on the backup side, in the example SETUP.md tells operators to type.                                                                                                                                                                                                                                                                             | Parsed once into `PGPASSWORD` plus `-h/-p/-U/-d`, mirroring `pgEnvAndFlags`, and unset from the shell afterwards.                                                                                                                                                                                                          |
+| Med      | **A relative `--uploads-dir` silently targeted the wrong directory.** `cd "$REPO_ROOT"` happens before argument parsing, so SETUP.md's own `./scratch-uploads` form resolved against the repo root — and that path is what `find … -delete` runs on and what the image count is then verified in, so it reported the restore verified having emptied somewhere else.                                                                                                                                                                   | Paths resolve against the invocation directory, captured before the `cd`. The confirmation prompt now names the uploads directory too — it was a recursive delete the operator was never shown.                                                                                                                            |
+| Med      | **Compose mode restored under a live webapp**, so `--clean`'s DROPs contended with live connections and the row-count check raced the `audit_log` writes those requests were making.                                                                                                                                                                                                                                                                                                                                                   | `docker compose stop webapp` first, `start` after, and an EXIT trap that brings it back if the restore dies partway. Plus a note about Redis holding pre-restore job state.                                                                                                                                                |
+| Med      | **`restore.sh` had no test at all**, contradicting its own header ("the thing that gets tested and the thing an operator reaches for at 2am are the same file") and D-45. The round-trip test reimplemented the restore with a direct `pg_restore` call.                                                                                                                                                                                                                                                                               | The round-trip test now RUNS the script — from a directory that is not the repo root, so the path bug above is covered — and two new cases assert it refuses a damaged archive and a manifest it does not understand.                                                                                                      |
+| Low ×8   | Prune could unlink a path outside `BACKUPS_DIR` (the download route guards the read direction; the delete direction did not); a sidecar that would not unlink skipped the soft-delete, so the row could never be pruned; `read_env` under `set -e` made its own `die` unreachable; `--help` printed one line; `createBackup` was a read-then-insert race; one-second archive names could clobber via `fs.rename`; `measureTree` counted symlinks where `restore.sh` counts `-type f`; the compose dump used a predictable `/tmp` path. | All fixed — containment guard, independent sidecar try, `                                                                                                                                                                                                                                                                  |     | true`, a real `--help`range,`pg_advisory_xact_lock` (`FOR UPDATE`locks nothing when nothing is running — the first-owner trap), the row id in the filename, regular files only, and`mktemp` in the container. |
+
+### Verification
+
+**761 unit tests**, up from 670. `pnpm build` still traces
+`sharp`/`bullmq`/`ioredis` — and now `cron-parser` — into
+`.next/standalone/node_modules`.
+
+`cron-parser` is a new direct dependency of `packages/api`, declared rather than
+borrowed from BullMQ's transitive tree, matching the sharp/bullmq/exceljs
+precedent. It is used for validation and next-run only; the scheduler itself is
+BullMQ's.
+
+**A `.gitignore` rule nearly shipped this feature without its endpoint.** The
+`backups/` line — meant for the backup volume at the repo root — is unanchored,
+so it matches a directory of that name at any depth, and it silently swallowed
+`apps/web/src/app/api/admin/backups/` with the entire download route and its
+twelve tests inside. `git status` showed a clean tree; `git status --ignored`
+(which `CLAUDE.md` requires before a first-time commit of a new directory, and
+which is the only reason this was caught) showed the directory as ignored. The
+download button would have shipped calling a 404, and CI would have agreed
+everything was fine because the tests were not in the repository either. `data/`,
+`uploads/` and `backups/` are now `/data/`, `/uploads/` and `/backups/`, which
+is what they always meant.
+
+One thing worth recording about the restore script: **it is deliberately not
+copied into the runner image**, contrary to the first draft of the plan. Its
+compose mode drives `docker compose` from outside the container and it needs
+`python3`, which ARCHITECTURE.md §8.1 explicitly drops from that image. An
+operator reaches it from a checkout — which is how they got `docker-compose.yml`
+in the first place.
 
 ## Email Receipts (D-44)
 
@@ -1276,10 +1471,22 @@ up -d`. All three containers healthy; `webapp`'s `next-server` runs as
 
 ## Next
 
-Phase 9 — Backups. `pg_dump` + optional image tarball, a manifest with
-checksums, a scheduled repeatable job, retention, and `scripts/restore.sh`.
-Its gate is a restore drill against a scratch database: a backup that has
-never been restored is a hypothesis.
+Phase 10 — Hardening and docs. Opens with a full security review against the
+brief §4 checklist, then `SETUP.md`/`DEPLOYMENT.md`/`README.md`, a secret sweep
+over full history, device testing, and the `v1.0.0` tag. Phase 9's restore
+procedure is written up under SETUP.md's "Backups" section already; 10.4 folds
+it into `DEPLOYMENT.md` alongside deploy/upgrade/rollback.
+
+Two things Phase 9 leaves for Phase 10 to pick up, both recorded honestly rather
+than quietly:
+
+- **`scripts/restore.sh`'s compose-mode write path has never been executed.**
+  Its refusal path has, against the live stack, and its direct-mode equivalent
+  is exercised by the drill and by CI — the two differ only in which shell the
+  commands run in. Closing it means restoring onto a throwaway stack.
+- **The "Back up now" button has not been pressed on a deployed image.** The
+  pipeline, worker, queue, API and download route are covered by tests and by
+  the drill; the button itself reaches production with the next deploy.
 
 Still outstanding from earlier phases: Phase 6's two live-API tasks (6.3,
 6.12), which need a real `ANTHROPIC_API_KEY`; Phase 7's on-device check; and
@@ -1478,6 +1685,12 @@ Decisions taken by the user this session:
 
 ## Surprises / notes
 
+- **An unanchored `.gitignore` directory rule matches at every depth.**
+  `backups/` was written for the volume at the repo root and quietly excluded
+  `apps/web/src/app/api/admin/backups/` in Phase 9 — a whole route plus its
+  tests, with a clean `git status` the entire time. Anchor directory rules that
+  mean "the one at the root" with a leading slash, and take `CLAUDE.md`'s
+  `git status --ignored` rule seriously: it is what caught this.
 - **The brief's atomic first-owner query does not work as written.**
   `SELECT ... WHERE role='owner' FOR UPDATE` locks the rows it returns, and on an
   empty users table that is none — so two concurrent first requests both see "no

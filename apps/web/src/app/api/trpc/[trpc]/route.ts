@@ -1,7 +1,14 @@
 import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { appRouter, createContext } from "@ledgerly/api";
 import { getEnv } from "@ledgerly/config/env";
-import { getReceiptEmailQueue, getReceiptExtractQueue } from "@ledgerly/queue/queue";
+import {
+  getBackupQueue,
+  getBackupScheduleState,
+  getReceiptEmailQueue,
+  getReceiptExtractQueue,
+  removeBackupSchedule,
+  upsertBackupSchedule,
+} from "@ledgerly/queue/queue";
 import { getRedisConnection } from "@ledgerly/queue/redis";
 import { sendOneEmail } from "@ledgerly/queue/emailWorker";
 
@@ -10,11 +17,12 @@ import { sendOneEmail } from "@ledgerly/queue/emailWorker";
  * from the raw headers and passes `ctx.user` down (D-24) — the middleware
  * attaches nothing and is not trusted.
  *
- * `enqueueReceiptExtract`, `enqueueReceiptEmail`, `sendEmail` and
- * `rateLimitRedis` are supplied here, not inside `packages/api` (`trpc.ts`'s
- * own comments explain why: `@ledgerly/queue` already depends on
- * `@ledgerly/api`, so the reverse import would be circular). This is the only
- * place in the app a tRPC procedure's queue/Redis side effects are wired up.
+ * `enqueueReceiptExtract`, `enqueueReceiptEmail`, `sendEmail`, the three
+ * backup capabilities and `rateLimitRedis` are supplied here, not inside
+ * `packages/api` (`trpc.ts`'s own comments explain why: `@ledgerly/queue`
+ * already depends on `@ledgerly/api`, so the reverse import would be
+ * circular). This is the only place in the app a tRPC procedure's queue/Redis
+ * side effects are wired up.
  *
  * `sendEmail` is the one that actually holds credentials, and it is the only
  * synchronous send in the application — `admin.testSmtp`, which exists
@@ -47,6 +55,27 @@ function handler(request: Request): Promise<Response> {
           });
         },
         sendEmail: sendOneEmail,
+        enqueueBackup: async ({ backupId, kind }) => {
+          // `jobId: backupId` — the row is the identity of the backup, so a
+          // duplicate request for the same row cannot become a second archive.
+          // Safe to reuse because the queue sets `removeOnComplete`/
+          // `removeOnFail: {count: 0}` (queue.ts spells out what happens when
+          // it does not).
+          await getBackupQueue(getEnv().REDIS_URL).add(
+            "backup",
+            { kind, backupId },
+            { jobId: backupId },
+          );
+        },
+        rescheduleBackup: async (cron) => {
+          const redisUrl = getEnv().REDIS_URL;
+          if (cron === null) {
+            await removeBackupSchedule(redisUrl);
+          } else {
+            await upsertBackupSchedule(redisUrl, cron);
+          }
+        },
+        readBackupScheduleState: () => getBackupScheduleState(getEnv().REDIS_URL),
         rateLimitRedis: getRedisConnection(getEnv().REDIS_URL),
       }),
   });

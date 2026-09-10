@@ -391,3 +391,81 @@ docker compose down
 
 `docker compose down -v` deletes the volumes, and with them every receipt and
 image. There is no undo.
+
+---
+
+## Backups
+
+The admin screen has a **Backups** card. Two things to do there, once:
+
+1. Press **Back up now**. A row appears, goes from `running` to `complete`, and
+   the archive downloads. That proves the whole path works before you need it.
+2. Set a **schedule** — `0 3 * * *` is nightly at 3am. Five cron fields, in the
+   container's timezone, which is UTC unless you set `TZ`. It takes effect
+   immediately; no restart.
+
+If the card says **"No scheduled backups"**, nothing is being backed up unless
+someone presses the button. That warning is there because a backup system that
+fails quietly is worse than none.
+
+Archives land in the `app_backups` volume (`/app/backups` in the container) and
+are pruned after `BACKUP_RETENTION_DAYS` (default 30). They contain the database
+always, and the uploaded images only if you set `BACKUP_INCLUDE_IMAGES=true` —
+off by default, because it is the difference between an archive of kilobytes and
+one of gigabytes.
+
+**The volume is on this host.** If the disk dies, so do the backups. Copy them
+somewhere else — a cron job on the host doing `rsync` or `tar` of
+`/var/lib/docker/volumes/ledgerly_app_backups/_data/` to another machine or to
+object storage. Ledgerly does not do that for you.
+
+### `MASTER_KEY` is not in the archive
+
+**Back it up separately — a password manager, an encrypted note, anywhere that
+is not this machine.**
+
+An archive contains the `app_config` table with its values still encrypted, and
+nothing that can decrypt them. That is deliberate: a stolen archive yields
+ciphertext. The cost is that restoring onto an instance with a different
+`MASTER_KEY` means the Claude API key and the SMTP password must be entered
+again by hand from the admin screen. Everything else — every receipt, every
+line item, every image — restores regardless.
+
+### Restoring
+
+`scripts/restore.sh`, from a checkout of this repository on the host. It is a
+script rather than a paragraph here because a restore procedure that only exists
+as prose is a procedure nobody has ever run.
+
+```bash
+# Into the running compose stack. This is the deployment case.
+./scripts/restore.sh ledgerly-backup-20260909T030000Z.tgz
+
+# Anywhere else — a scratch database, to rehearse without touching production.
+./scripts/restore.sh ledgerly-backup-20260909T030000Z.tgz     --database-url postgres://user:pass@localhost:5432/scratch     --uploads-dir ./scratch-uploads
+```
+
+What it does, in order, and what it refuses:
+
+1. Extracts to a temp directory and **verifies every file against the archive's
+   own `manifest.json` checksums**. A mismatch refuses outright —
+   `--ignore-checksum` exists for the disaster where a damaged archive is all
+   you have, and it warns loudly.
+2. **Refuses a non-empty target** unless you pass `--force`, and prints what it
+   found first (how many tables, how many receipts, how many users) so you can
+   see what you are about to overwrite.
+3. `pg_restore --clean --if-exists`. A non-zero exit here is common and usually
+   benign — `--clean` warns for every object it could not drop because it did
+   not exist. The row counts at the end are what decide it.
+4. **Handles a backup older than the code**: says so plainly and runs migrations
+   forward. A backup _newer_ than your checkout is refused — migrations are
+   forward-only, so check out the matching version and try again.
+5. Replaces the images, or says clearly that the archive has none.
+6. **Verifies row counts and the image count against the manifest**, table by
+   table, and fails if any disagree.
+
+Flags: `--force`, `--ignore-checksum`, `--skip-uploads`, `--yes` (no prompt),
+`--database-url`, `--uploads-dir`. `./scripts/restore.sh --help` prints them.
+
+**Rehearse it once, now, on a scratch database.** A backup that has never been
+restored is a hypothesis, not a backup.

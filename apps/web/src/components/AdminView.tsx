@@ -1,22 +1,26 @@
 "use client";
 
 import NextLink from "next/link";
-import { Button, Card, CardBody, Chip, Skeleton, Tooltip } from "@heroui/react";
+import { Card, CardBody, Chip, Skeleton } from "@heroui/react";
 import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
-import { Database, HardDriveDownload } from "lucide-react";
 
 import { trpc } from "../lib/trpc";
 import { AiKeyCard } from "./AiKeyCard";
+import { BackupsCard } from "./BackupsCard";
 import { SmtpCard } from "./SmtpCard";
 
 /**
  * apps/web/src/components/AdminView.tsx — brief §7: all projects, all users,
  * extraction cost and escalation rate, backup status.
+ *
+ * The backup section is `BackupsCard.tsx`. It was inline here through Phase 8
+ * as a disabled button; Phase 9 gave it a schedule form, a per-row download, a
+ * summary and three different failure callouts, which is more than belongs in
+ * the middle of this file.
  */
 export function AdminView() {
   const overview = trpc.admin.overview.useQuery();
   const usage = trpc.admin.aiUsage.useQuery({ sinceDays: 30 });
-  const backups = trpc.admin.backups.useQuery();
 
   return (
     <div className="flex flex-col gap-5">
@@ -93,75 +97,7 @@ export function AdminView() {
         </CardBody>
       </Card>
 
-      <Card shadow="sm">
-        <CardBody className="gap-3 p-4">
-          <div className="flex items-center justify-between gap-3">
-            <h2 className="flex items-center gap-2 text-lg font-semibold">
-              <Database className="h-5 w-5" aria-hidden />
-              Backups
-            </h2>
-            {/*
-              Phase 9 owns the backup job, its schedule, retention, and the
-              restore drill. Nothing in the codebase writes a `backups` row
-              yet, so this button is rendered and disabled rather than hidden:
-              an operator should be able to see that backups are a planned
-              capability and that they are not running, instead of finding no
-              mention of them and assuming they are.
-            */}
-            <Tooltip content="Backups arrive in phase 9">
-              <span>
-                <Button
-                  size="sm"
-                  variant="flat"
-                  isDisabled
-                  startContent={<HardDriveDownload className="h-4 w-4" />}
-                >
-                  Back up now
-                </Button>
-              </span>
-            </Tooltip>
-          </div>
-
-          {backups.isPending ? (
-            <Skeleton className="h-16 rounded-lg" />
-          ) : backups.isError ? (
-            <p className="text-sm text-danger">{backups.error.message}</p>
-          ) : backups.data.length === 0 ? (
-            <p className="rounded-lg border border-warning-200 bg-warning-50/50 p-3 text-sm">
-              <strong>No backups have ever run.</strong> The backup job lands in phase 9. Until
-              then, this instance&apos;s database and uploaded images are not being backed up by
-              Ledgerly itself.
-            </p>
-          ) : (
-            <ul className="flex flex-col divide-y divide-divider text-sm">
-              {backups.data.map((backup) => (
-                <li key={backup.id} className="flex items-center gap-3 py-2">
-                  <Chip
-                    size="sm"
-                    variant="flat"
-                    color={
-                      backup.status === "complete"
-                        ? "success"
-                        : backup.status === "failed"
-                          ? "danger"
-                          : "default"
-                    }
-                  >
-                    {backup.status}
-                  </Chip>
-                  <span className="flex-1 text-default-500">{backup.kind}</span>
-                  <span className="tabular-nums">
-                    {backup.sizeBytes ? `${(backup.sizeBytes / 1_048_576).toFixed(1)} MB` : "—"}
-                  </span>
-                  <span className="text-xs text-default-400">
-                    {backup.startedAt.toLocaleString()}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </CardBody>
-      </Card>
+      <BackupsCard />
 
       <Card shadow="sm">
         <CardBody className="gap-3 p-4">

@@ -141,3 +141,87 @@ export function getReceiptEmailQueue(redisUrl: string): Queue {
 export function autoEmailJobId(receiptId: string): string {
   return `${receiptId}:auto`;
 }
+
+/**
+ * `backup` — Phase 9's queue, and the third of the three D-08 reserved (the
+ * second, `export`, stayed unbuilt: D-37 streams exports from a Route Handler
+ * instead, so this is the only one still owed).
+ *
+ * Carries both kinds of backup. A manual one is added by `admin.createBackup`
+ * against a row it has already inserted; a scheduled one is produced by the
+ * job scheduler below, which supplies no row and lets `backupWorker.ts` create
+ * one. Same processor either way — a scheduled backup that behaves differently
+ * from the one you tested by hand is not a backup you have tested.
+ */
+export const BACKUP_QUEUE_NAME = "backup";
+
+let sharedBackupQueue: Queue | undefined;
+
+export function getBackupQueue(redisUrl: string): Queue {
+  if (!sharedBackupQueue) {
+    sharedBackupQueue = new Queue(BACKUP_QUEUE_NAME, {
+      connection: getRedisConnection(redisUrl),
+      defaultJobOptions: {
+        // Two, not three. A retry is worth having for a database that was
+        // briefly unreachable, but a backup is expensive in wall time and disk
+        // and most of its failure modes (no space, a missing binary, a bad
+        // password) are not helped by repeating them — those are thrown as
+        // non-retryable `BackupError`s and stop after one attempt regardless.
+        attempts: 2,
+        backoff: { type: "exponential", delay: 60_000 },
+        // Both `count: 0`, for the reason spelled out on the receipt-email
+        // queue above: a retained job hash makes a later `add` with the same id
+        // a silent success that runs nothing. Manual backups use the row id as
+        // the job id, and the scheduler reuses its own id on every tick, so
+        // this queue would hit that bug on its second scheduled run.
+        removeOnComplete: { count: 0 },
+        removeOnFail: { count: 0 },
+      },
+    });
+  }
+  return sharedBackupQueue;
+}
+
+/**
+ * The one repeatable job in the app (task 9.3).
+ *
+ * A single fixed scheduler id, so `upsertJobScheduler` REPLACES the schedule
+ * rather than accumulating one scheduler per cron string ever configured.
+ * That is the whole reason the admin screen can change the cron and have it
+ * take effect without a restart: reconciliation is an upsert against a known
+ * id, not a diff over a set.
+ */
+export const BACKUP_SCHEDULER_ID = "nightly-backup";
+
+export async function upsertBackupSchedule(redisUrl: string, cron: string): Promise<void> {
+  await getBackupQueue(redisUrl).upsertJobScheduler(
+    BACKUP_SCHEDULER_ID,
+    { pattern: cron },
+    { name: "scheduled-backup", data: { kind: "scheduled" } },
+  );
+}
+
+export async function removeBackupSchedule(redisUrl: string): Promise<void> {
+  await getBackupQueue(redisUrl).removeJobScheduler(BACKUP_SCHEDULER_ID);
+}
+
+/**
+ * When the scheduler will next fire, straight from Redis.
+ *
+ * Deliberately read from BullMQ rather than computed from the stored cron: the
+ * question the admin screen has to answer is not "what would this cron do" but
+ * "is a backup actually going to happen". Those differ precisely when
+ * something is wrong — a configured cron with no registered scheduler — and
+ * that is the case worth surfacing, so `null` here is a finding, not a blank.
+ */
+export async function getBackupScheduleState(
+  redisUrl: string,
+): Promise<{ registered: boolean; pattern: string | null; nextRunAt: Date | null }> {
+  const scheduler = await getBackupQueue(redisUrl).getJobScheduler(BACKUP_SCHEDULER_ID);
+  if (!scheduler) return { registered: false, pattern: null, nextRunAt: null };
+  return {
+    registered: true,
+    pattern: scheduler.pattern ?? null,
+    nextRunAt: typeof scheduler.next === "number" ? new Date(scheduler.next) : null,
+  };
+}

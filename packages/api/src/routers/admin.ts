@@ -24,9 +24,10 @@ import {
 import { recordAudit } from "../audit";
 import { isUniqueViolation } from "../errors";
 import { NEEDS_REVIEW_SQL } from "../receiptAccess";
-import { checkRateLimit } from "../rateLimit";
+import { checkRateLimit, checkWindowedRateLimit } from "../rateLimit";
 import { scopedProjects } from "../scope";
 import { SECRET_KEYS, deleteSecret, writeSecret } from "../secrets";
+import { describeBackupSchedule, serializeBackupSchedule, validateCron } from "../backupSchedule";
 import {
   describeSmtpConfig,
   mergeSmtpConfig,
@@ -343,21 +344,16 @@ export const adminRouter = router({
   }),
 
   /**
-   * Backup history — READ ONLY. There is deliberately no procedure here that
-   * starts a backup: the backup job, its scheduling, retention and the
-   * restore drill are all Phase 9 (docs/PHASES.md 9.1-9.6), and nothing in
-   * this repository writes a `backups` row yet.
-   *
-   * So today this returns an empty list, and that is the correct answer, not
-   * an error — the admin screen renders an empty state and disables its
-   * trigger button until Phase 9 lands.
+   * Backup history (Phase 9). Read-only; `createBackup` below is what starts
+   * one.
    *
    * `path` and `manifest` are deliberately NOT returned. `path` is a host
    * filesystem path and `manifest` is jsonb that can carry more of the same;
    * CLAUDE.md keeps real hostnames and infrastructure detail out of
    * client-visible surfaces, and an operator needs status, size and timing —
    * not a path they cannot act on from a browser. `hasArtifact` carries the
-   * only bit the UI actually needs.
+   * only bit the UI actually needs, and the download route takes a row id and
+   * resolves the path server-side.
    */
   backups: ownerProcedure
     .input(z.object({ limit: z.number().int().min(1).max(200).default(50) }).optional())
@@ -384,6 +380,264 @@ export const adminRouter = router({
 
       return rows;
     }),
+
+  /**
+   * Everything the Backups card needs that is not a history row: the last
+   * backup, the configured schedule, and whether anything is actually going to
+   * run it (task 9.5's "admin visibility").
+   *
+   * The two next-run figures are reported separately on purpose.
+   * `schedule.nextRunAt` is computed from the cron stored in `app_config`;
+   * `nextRunAt` comes from the BullMQ scheduler in Redis. They agree in every
+   * healthy state, and the case where they do not — a cron configured with
+   * `registered: false` — is precisely the silent failure this phase exists to
+   * prevent, so the card renders it as an error rather than papering over it
+   * with whichever value is available. Redis is not in any backup, so a
+   * `redis_data` loss makes that state ordinary rather than exotic.
+   */
+  backupStatus: ownerProcedure.query(async ({ ctx }) => {
+    const env = getEnv();
+    const schedule = await describeBackupSchedule(ctx.db, env.MASTER_KEY);
+
+    const [last] = await ctx.db
+      .select({
+        id: backups.id,
+        kind: backups.kind,
+        status: backups.status,
+        sizeBytes: backups.sizeBytes,
+        imagesIncluded: backups.imagesIncluded,
+        error: backups.error,
+        startedAt: backups.startedAt,
+        finishedAt: backups.finishedAt,
+        hasArtifact: sql<boolean>`${backups.path} is not null`,
+      })
+      .from(backups)
+      .where(isNull(backups.deletedAt))
+      .orderBy(desc(backups.startedAt))
+      .limit(1);
+
+    // Absent in tests and in any caller without Redis wired. Reported as
+    // `null` rather than `false`, so "we could not ask" is distinguishable
+    // from "we asked and nothing is registered" — the UI must not raise an
+    // alarm about the first.
+    let scheduler: { registered: boolean; pattern: string | null; nextRunAt: Date | null } | null =
+      null;
+    if (ctx.readBackupScheduleState) {
+      try {
+        const state = await ctx.readBackupScheduleState();
+        // `pattern` is carried, not dropped. The scheduler being registered is
+        // not the same as it being registered with the CRON THAT IS SAVED — and
+        // the gap between them is reachable by the ordinary path: the write to
+        // `app_config` commits, the reschedule fails on a Redis blip, and Redis
+        // goes on holding the OLD scheduler. `registered` is then true, no
+        // alarm fires, and the screen shows a next-run computed from the new
+        // cron while backups keep running at the old time, indefinitely.
+        scheduler = {
+          registered: state.registered,
+          pattern: state.pattern,
+          nextRunAt: state.nextRunAt,
+        };
+      } catch (error) {
+        console.error("[ledgerly] could not read the backup scheduler state:", error);
+      }
+    }
+
+    return {
+      last: last ?? null,
+      schedule: { ...schedule, updatedBy: undefined },
+      scheduler,
+      /** Env-owned, not settable here (D-45) — shown so the card can say what
+       *  a backup will actually contain rather than leaving it to be guessed. */
+      includeImages: env.BACKUP_INCLUDE_IMAGES,
+      retentionDays: env.BACKUP_RETENTION_DAYS,
+    };
+  }),
+
+  /**
+   * Starts a manual backup (task 9.1).
+   *
+   * The row is inserted here rather than in the worker so the screen shows
+   * `running` the instant the button is pressed — and so that a Redis failure
+   * a moment later leaves a visible artefact of the request instead of
+   * nothing. `backupWorker.ts`'s boot sweep marks any row still `running`
+   * after a restart as `failed`, which closes that loop.
+   *
+   * Refuses while one is already running. Not politeness: two concurrent
+   * `pg_dump`s compete for the same disk to produce two archives nobody asked
+   * for, and the worker's `concurrency: 1` would queue the second one anyway —
+   * so the refusal is honest about what would happen rather than silently
+   * accepting a click that does nothing for ten minutes.
+   */
+  createBackup: ownerProcedure.mutation(async ({ ctx }) => {
+    if (ctx.rateLimitRedis) {
+      const limit = await checkBackupRateLimit(ctx.rateLimitRedis, ctx.user.id);
+      if (!limit.allowed) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "Too many backups requested. Try again shortly.",
+        });
+      }
+    }
+
+    const env = getEnv();
+    const backupId = await ctx.db.transaction(async (tx) => {
+      // Serialises the check below against a concurrent request. Without it
+      // this is a read followed by a separate insert, so two clicks inside the
+      // rate limit could both see "nothing running" and both insert — and the
+      // CONFLICT this procedure advertises would be a guarantee it does not
+      // make. An advisory lock rather than `SELECT ... FOR UPDATE`, because
+      // there is nothing to lock in the case that matters: `FOR UPDATE` locks
+      // the rows it returns, and on "no backup is running" that is none. The
+      // same trap `docs/SCHEMA.md` records for the first-owner election.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${BACKUP_LOCK_KEY})`);
+
+      const [running] = await tx
+        .select({ id: backups.id, startedAt: backups.startedAt })
+        .from(backups)
+        .where(
+          and(
+            eq(backups.status, "running"),
+            isNull(backups.deletedAt),
+            // Only a row that could PLAUSIBLY still be running blocks a new
+            // one. BullMQ can fail a stalled job without the retry the failed
+            // handler assumes is coming, which leaves the row `running`
+            // forever; without this bound, one stalled job would disable the
+            // button until the next restart — a backup system that has quietly
+            // stopped accepting backups, which is the failure this phase is
+            // built to prevent. `PG_DUMP_TIMEOUT_MS` is the longest a dump is
+            // allowed to take, so anything older than it is not running.
+            gte(backups.startedAt, new Date(Date.now() - RUNNING_BACKUP_MAX_AGE_MS)),
+          ),
+        )
+        .limit(1);
+      if (running) {
+        throw new TRPCError({
+          code: "CONFLICT",
+          message: "A backup is already running. Wait for it to finish.",
+        });
+      }
+
+      const [row] = await tx
+        .insert(backups)
+        .values({
+          kind: "manual",
+          status: "running",
+          dbIncluded: true,
+          imagesIncluded: env.BACKUP_INCLUDE_IMAGES,
+        })
+        .returning({ id: backups.id });
+      if (!row) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+      await recordAudit(tx, {
+        actorUserId: ctx.user.id,
+        action: "backup.requested",
+        entityType: "backup",
+        entityId: row.id,
+        metadata: { via: "admin.createBackup", includeImages: env.BACKUP_INCLUDE_IMAGES },
+      });
+      return row.id;
+    });
+
+    // Outside the transaction: an enqueue that succeeds against a transaction
+    // that then rolls back would leave a job pointing at a row that does not
+    // exist. `receipts.emailReceipt` orders it the same way, for the same
+    // reason.
+    const enqueue = ctx.enqueueBackup;
+    if (!enqueue) {
+      console.warn(
+        `[ledgerly] backup ${backupId} was requested but no queue is wired into this context.`,
+      );
+      throw new TRPCError({
+        code: "SERVICE_UNAVAILABLE",
+        message: "Backups are not available on this instance right now.",
+      });
+    }
+    try {
+      await enqueue({ backupId, kind: "manual" });
+    } catch (error) {
+      console.error(`[ledgerly] could not enqueue backup ${backupId}:`, error);
+      throw new TRPCError({
+        code: "SERVICE_UNAVAILABLE",
+        message: "The backup could not be queued. Check that Redis is reachable.",
+      });
+    }
+
+    return { ok: true as const, backupId };
+  }),
+
+  /**
+   * Sets the nightly schedule (task 9.3).
+   *
+   * Validated BEFORE the write. A pattern BullMQ would reject must not be
+   * persisted as the configured schedule while no scheduler exists to run it —
+   * a stored intention with no effect is the shape of every silent backup
+   * failure, and this one would look correct on the screen that set it.
+   *
+   * The reschedule happens after the commit and is reported, not swallowed:
+   * `app_config` is the source of truth and the worker reconciles from it at
+   * boot, so a Redis failure here is recoverable by restarting — but the
+   * operator has to be told that restarting is what it now needs.
+   */
+  setBackupSchedule: ownerProcedure
+    .input(z.object({ cron: z.string().trim().min(1).max(120) }))
+    .mutation(async ({ ctx, input }) => {
+      const validated = validateCron(input.cron);
+      if (!validated.ok) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: validated.message });
+      }
+
+      const env = getEnv();
+      await ctx.db.transaction(async (tx) => {
+        await writeSecret(
+          tx,
+          SECRET_KEYS.backupSchedule,
+          serializeBackupSchedule({ cron: input.cron }),
+          env.MASTER_KEY,
+          ctx.user.id,
+        );
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.updated",
+          entityType: "app_config",
+          // `audit_log.entity_id` is uuid-typed and an app_config row is keyed
+          // by text, so the key goes in metadata — the same shape `setSmtp`
+          // uses. The cron itself is recorded because "when was this instance
+          // supposed to be backing up" is exactly what an audit log should be
+          // able to answer, and it is not a credential.
+          entityId: null,
+          metadata: {
+            key: SECRET_KEYS.backupSchedule,
+            via: "admin.setBackupSchedule",
+            cron: input.cron,
+          },
+        });
+      });
+
+      return {
+        ...(await applyBackupSchedule(ctx, input.cron)),
+        nextRunAt: validated.next,
+      };
+    }),
+
+  /** Turns scheduled backups off. Never reads the stored row, so it is also
+   *  the recovery path when `MASTER_KEY` no longer matches it — the same
+   *  property `clearSmtp` has, and for the same reason. */
+  clearBackupSchedule: ownerProcedure.mutation(async ({ ctx }) => {
+    const cleared = await ctx.db.transaction(async (tx) => {
+      const removed = await deleteSecret(tx, SECRET_KEYS.backupSchedule);
+      if (removed) {
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.cleared",
+          entityType: "app_config",
+          entityId: null,
+          metadata: { key: SECRET_KEYS.backupSchedule, via: "admin.clearBackupSchedule" },
+        });
+      }
+      return removed;
+    });
+
+    return { ...(await applyBackupSchedule(ctx, null)), cleared };
+  }),
   /**
    * The Claude API key's STATUS — never the key.
    *
@@ -747,6 +1001,94 @@ const AI_KEY_TEST_RATE_LIMIT_PER_MIN = 10;
 /** Lower than the AI key's: this one actually delivers a message, and a relay
  *  counts every one against the instance's sending reputation. */
 const SMTP_TEST_RATE_LIMIT_PER_MIN = 3;
+
+/**
+ * Two tiers, composed the same way as `checkEmailReceiptRateLimit`.
+ *
+ * A backup is the most expensive thing this instance can be asked to do — a
+ * full `pg_dump`, optionally a tar of every image, and a new archive on the
+ * volume each time. The per-minute cap stops a double-click or an impatient
+ * operator from queueing five; the daily cap is the one that matters, because
+ * 2/min sustained would fill the backups volume long before retention got
+ * anywhere near pruning it. Both are far above any genuine use: the schedule
+ * exists precisely so nobody has to press this button routinely.
+ */
+const BACKUP_RATE_LIMIT_PER_MIN = 2;
+
+/**
+ * An arbitrary but fixed key for `pg_advisory_xact_lock`, so every caller of
+ * `createBackup` contends on the same one. Advisory locks share a single
+ * instance-wide namespace, so the value only has to not collide with another
+ * use — and this is currently the only one.
+ */
+const BACKUP_LOCK_KEY = 909_001;
+
+/**
+ * How long a `running` row is believed. Matches `PG_DUMP_TIMEOUT_MS` in
+ * `packages/queue/src/pipeline/backup.ts` — the longest a dump is permitted to
+ * take, so a row older than this cannot still be in progress. Held by value
+ * rather than imported, because `api` cannot import `queue` (D-07); the two
+ * must be changed together, which is what this comment is for.
+ */
+const RUNNING_BACKUP_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const BACKUP_RATE_LIMIT_PER_DAY = 12;
+const ONE_DAY_SECONDS = 24 * 60 * 60;
+
+async function checkBackupRateLimit(
+  redis: NonNullable<Context["rateLimitRedis"]>,
+  userId: string,
+): Promise<{ allowed: boolean }> {
+  const perMinute = await checkRateLimit(
+    redis,
+    `backup_create:${userId}`,
+    1,
+    BACKUP_RATE_LIMIT_PER_MIN,
+  );
+  if (!perMinute.allowed) return perMinute;
+  // Charged only once the per-minute check has admitted the request, so
+  // hammering past the minute limit cannot burn the day's allowance.
+  return checkWindowedRateLimit(
+    redis,
+    `backup_create_daily:${userId}`,
+    1,
+    BACKUP_RATE_LIMIT_PER_DAY,
+    ONE_DAY_SECONDS,
+  );
+}
+
+/**
+ * Reconciles Redis to the schedule that has just been written, and says
+ * whether it worked.
+ *
+ * Returns `{ ok, message }` rather than throwing, because the write it follows
+ * has already committed: throwing here would tell the operator the whole
+ * operation failed when the durable half of it succeeded, and they would
+ * reasonably retry a thing that does not need retrying. The honest report is
+ * "saved, but not yet live".
+ */
+async function applyBackupSchedule(
+  ctx: Pick<Context, "rescheduleBackup">,
+  cron: string | null,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const reschedule = ctx.rescheduleBackup;
+  if (!reschedule) {
+    console.warn("[ledgerly] backup schedule changed but no queue is wired into this context.");
+    return {
+      ok: false,
+      message: "Saved. It will take effect the next time the app restarts.",
+    };
+  }
+  try {
+    await reschedule(cron);
+    return { ok: true };
+  } catch (error) {
+    console.error("[ledgerly] could not apply the backup schedule:", error);
+    return {
+      ok: false,
+      message: "Saved, but the scheduler could not be updated. Restart the app to apply it.",
+    };
+  }
+}
 
 const KEY_BLOCKED_ERRORS = ["ANTHROPIC_KEY_NOT_CONFIGURED", "ANTHROPIC_KEY_UNDECRYPTABLE"];
 

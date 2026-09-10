@@ -512,8 +512,17 @@ CREATE TABLE app_config (
 
 Encrypted key-value store for runtime settings, following Forkd's
 `getDecryptedConfigValue()` / `setEncryptedConfigValue()` pattern with
-`MASTER_KEY` (32 bytes, base64, validated at startup by D-14). Keys in v1:
-`backup.schedule_cron`, `backup.include_images`, `ai.escalate_below`.
+`MASTER_KEY` (32 bytes, base64, validated at startup by D-14). Keys actually in
+use, as a closed union in `packages/api/src/secrets.ts`: `anthropic_api_key`
+(D-39), `smtp_config` (D-44), and `backup_schedule` (D-45).
+
+`backup_schedule` is the one key holding something that is not a secret. It is
+encrypted because this table has exactly one storage format; the consequence —
+a rotated `MASTER_KEY` makes the schedule unreadable — is handled as a
+first-class `undecryptable` state rather than reported as "not configured"
+(D-45). `backup.include_images` was planned and is not built: `BACKUP_INCLUDE_IMAGES`
+owns that, in the environment. `ai.escalate_below` likewise stayed
+`AI_ESCALATE_BELOW`.
 
 **`MASTER_KEY` is irreplaceable.** A backup archive contains the encrypted values
 and nothing that can decrypt them. `SETUP.md` says so in bold, and the key is

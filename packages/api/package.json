@@ -12,10 +12,12 @@
     "./scope": "./src/scope.ts",
     "./storage": "./src/storage.ts",
     "./rateLimit": "./src/rateLimit.ts",
+    "./audit": "./src/audit.ts",
     "./export": "./src/export/index.ts",
     "./aiKey": "./src/aiKey.ts",
     "./secrets": "./src/secrets.ts",
-    "./smtp": "./src/smtp.ts"
+    "./smtp": "./src/smtp.ts",
+    "./backupSchedule": "./src/backupSchedule.ts"
   },
   "scripts": {
     "lint": "eslint .",
@@ -28,6 +30,7 @@
     "@ledgerly/db": "workspace:*",
     "@ledgerly/shared": "workspace:*",
     "@trpc/server": "^11.0.0",
+    "cron-parser": "^4.9.0",
     "drizzle-orm": "^0.41.0",
     "exceljs": "^4.4.0",
     "server-only": "^0.0.1",

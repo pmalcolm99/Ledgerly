@@ -502,22 +502,50 @@ the database, so a container can report healthy while every query fails
 
 ### 8.3 Backups
 
-BullMQ jobs, manual (admin button) and scheduled (repeatable job, cron from
-`app_config`):
+The `backup` queue — the third D-08 reserved, and the only one still owed after
+D-37 left `export` unbuilt. One processor for both kinds: manual (the admin
+button, against a `backups` row the API has already inserted) and scheduled (a
+BullMQ job scheduler, cron from `app_config`). A scheduled backup that behaved
+differently from the one you tested by hand would not be a backup you had
+tested.
 
-- `pg_dump --format=custom` -> `db.dump`
-- `${UPLOADS_DIR}` tree, only if `BACKUP_INCLUDE_IMAGES=true`
-- `app_config` rows, values left encrypted
-- `manifest.json`: schema version, per-table row counts, image count, SHA-256
-  checksums
-- tar + gzip into `${BACKUPS_DIR}`
+- `pg_dump --format=custom --no-owner --no-privileges` -> `db.dump`. The
+  connection goes in as discrete flags with the password in `PGPASSWORD`, never
+  as a URI in argv — argv is world-readable through `/proc`.
+- `${UPLOADS_DIR}` tree as `uploads.tar`, only if `BACKUP_INCLUDE_IMAGES=true`.
+  Not gzipped: every file under it is an already-compressed WebP.
+- `manifest.json`: schema version (read from `drizzle.__drizzle_migrations`, so
+  it is what is actually applied), per-table row counts in ONE query so they
+  share a snapshot, image count, and a SHA-256 of every member file.
+- tar + gzip into `${BACKUPS_DIR}`, written under a `.part` name and renamed
+  only on success, so a SIGKILL cannot leave a truncated file that looks like a
+  backup. A sidecar `.sha256` carries the archive's own checksum, which cannot
+  be inside the file it describes.
 
-Retention `BACKUP_RETENTION_DAYS` (default 30). A `scripts/restore.sh` ships in
-the repo, and Phase 9 does not pass until a restore drill succeeds against a
-scratch database. A backup that has never been restored is a hypothesis.
+`app_config` is **not** written out separately — the dump already contains it,
+with its values still encrypted (D-45).
+
+Retention `BACKUP_RETENTION_DAYS` (default 30): unlink first, then soft-delete
+the row, so a crash between the two leaves a visible inconsistency rather than
+an invisible one.
+
+Failures are loud by construction, because a backup system that fails silently
+is worse than none: a reason code on the row, a `console.error` from the
+worker's `failed` handler, a `failed` status in the admin view, and a boot sweep
+that marks any row still `running` after a restart as `INTERRUPTED`. That sweep
+also reconciles the cron from `app_config` into Redis — Redis is not in any
+backup, so an unregistered scheduler is the normal state after a `redis_data`
+loss, and the admin card renders "configured but not registered" as an error.
+
+`scripts/restore.sh` ships in the repo (host-side; it drives `docker compose`,
+and the runner image has no python3). It validates every member against the
+manifest before touching a database, refuses a non-empty target without
+`--force`, and migrates forward when the archive predates the checkout. Phase 9
+does not pass until a restore drill succeeds against a scratch database. A
+backup that has never been restored is a hypothesis.
 
 `MASTER_KEY` is not in the archive and cannot be recovered from it. `SETUP.md`
-says so in bold.
+says so in bold, and so does the admin screen.
 
 ### 8.4 CI
 
