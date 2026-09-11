@@ -8,8 +8,9 @@ import { pipeline as streamPipeline } from "node:stream/promises";
 
 import { and, eq, isNull, lt, sql } from "drizzle-orm";
 import { appTableNames } from "@ledgerly/db/tables";
-import { backups } from "@ledgerly/db/schema";
+import { appEvents, auditLog, backups } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
+import type { PgColumn, PgTable } from "drizzle-orm/pg-core";
 
 /**
  * packages/queue/src/pipeline/backup.ts — producing one backup archive
@@ -84,6 +85,10 @@ export type BackupDeps = {
   uploadsDir: string;
   includeImages: boolean;
   retentionDays: number;
+  /** Logs keep their own clock from backups' — same default, separate knob,
+   *  because one is about disk and the other about how far back questions can
+   *  be answered. */
+  logRetentionDays: number;
   /** Only ever parsed for connection parameters. See `pgEnvAndFlags` — the
    *  password reaches `pg_dump` through the environment, never through argv. */
   databaseUrl: string;
@@ -588,11 +593,22 @@ export async function runBackup(deps: BackupDeps, data: BackupJobData): Promise<
     // both `pruneBackups` (which walks rows) and `clearBackupWorkspace` (which
     // only removes `.part`). Silent, unbounded growth of the one volume whose
     // job is to have room for the next backup.
+    //
+    // Two sweeps, two `try`s. Sharing one would mean an `EACCES` unlinking a
+    // single stale archive silently cancels log retention for the night — and
+    // the boot sweep only covers that up if somebody restarts the container.
+    // They are independent chores; a failure in one is not news about the
+    // other.
     let pruned = 0;
     try {
       pruned = await pruneBackups(deps);
     } catch (error) {
       console.error("[ledgerly] backup retention sweep failed:", error);
+    }
+    try {
+      await pruneLogs({ db: deps.db, retentionDays: deps.logRetentionDays, now: deps.now });
+    } catch (error) {
+      console.error("[ledgerly] log retention sweep failed:", error);
     }
     return { backupId, archivePath, sizeBytes, archiveSha256, manifest, pruned };
   } finally {
@@ -667,6 +683,73 @@ export async function pruneBackups(deps: BackupDeps): Promise<number> {
     console.log(`[ledgerly] pruned ${pruned} backup(s) older than ${deps.retentionDays} days`);
   }
   return pruned;
+}
+
+/**
+ * Retention for the Logs tab (D-46).
+ *
+ * Lives here, beside `pruneBackups`, because it is the same kind of chore on
+ * the same clock and because the backup job is the one thing that already runs
+ * nightly. Called from the job AND from the worker's boot sweep — an instance
+ * with no backup schedule configured would otherwise never prune at all, which
+ * is exactly the instance least likely to notice a table growing.
+ *
+ * Deletes rather than soft-deletes: unlike a backup row, a log line that has
+ * aged out has no artifact to reconcile against and nothing to be visible
+ * *about*. A tombstone would just be a smaller log line kept forever.
+ *
+ * **Batched, and counted without `RETURNING`.** The first sweep after this
+ * ships is the expensive one: an instance that has been running since Phase 4
+ * with no retention at all deletes its entire historical backlog at once. A
+ * single unbounded `DELETE` would hold row locks against concurrent
+ * `recordAudit` inserts for the whole of it, and `.returning({ id })` — used
+ * here only to call `.length` — would ship every one of those UUIDs back over
+ * the wire to be counted. `rowCount` is the same number for none of the cost.
+ */
+const PRUNE_BATCH = 10_000;
+
+export async function pruneLogs(deps: {
+  db: Database;
+  retentionDays: number;
+  now?: () => Date;
+}): Promise<{ events: number; audit: number }> {
+  const now = deps.now ?? (() => new Date());
+  const cutoff = new Date(now().getTime() - deps.retentionDays * 24 * 60 * 60 * 1000);
+
+  /**
+   * `ctid IN (SELECT ctid ... LIMIT n)` rather than a plain `DELETE ... LIMIT`,
+   * which postgres does not have. Loops until a pass deletes nothing, so each
+   * statement's locks are held for a bounded time and a long backlog is cleared
+   * in steps instead of one transaction.
+   */
+  async function deleteInBatches(table: PgTable, column: PgColumn): Promise<number> {
+    let total = 0;
+    for (;;) {
+      const result = await deps.db.execute(sql`
+        DELETE FROM ${table}
+         WHERE ctid IN (
+           SELECT ctid FROM ${table} WHERE ${column} < ${cutoff} LIMIT ${PRUNE_BATCH}
+         )
+      `);
+      const deleted = result.rowCount ?? 0;
+      total += deleted;
+      if (deleted < PRUNE_BATCH) return total;
+    }
+  }
+
+  // No `sql.raw` anywhere: the table and column are interpolated as drizzle
+  // objects, so they are quoted identifiers rather than pasted text, and the
+  // cutoff — the only value that varies — is a bound parameter.
+  const events = await deleteInBatches(appEvents, appEvents.at);
+  const audit = await deleteInBatches(auditLog, auditLog.createdAt);
+
+  if (events > 0 || audit > 0) {
+    console.log(
+      `[ledgerly] pruned ${events} event(s) and ${audit} audit row(s) ` +
+        `older than ${deps.retentionDays} days`,
+    );
+  }
+  return { events, audit };
 }
 
 /** Leftovers from a process killed mid-archive. Called by the worker at boot,

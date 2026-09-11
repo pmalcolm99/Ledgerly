@@ -4,6 +4,7 @@ import { buildAccessDeniedResponse } from "@ledgerly/auth/response";
 import type { Env } from "@ledgerly/config/env";
 import { projects, receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
+import { recordEvent } from "@ledgerly/api/events";
 import { checkUploadRateLimit } from "@ledgerly/api/rateLimit";
 import { scopedProjects } from "@ledgerly/api/scope";
 import { receiptFilePath, writeReceiptFile } from "@ledgerly/api/storage";
@@ -249,6 +250,19 @@ async function processOneFile(
     return { filename, ok: true, receiptId: row.id };
   } catch (error) {
     console.error(`[ledgerly] upload persistence failed for "${filename}":`, error);
+    // The upload half of D-46. The caller is told only "INTERNAL_ERROR" — an
+    // upload response is not the place to explain a disk or Redis failure — so
+    // without this row the reason exists nowhere the owner can reach. The
+    // filename is the user's own and is what makes the row identifiable; the
+    // raw message is scrubbed centrally by `recordEvent`.
+    await recordEvent(ctx.db, {
+      level: "error",
+      category: "upload",
+      event: "upload.persist_failed",
+      entityType: "receipt",
+      entityId: receiptId,
+      metadata: { filename, error: error instanceof Error ? error.message : String(error) },
+    });
     if (receiptId) {
       // The row exists (insert succeeded) but staging or enqueue failed --
       // record that rather than leaving a `pending` row with no job and
@@ -257,8 +271,21 @@ async function processOneFile(
         .update(receipts)
         .set({ extractionStatus: "failed", extractionError: "UPLOAD_PERSISTENCE_FAILED" })
         .where(eq(receipts.id, receiptId))
-        .catch((updateError: unknown) => {
+        .catch(async (updateError: unknown) => {
           console.error(`[ledgerly] failed to mark receipt ${receiptId} failed:`, updateError);
+          // The worse of the two failures: the receipt is now stuck as
+          // `pending` with no job behind it, which looks to the user like an
+          // upload that is simply taking a while and will never finish.
+          await recordEvent(ctx.db, {
+            level: "error",
+            category: "upload",
+            event: "upload.status_write_failed",
+            entityType: "receipt",
+            entityId: receiptId,
+            metadata: {
+              error: updateError instanceof Error ? updateError.message : String(updateError),
+            },
+          });
         });
     }
     return { filename, ok: false, error: "INTERNAL_ERROR" };

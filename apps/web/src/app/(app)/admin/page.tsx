@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 
+import { AdminSubNav } from "../../../components/AdminSubNav";
 import { AdminView } from "../../../components/AdminView";
 import { resolveIdentity } from "../../../server/identity";
 
@@ -14,5 +15,10 @@ import { resolveIdentity } from "../../../server/identity";
 export default async function AdminPage() {
   const user = await resolveIdentity();
   if (user?.role !== "owner") redirect("/");
-  return <AdminView />;
+  return (
+    <div className="flex flex-col gap-4">
+      <AdminSubNav />
+      <AdminView />
+    </div>
+  );
 }

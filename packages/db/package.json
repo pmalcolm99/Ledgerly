@@ -23,7 +23,7 @@
     "db:seed": "tsx src/seed.cli.ts"
   },
   "dependencies": {
-    "drizzle-orm": "^0.41.0",
+    "drizzle-orm": "~0.41.0",
     "pg": "^8.14.0",
     "server-only": "^0.0.1"
   },

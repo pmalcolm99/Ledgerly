@@ -36,7 +36,12 @@ RUN corepack enable && corepack prepare pnpm@11.0.9 --activate
 COPY --from=deps /app ./
 COPY . .
 
+# Declared in BOTH stages because ARG does not cross them. Here it is
+# promoted to ENV so `next.config.ts` can read it during `next build` and
+# inline it as APP_GIT_SHA — without this line the ARG was declared and never
+# used, which is why nothing in the app could say which build it was running.
 ARG GIT_SHA=dev
+ENV GIT_SHA=$GIT_SHA
 ENV NEXT_TELEMETRY_DISABLED=1
 
 # Build-time-only placeholders so packages/config/src/env.ts's startup parse

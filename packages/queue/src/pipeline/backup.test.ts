@@ -10,15 +10,17 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 import {
   createTestProjectWithMembers,
   getCleanPool,
+  mkTestUser,
   withCleanDatabase,
 } from "@ledgerly/db/testHarness";
 import { appTableNames } from "@ledgerly/db/tables";
 import * as schema from "@ledgerly/db/schema";
-import { backups, receipts } from "@ledgerly/db/schema";
+import { appEvents, auditLog, backups, receipts } from "@ledgerly/db/schema";
 
 import {
   BackupError,
   archiveBasename,
+  pruneLogs,
   clearBackupWorkspace,
   countArchivedFiles,
   countRows,
@@ -134,6 +136,7 @@ function deps(overrides: Partial<BackupDeps> = {}): BackupDeps {
     uploadsDir,
     includeImages: false,
     retentionDays: 30,
+    logRetentionDays: 90,
     databaseUrl: "postgres://u:p@localhost:5432/ledgerly_test",
     run: fakeRun().run,
     ...overrides,
@@ -564,6 +567,49 @@ describe("countArchivedFiles", () => {
   it("is zero for an empty archive", () => {
     expect(countArchivedFiles("./\n")).toBe(0);
     expect(countArchivedFiles("")).toBe(0);
+  });
+});
+
+describe("pruneLogs", () => {
+  it("prunes both tables past the window and leaves anything inside it", async () => {
+    const now = new Date("2026-09-09T00:00:00Z");
+    const at = (daysAgo: number): Date => new Date(now.getTime() - daysAgo * 86_400_000);
+    const user = await mkTestUser(db, "pruner");
+
+    await db.insert(appEvents).values([
+      { level: "info", category: "email", event: "email.sent", at: at(91) },
+      { level: "info", category: "email", event: "email.sent", at: at(89) },
+    ]);
+    await db.insert(auditLog).values([
+      { actorUserId: user.id, action: "receipt.updated", entityType: "receipt", createdAt: at(91) },
+      { actorUserId: user.id, action: "receipt.updated", entityType: "receipt", createdAt: at(89) },
+    ]);
+
+    const pruned = await pruneLogs({ db, retentionDays: 90, now: () => now });
+    expect(pruned).toEqual({ events: 1, audit: 1 });
+    expect(await db.select().from(appEvents)).toHaveLength(1);
+    expect(await db.select().from(auditLog)).toHaveLength(1);
+  });
+
+  /** The choice made explicitly when this was planned: audit rows are pruned
+   *  on the same clock as events, which means "who deleted that receipt" stops
+   *  being answerable after the window. Asserted so the trade is visible in a
+   *  test rather than only in a decision document. */
+  it("does prune audit rows, which used to be append-only forever", async () => {
+    const now = new Date("2026-09-09T00:00:00Z");
+    const user = await mkTestUser(db, "pruner2");
+    await db.insert(auditLog).values({
+      actorUserId: user.id,
+      action: "receipt.deleted",
+      entityType: "receipt",
+      createdAt: new Date(now.getTime() - 200 * 86_400_000),
+    });
+    await pruneLogs({ db, retentionDays: 90, now: () => now });
+    expect(await db.select().from(auditLog)).toHaveLength(0);
+  });
+
+  it("is a no-op on an empty instance", async () => {
+    expect(await pruneLogs({ db, retentionDays: 90 })).toEqual({ events: 0, audit: 0 });
   });
 });
 

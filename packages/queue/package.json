@@ -29,7 +29,7 @@
     "@ledgerly/db": "workspace:*",
     "@ledgerly/shared": "workspace:*",
     "bullmq": "^5.34.0",
-    "drizzle-orm": "^0.41.0",
+    "drizzle-orm": "~0.41.0",
     "ioredis": "^5.4.2",
     "nodemailer": "^10.0.1",
     "server-only": "^0.0.1",

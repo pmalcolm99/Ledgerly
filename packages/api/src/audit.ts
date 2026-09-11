@@ -31,7 +31,13 @@ export type AuditEntry = {
   /** Free-form context for reconstructing what happened. Never receipt
    * images, model output, or secrets (`docs/SCHEMA.md`) — and, per the
    * existing `user.sub_relinked` precedent, no email or other PII beyond
-   * ids: the audit row names the identity, not the person. */
+   * ids: the audit row names the identity, not the person.
+   *
+   * **Now load-bearing for display, not only for storage.** Since D-46 the
+   * Logs tab returns `audit_log.metadata` to the owner's browser verbatim, and
+   * unlike `app_events` there is no `safeMetadata()` between this object and
+   * that screen — `recordAudit` writes inside the caller's transaction and has
+   * no scrubbing pass of its own. What goes in here is what is rendered. */
   metadata?: Record<string, unknown>;
 };
 

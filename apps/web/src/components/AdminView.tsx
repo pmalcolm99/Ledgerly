@@ -4,6 +4,7 @@ import NextLink from "next/link";
 import { Card, CardBody, Chip, Skeleton } from "@heroui/react";
 import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
 
+import { buildLabel } from "../lib/buildInfo";
 import { trpc } from "../lib/trpc";
 import { AiKeyCard } from "./AiKeyCard";
 import { BackupsCard } from "./BackupsCard";
@@ -188,6 +189,12 @@ export function AdminView() {
           )}
         </CardBody>
       </Card>
+
+      {/* No About page (that was considered and dropped) — so the build
+          identity lives at the foot of the one screen an operator is already
+          on. Answering "which build is this?" used to mean grepping the JS
+          bundle inside the container. */}
+      <p className="pt-2 text-center font-mono text-xs text-default-400">Ledgerly {buildLabel()}</p>
     </div>
   );
 }

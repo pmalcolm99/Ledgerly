@@ -5,6 +5,7 @@ import superjson from "superjson";
 import { getDb } from "@ledgerly/db";
 import type { Database } from "@ledgerly/db";
 import { isOnboarded, resolveIdentityFromHeaders } from "@ledgerly/auth";
+import { recordEvent } from "./events";
 import type { AuthUser } from "@ledgerly/auth";
 
 import type { RateLimitRedis } from "./rateLimit";
@@ -157,6 +158,74 @@ const CLIENT_SAFE_CODES = new Set([
   "SERVICE_UNAVAILABLE",
 ]);
 
+/**
+ * Suppresses repeats of the same internal error, in process.
+ *
+ * Every 500 in the app now writes a row, and a tight retry loop against a
+ * broken dependency emits them as fast as the event loop allows — a stuck
+ * system would fill the table meant to explain it. Keyed on `(path, code)` so
+ * a DIFFERENT failure is never suppressed by a noisy one.
+ *
+ * In memory rather than a database check, deliberately: the guard must not cost
+ * a query on the error path, which is by definition the path already going
+ * wrong. The cost of that choice is that N containers write up to N copies —
+ * acceptable, and this instance runs one.
+ */
+const INTERNAL_ERROR_THROTTLE_MS = 60_000;
+const lastInternalError = new Map<string, number>();
+
+function shouldRecordInternalError(signature: string): boolean {
+  const now = Date.now();
+  const last = lastInternalError.get(signature);
+  if (last !== undefined && now - last < INTERNAL_ERROR_THROTTLE_MS) return false;
+  lastInternalError.set(signature, now);
+  // Bounded: a pathological variety of distinct signatures must not turn the
+  // guard against memory into a leak.
+  if (lastInternalError.size > 500) {
+    for (const [key, at] of lastInternalError) {
+      if (now - at >= INTERNAL_ERROR_THROTTLE_MS) lastInternalError.delete(key);
+    }
+  }
+  return true;
+}
+
+/**
+ * An upstream error message, bounded before it is stored.
+ *
+ * The first line only, capped. `system.internal_error` stores text produced by
+ * whatever threw — most of it a driver — and the worked example is drizzle:
+ * from 0.42 it wraps failures in `DrizzleQueryError`, whose message is
+ * `Failed query: <sql>` followed by a `params:` line carrying **the bound
+ * parameters**. That would quietly turn every failing statement's inputs into
+ * rows in an owner-readable table, which is precisely what D-46 promises this
+ * never does. `drizzle-orm` is pinned to `~0.41.0` so a caret bump cannot make
+ * that happen silently; this is the second line of defence, and it does not
+ * depend on knowing any particular library's format.
+ */
+const MAX_STORED_ERROR_CHARS = 300;
+
+function errorSummary(message: string): string {
+  const firstLine = message.split("\n", 1)[0] ?? "";
+  return firstLine.length > MAX_STORED_ERROR_CHARS
+    ? `${firstLine.slice(0, MAX_STORED_ERROR_CHARS)}…`
+    : firstLine;
+}
+
+/**
+ * What an internal error looks like by the time a client sees it: a fixed
+ * message, with the diagnostic fields removed.
+ *
+ * Deleted, not set to `undefined` — superjson serialises `undefined` as `null`
+ * plus a `meta.values` entry, so the keys would survive into the response body
+ * announcing exactly what had been stripped.
+ */
+function redacted<T extends { data: object }>(shape: T): T {
+  const data: Record<string, unknown> = { ...shape.data };
+  delete data.stack;
+  delete data.path;
+  return { ...shape, message: "Internal server error.", data } as T;
+}
+
 const t = initTRPC.context<Context>().create({
   transformer: superjson,
   // Decided here, once, rather than inherited from `process.env.NODE_ENV`
@@ -169,14 +238,56 @@ const t = initTRPC.context<Context>().create({
     // Server-side only. This is the one place the real cause is recorded.
     console.error(`[ledgerly] tRPC ${error.code}:`, error.cause ?? error.message);
 
-    // Deleted, not set to `undefined`: superjson serialises undefined as
-    // `null` plus a `meta.values` entry, so the keys would survive into the
-    // response body announcing what was stripped.
-    const data: Record<string, unknown> = { ...shape.data };
-    delete data.stack;
-    delete data.path;
+    // …and now also the Logs tab (D-46). This is the single biggest bucket of
+    // failures that previously existed only in container stdout.
+    //
+    // What is stored: the path, the code, and the message — the message run
+    // through `scrubLuhnSequences`, because an error from the driver can carry
+    // whatever was in the statement that failed. NEVER the stack and never the
+    // inputs. This is deliberately a narrower disclosure than the console line
+    // above, which keeps the full cause.
+    //
+    // Worth naming plainly: the whole reason this formatter exists is to stop
+    // a driver's error text reaching a CLIENT. Storing it for the instance
+    // owner is a different threat model — they administer the box — but it is
+    // a real widening and was reviewed as one.
+    const path = shape.data.path ?? "unknown";
+    // `getDb()` below reads `process.env.DATABASE_URL` — the APPLICATION
+    // database — rather than the injected `ctx.db`, which a formatter has no
+    // access to. D-18 is emphatic that a test must never touch that URL. The
+    // suite does not reach here today (`createCallerFactory` skips
+    // `errorFormatter` entirely; only the HTTP and WS adapters call it), but
+    // the first test to exercise the HTTP adapter would start writing
+    // `app_events` rows into the dev database, and it would do so silently.
+    if (process.env.NODE_ENV === "test") return redacted(shape);
+    if (shouldRecordInternalError(`${path}:${error.code}`)) {
+      // Wrapped, and not only because `recordEvent` already swallows its own
+      // failures: `getDb()` is evaluated HERE, outside it, and `getPool()`
+      // throws synchronously when DATABASE_URL is absent. An error formatter
+      // that can itself throw is the last thing that should exist — it is the
+      // code path that runs when everything else has already gone wrong.
+      try {
+        void recordEvent(getDb(), {
+          level: "error",
+          category: "system",
+          event: "system.internal_error",
+          metadata: {
+            path,
+            code: error.code,
+            // `recordEvent` scrubs card numbers and host paths out of every
+            // metadata value centrally. `errorSummary` handles the part that
+            // is specific to this call site: the message here is arbitrary
+            // text from an upstream library, so it is bounded and reduced to
+            // its first line before it is stored.
+            message: errorSummary(error.message),
+          },
+        });
+      } catch (loggingError) {
+        console.error("[ledgerly] could not record an internal error:", loggingError);
+      }
+    }
 
-    return { ...shape, message: "Internal server error.", data } as typeof shape;
+    return redacted(shape);
   },
 });
 

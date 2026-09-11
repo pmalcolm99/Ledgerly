@@ -112,6 +112,7 @@ export function getCleanPool(): Pool {
 }
 
 const TABLES_IN_FK_SAFE_ORDER = [
+  "app_events",
   "audit_log",
   "ai_usage",
   "backups",

@@ -60,7 +60,13 @@ import { renderReceiptEmail, type EmailReceiptData } from "./emailMessage";
 
 /** What `nodemailer`'s transport provides, narrowed to what is used. Declared
  *  structurally so this module never imports nodemailer — the credential-
- *  consuming client stays in `emailWorker.ts`, the one file that builds it. */
+ *  consuming client stays in `emailWorker.ts`, the one file that builds it.
+ *
+ *  The return type was `Promise<unknown>`, which threw away the relay's own
+ *  `messageId`. That id is the only handle that ties a row in this app to a
+ *  row in smtp2go's dashboard — and "was it actually sent?" is precisely the
+ *  question that took two rounds to answer when a delivered email turned out
+ *  to be sitting in a Junk folder. Narrowed to the one field worth keeping. */
 export type EmailTransport = {
   sendMail(message: {
     from: string;
@@ -69,7 +75,7 @@ export type EmailTransport = {
     text: string;
     html: string;
     attachments: { filename: string; content: Buffer; contentType: string }[];
-  }): Promise<unknown>;
+  }): Promise<{ messageId?: string }>;
 };
 
 export type EmailJobData =
@@ -102,7 +108,10 @@ export class EmailError extends Error {
 }
 
 export type EmailOutcome =
-  | { sent: true; to: string }
+  /** `to` is the address, for the log line; `toUserId` is what gets PERSISTED
+   *  (`events.ts`'s metadata policy — ids, never addresses). `messageId` is the
+   *  relay's, when it supplied one. */
+  | { sent: true; to: string; toUserId: string; messageId: string | null }
   /** Not a failure. The project has the setting off, the automatic email has
    *  already gone, or the receipt is gone — all normal, all worth naming so a
    *  log line says which. */
@@ -166,7 +175,7 @@ async function resolveRecipient(
   db: Database,
   loaded: LoadedReceipt,
   data: EmailJobData,
-): Promise<{ address: string; name: string } | null> {
+): Promise<{ address: string; name: string; userId: string } | null> {
   const userId = data.reason === "auto" ? loaded.projectOwnerId : data.toUserId;
 
   if (userId !== loaded.projectOwnerId) {
@@ -189,7 +198,7 @@ async function resolveRecipient(
     .where(eq(users.id, userId))
     .limit(1);
   if (!user) return null;
-  return { address: user.email, name: displayNameOf(user) };
+  return { address: user.email, name: displayNameOf(user), userId };
 }
 
 /** `"Ledgerly" <receipts@example.com>`. Built here rather than stored as one
@@ -267,8 +276,9 @@ export async function processReceiptEmail(
   };
   const rendered = renderReceiptEmail(message);
 
+  let messageId: string | null = null;
   try {
-    await deps.transport.sendMail({
+    const result = await deps.transport.sendMail({
       from: formatFrom(deps.from),
       to: recipient.address,
       subject: rendered.subject,
@@ -285,6 +295,9 @@ export async function processReceiptEmail(
         },
       ],
     });
+    // Optional by the transport's type, and genuinely absent on some relays —
+    // recorded when supplied, never required.
+    messageId = result.messageId ?? null;
   } catch (error) {
     // The relay's own message is the diagnosis and belongs in the log; it must
     // not become the reason code, which is matched on.
@@ -320,5 +333,5 @@ export async function processReceiptEmail(
     }
   }
 
-  return { sent: true, to: recipient.address };
+  return { sent: true, to: recipient.address, toUserId: recipient.userId, messageId };
 }

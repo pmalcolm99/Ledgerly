@@ -1,7 +1,37 @@
+import { readFileSync } from "node:fs";
+
 import type { NextConfig } from "next";
+
+/**
+ * The version, read from the repo root's package.json at BUILD time.
+ *
+ * Read rather than imported because a `.json` import inside a Next config is
+ * awkward across module formats, and because this file is evaluated by Node
+ * directly. Bumped by hand per release, mirroring Forkd.
+ */
+const rootPkg = JSON.parse(
+  readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+) as { version: string };
 
 const nextConfig: NextConfig = {
   output: "standalone",
+
+  /**
+   * Build identity, inlined at build time so any component — server or client
+   * — can render it without a round trip.
+   *
+   * `GIT_SHA` is a build ARG promoted to ENV in docker/Dockerfile's builder
+   * stage; CI passes `GIT_SHA=${{ github.sha }}`. A local `docker compose
+   * build` that passes nothing gets "dev", which is the honest answer for an
+   * image built from a working tree rather than a commit.
+   *
+   * These two are the only thing standing between an operator and grepping a
+   * JS bundle to find out which build they are running.
+   */
+  env: {
+    APP_VERSION: rootPkg.version,
+    APP_GIT_SHA: process.env.GIT_SHA ?? "dev",
+  },
   // These three are Node-native / dynamic-require-heavy and must not be
   // bundled by webpack — ARCHITECTURE.md §8.1. See src/instrumentation.ts
   // and packages/queue/src/worker.ts for how they become reachable in the

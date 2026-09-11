@@ -9,6 +9,7 @@ import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { backups } from "@ledgerly/db/schema";
 import { resolveBackupSchedule } from "@ledgerly/api/backupSchedule";
+import { recordEvent } from "@ledgerly/api/events";
 import type { Database } from "@ledgerly/db";
 
 import { getRedisConnection } from "./redis";
@@ -16,6 +17,7 @@ import { BACKUP_QUEUE_NAME, removeBackupSchedule, upsertBackupSchedule } from ".
 import {
   BackupError,
   clearBackupWorkspace,
+  pruneLogs,
   runBackup,
   type BackupDeps,
   type BackupJobData,
@@ -90,6 +92,7 @@ function backupDeps(db: Database): Omit<BackupDeps, "run"> & { run: typeof runCo
     uploadsDir: env.UPLOADS_DIR,
     includeImages: env.BACKUP_INCLUDE_IMAGES,
     retentionDays: env.BACKUP_RETENTION_DAYS,
+    logRetentionDays: env.LOG_RETENTION_DAYS,
     databaseUrl: env.DATABASE_URL,
     run: runCommand,
   };
@@ -102,6 +105,8 @@ function backupDeps(db: Database): Omit<BackupDeps, "run"> & { run: typeof runCo
  * Deliberately awaited before `startBackupWorker` returns, matching
  * `reconcilePendingExtractions`: if the schedule cannot be reconciled the
  * process should say so during startup, not on the first night nothing happens.
+ * The one exception is the log sweep at the end, which is housekeeping rather
+ * than a precondition and is left running in the background.
  */
 async function reconcileBackups(db: Database, redisUrl: string): Promise<void> {
   const env = getEnv();
@@ -117,6 +122,12 @@ async function reconcileBackups(db: Database, redisUrl: string): Promise<void> {
     .returning({ id: backups.id });
   if (interrupted.length > 0) {
     console.warn(`[ledgerly] marked ${interrupted.length} interrupted backup(s) failed at startup`);
+    await recordEvent(db, {
+      level: "warn",
+      category: "backup",
+      event: "backup.interrupted",
+      metadata: { count: interrupted.length },
+    });
   }
 
   // (2) Debris from those same kills. Safe here and nowhere else: the worker
@@ -131,9 +142,13 @@ async function reconcileBackups(db: Database, redisUrl: string): Promise<void> {
     console.error("[ledgerly] could not clean the backup workspace:", error);
   }
 
-  // (3) The schedule. `app_config` is the source of truth (D-45) and Redis is
+  // (4) The schedule. `app_config` is the source of truth (D-45) and Redis is
   // a cache of it that no backup restores, so this runs on every boot rather
   // than only when the setting changes.
+  //
+  // Deliberately BEFORE the log sweep below: registering the schedule is the
+  // step whose absence is a silent failure, and it must not queue behind
+  // housekeeping.
   try {
     const { schedule, source } = await resolveBackupSchedule(db, env.MASTER_KEY);
     if (schedule) {
@@ -146,10 +161,30 @@ async function reconcileBackups(db: Database, redisUrl: string): Promise<void> {
       // either way — with the reason, since `undecryptable` and `none` need
       // completely different fixes.
       console.warn(`[ledgerly] no scheduled backup is registered (schedule source: ${source})`);
+      // The exact silent failure Phase 9 was built to prevent, and one the
+      // admin card can only show while someone is looking at it.
+      await recordEvent(db, {
+        level: source === "undecryptable" ? "error" : "warn",
+        category: "backup",
+        event: "backup.schedule_unregistered",
+        metadata: { source },
+      });
     }
   } catch (error) {
     console.error("[ledgerly] could not reconcile the backup schedule:", error);
   }
+
+  // (5) Log retention. Also run by the backup job; the boot sweep is what makes
+  // it independent of a backup schedule existing at all — an instance that
+  // never backs up is exactly the one whose tables grow unwatched.
+  //
+  // NOT awaited. The batching inside `pruneLogs` bounds each statement, not the
+  // loop, and the first sweep on an instance that has been running since Phase
+  // 4 with no retention has a long backlog to work through. Nothing above waits
+  // on it and neither should the worker's readiness.
+  void pruneLogs({ db, retentionDays: env.LOG_RETENTION_DAYS }).catch((error: unknown) => {
+    console.error("[ledgerly] log retention sweep failed at startup:", error);
+  });
 }
 
 /**
@@ -203,6 +238,19 @@ export async function startBackupWorker(redisUrl: string): Promise<Worker<Backup
             `bytes=${result.sizeBytes} images=${result.manifest.images.count} ` +
             `pruned=${result.pruned}`,
         );
+        await recordEvent(db, {
+          level: "info",
+          category: "backup",
+          event: "backup.complete",
+          entityType: "backup",
+          entityId: result.backupId,
+          metadata: {
+            kind: job.data.kind,
+            sizeBytes: result.sizeBytes,
+            images: result.manifest.images.count,
+            pruned: result.pruned,
+          },
+        });
       } catch (error) {
         if (error instanceof BackupError && !error.retryable) {
           throw new UnrecoverableError(error.reason);
@@ -244,6 +292,20 @@ export async function startBackupWorker(redisUrl: string): Promise<Worker<Backup
             ? error.message
             : "BACKUP_FAILED";
       console.error(`[ledgerly] backup gave up id=${job.data.backupId ?? "?"} reason=${reason}`);
+      await recordEvent(db, {
+        level: "error",
+        category: "backup",
+        event: "backup.failed",
+        entityType: "backup",
+        entityId: job.data.backupId ?? null,
+        metadata: {
+          reason,
+          kind: job.data.kind,
+          ...(reason === "BACKUP_FAILED"
+            ? { error: error instanceof Error ? error.message : String(error) }
+            : {}),
+        },
+      });
       // The reason codes that say nothing are exactly the ones whose cause was
       // being thrown away, so log the underlying error for that case — the
       // lesson from Phase 6's `AI_EXTRACTION_FAILED` archaeology.

@@ -22,7 +22,7 @@
   "dependencies": {
     "@ledgerly/config": "workspace:*",
     "@ledgerly/db": "workspace:*",
-    "drizzle-orm": "^0.41.0",
+    "drizzle-orm": "~0.41.0",
     "jose": "^6.0.0",
     "react": "^19.0.0",
     "server-only": "^0.0.1",

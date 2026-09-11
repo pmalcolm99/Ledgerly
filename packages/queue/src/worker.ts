@@ -6,6 +6,7 @@ import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { resolveAiKey } from "@ledgerly/api/aiKey";
+import { recordEvent } from "@ledgerly/api/events";
 import { receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
 
@@ -166,6 +167,20 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
             `[ledgerly] failed to enqueue receipt email for ${job.data.receiptId}:`,
             enqueueError,
           );
+          // The failure that hid the colon-in-job-id bug for as long as it did:
+          // swallowed on purpose (an extraction that has been paid for must not
+          // fail over a notification), and therefore invisible. It is visible
+          // now.
+          await recordEvent(db, {
+            level: "error",
+            category: "email",
+            event: "email.enqueue_failed",
+            entityType: "receipt",
+            entityId: job.data.receiptId,
+            metadata: {
+              error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+            },
+          });
         }
       } catch (error) {
         // M-4: a 400/401/403/404 from Anthropic (a malformed request, a
@@ -233,6 +248,26 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
         );
       }
 
+      await recordEvent(db, {
+        level: "error",
+        category: "extraction",
+        event: "extraction.failed",
+        entityType: "receipt",
+        entityId: job.data.receiptId,
+        // For the unclassified case the reason code says nothing, which is
+        // exactly when the underlying message is the only useful thing — the
+        // lesson from the first real extraction run, where diagnosing a 400
+        // required a live API probe because the provider's own words had been
+        // thrown away.
+        metadata: {
+          reason,
+          attempts: job.attemptsMade,
+          ...(error instanceof ExtractError
+            ? {}
+            : { error: error instanceof Error ? error.message : String(error) }),
+        },
+      });
+
       try {
         await db
           .update(receipts)
@@ -243,6 +278,16 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
           .set({ extractionStatus: "failed", extractionError: reason, updatedAt: new Date() })
           .where(and(eq(receipts.id, job.data.receiptId), isNull(receipts.deletedAt)));
       } catch (dbError) {
+        // A receipt stuck at `pending` forever, and until now the log was the
+        // only place that said so.
+        await recordEvent(db, {
+          level: "error",
+          category: "extraction",
+          event: "extraction.status_write_failed",
+          entityType: "receipt",
+          entityId: job.data.receiptId,
+          metadata: { reason, error: dbError instanceof Error ? dbError.message : String(dbError) },
+        });
         // Never let a failure to record the failure escape as an
         // unhandled rejection out of a BullMQ event handler. Images and
         // the receipt row are untouched regardless -- CLAUDE.md's "never

@@ -13,7 +13,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
-import { backupKindEnum, backupStatusEnum } from "./enums";
+import { backupKindEnum, backupStatusEnum, eventCategoryEnum, eventLevelEnum } from "./enums";
 import { receipts } from "./receipts";
 import { users } from "./users";
 
@@ -35,7 +35,56 @@ export const auditLog = pgTable(
   (t) => [
     index("audit_log_entity_idx").on(t.entityType, t.entityId, t.createdAt.desc()),
     index("audit_log_actor_idx").on(t.actorUserId, t.createdAt.desc()),
-    index("audit_log_created_idx").on(t.createdAt.desc()),
+    // `(created_at DESC, id DESC)`, not `created_at` alone. The Logs tab's
+    // keyset cursor is the pair — `created_at` is not unique, because it
+    // defaults to `now()`, the TRANSACTION timestamp, so one mutation writing
+    // two audit rows gives them the same value to the microsecond. A
+    // single-column index cannot satisfy that ORDER BY, so the planner sorts
+    // the whole table on every page.
+    index("audit_log_created_idx").on(t.createdAt.desc(), t.id.desc()),
+  ],
+);
+
+/**
+ * docs/SCHEMA.md §app_events. What the SYSTEM did, as distinct from
+ * `audit_log`'s what a PERSON did (D-46).
+ *
+ * The two are separate tables because they are different kinds of write, not
+ * because of taste. `recordAudit` must run inside the transaction of the write
+ * it documents; an event must NOT — an "extraction failed" row written inside
+ * the transaction that then rolls back vanishes along with the failure it
+ * exists to record. The volumes differ by orders of magnitude besides.
+ *
+ * `event` is a stable code (`email.skipped`), never a prose sentence. The
+ * sentence is rendered in the UI from the code plus `metadata`, the same way
+ * `receiptLabels.ts` already renders extraction errors — prose in a column
+ * cannot be filtered, drifts from the metadata beside it, and cannot be
+ * reworded without a migration.
+ */
+export const appEvents = pgTable(
+  "app_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    at: timestamp("at", { withTimezone: true }).notNull().defaultNow(),
+    level: eventLevelEnum("level").notNull(),
+    category: eventCategoryEnum("category").notNull(),
+    event: text("event").notNull(),
+    // Free text rather than a FK: an event may name a row that has since been
+    // deleted, and losing the event with the row would defeat the point.
+    entityType: text("entity_type"),
+    entityId: uuid("entity_id"),
+    metadata: jsonb("metadata")
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+  },
+  (t) => [
+    // The Logs tab's default ordering, and what its keyset pagination seeks on.
+    // Both carry `id` as the trailing key, for the reason given on
+    // `audit_log_created_idx` above: the Logs tab orders and seeks by the
+    // `(at, id)` pair, and an index that stops at `at` leaves the planner
+    // sorting the table to break the ties.
+    index("app_events_at_idx").on(t.at.desc(), t.id.desc()),
+    index("app_events_category_idx").on(t.category, t.at.desc(), t.id.desc()),
   ],
 );
 

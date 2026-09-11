@@ -37,13 +37,19 @@ afterAll(async () => {
 
 type SentMessage = Parameters<EmailTransport["sendMail"]>[0];
 
-function fakeTransport(): { transport: EmailTransport; sent: SentMessage[] } {
+function fakeTransport(messageId = "relay-msg-1"): {
+  transport: EmailTransport;
+  sent: SentMessage[];
+} {
   const sent: SentMessage[] = [];
   return {
     sent,
     transport: {
+      // Returns a `messageId`, as a real relay does — it is the handle that
+      // ties an `app_events` row to a row in smtp2go's dashboard.
       sendMail: vi.fn(async (message: SentMessage) => {
         sent.push(message);
+        return { messageId };
       }),
     },
   };
@@ -114,7 +120,14 @@ describe("processReceiptEmail — the automatic send", () => {
 
     const outcome = await processReceiptEmail(deps(transport), { receiptId, reason: "auto" });
 
-    expect(outcome).toEqual({ sent: true, to: users.owner!.email });
+    // `toUserId` and `messageId` are what get PERSISTED to app_events — the
+    // address is only for the log line (events.ts: ids, never addresses).
+    expect(outcome).toEqual({
+      sent: true,
+      to: users.owner!.email,
+      toUserId: users.owner!.id,
+      messageId: "relay-msg-1",
+    });
     expect(sent).toHaveLength(1);
     expect(sent[0]?.subject).toContain("Costco");
     expect(sent[0]?.from).toBe('"Ledgerly" <receipts@example.com>');
@@ -225,7 +238,7 @@ describe("processReceiptEmail — the automatic send", () => {
       { receiptId, reason: "auto" },
     );
 
-    expect(outcome).toEqual({ sent: true, to: expect.any(String) });
+    expect(outcome).toMatchObject({ sent: true, to: expect.any(String) });
     expect(sent).toHaveLength(1);
   });
 
@@ -257,7 +270,12 @@ describe("processReceiptEmail — the on-demand send", () => {
       requestedBy: users.owner!.id,
     });
 
-    expect(outcome).toEqual({ sent: true, to: users.reader!.email });
+    expect(outcome).toEqual({
+      sent: true,
+      to: users.reader!.email,
+      toUserId: users.reader!.id,
+      messageId: "relay-msg-1",
+    });
     expect(sent[0]?.to).toBe(users.reader!.email);
   });
 

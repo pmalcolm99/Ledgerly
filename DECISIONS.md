@@ -1552,3 +1552,97 @@ holds pre-compressed WebP. It earns little on that content; `.tgz` is the shape
 every operator and runbook expects, and `manifest.json` does compress. If backup
 duration ever becomes the complaint, that is the line to revisit — not the
 checksums.
+
+---
+
+## D-46 — The admin Logs tab reads structured events, not container stdout; and retention applies to `audit_log` too. **Settled** (user decision).
+
+**Context.** Diagnosing the automatic receipt email (the colon-in-a-BullMQ-job-id
+bug) took two rounds, a production/dev mix-up, and finally reading
+`docker compose logs` while sitting beside the person watching their inbox. The
+reason is written down in `emailWorker.ts`: _"No database write. See the header:
+the receipt is untouched by a notification failure, so the log is the whole
+record of it."_ That reasoning was right about not marking the receipt and wrong
+about there being nowhere else to put it. An email that was skipped, failed, or
+never queued left no trace anywhere in the product.
+
+**Structured events, not raw stdout.** Tailing the container log into the UI was
+considered and rejected: it needs `/var/run/docker.sock` mounted into an
+internet-facing web app, and the Docker socket is root on the host. That is a
+far larger security change than a logs view is worth. `docker compose logs`
+remains the place for stack traces and framework noise; `app_events` carries
+what an operator needs to answer a question.
+
+**Consequence.** A second table rather than actorless `audit_log` rows — which
+would have had precedent, since `provision.ts` already writes
+`user.identity_conflict` with a null actor. The deciding reason is the write
+contract: `recordAudit` must share the transaction of the write it documents,
+and an event must not be in one at all, or an "extraction failed" row written
+inside a transaction that then rolls back disappears along with the failure. The
+volumes differ by orders of magnitude besides.
+
+**Consequence.** `recordEvent` **cannot throw**. Every insert is wrapped
+internally. A job that has already paid for an Anthropic call must not be failed
+by a logging insert — that would be D-44's lesson (never put a notification in
+the retry path of a job that costs money) repeated with a different dependency.
+
+**Consequence.** `EmailTransport.sendMail` was typed `Promise<unknown>`, which
+discarded nodemailer's `messageId`. It is now recorded. That id is the only
+handle tying a row in this app to a row in the relay's dashboard, and "was it
+actually sent?" is exactly the question that cost this session two rounds — the
+answer, eventually, being that it had been sent and was sitting in a Junk
+folder.
+
+**Consequence, and the one with a real cost.** `system.internal_error` is
+written from `trpc.ts`'s `errorFormatter` — the single biggest log-only bucket,
+every 500 in the app. It stores the path, the code, and the message run through
+`scrubLuhnSequences`; never the stack, never the request inputs. This is a
+deliberate widening: that formatter exists precisely to stop a driver's error
+text reaching a CLIENT, and the instance owner reading their own errors is a
+different threat model, but it is a widening and was reviewed as one. It is also
+the only event with a volume guard — an in-process throttle keyed on
+`(path, code)`, because a tight retry loop against a broken dependency would
+otherwise fill the table meant to explain it.
+
+**What the scrub does and does not cover.** `scrubLuhnSequences` catches card
+numbers, and the directory redaction beside it catches `UPLOADS_DIR` and
+`BACKUPS_DIR`. Neither is a general secret filter, and the review traced the
+realistic producers to confirm none of them carries a credential: `pg` puts row
+data in `error.detail`, not `error.message`; nodemailer and the Anthropic SDK
+are unreachable from any tRPC procedure, both living behind `packages/queue`;
+nothing in the repo builds an `Error` message out of a config value. What _can_
+land there is infrastructure shape — `getaddrinfo ENOTFOUND db`,
+`connect ECONNREFUSED 10.0.0.5:5432` — which D-27 called a finding when it
+reaches a client. Owner-only, and accepted as the residual, but recorded here so
+the scrub is not mistaken for the control it is not. The actual control on that
+text is shape, not content: the first line only, capped at 300 characters, and
+`drizzle-orm` pinned to `~0.41.0` — from 0.42 it wraps failures in
+`DrizzleQueryError`, whose message carries the failing SQL **and its bound
+parameters**, so a caret bump would silently have started writing request inputs
+into this table.
+
+**One gap, named rather than discovered later.** `createCallerFactory` does not
+invoke `errorFormatter`, so the one procedure path deliberately routed through
+it — the `/welcome` server action — produces no `system.internal_error` row.
+Onboarding failures remain stdout-only. The same seam is why the formatter now
+returns early under `NODE_ENV === "test"`: it reaches the database through
+`getDb()` and therefore `DATABASE_URL` rather than the injected `ctx.db`, and
+D-18 is emphatic that a test must never touch that.
+
+**Retention applies to `audit_log` too** — `LOG_RETENTION_DAYS`, 90 days, one
+clock for both tables. Chosen by the user over keeping audit rows forever, with
+the consequence stated at the time: **after 90 days, "who deleted that receipt"
+is no longer answerable.** `docs/SCHEMA.md`'s "Append-only; nothing updates or
+deletes a row" is narrowed accordingly. Splitting the variable in two is a
+one-line change if that trade stops being right.
+
+**Versioning is the version and the sha, and nothing else.** Forkd's system is
+four separable pieces — build identity, an About page, a "what's new" changelog
+popup backed by a `last_seen_changelog_version` column, and an owner-only
+restart button. Only the first was wanted. `next.config.ts` inlines
+`APP_VERSION` from the root `package.json` and `APP_GIT_SHA` from the build ARG,
+mirroring Forkd's mechanism exactly; the Dockerfile's builder stage needed
+`ENV GIT_SHA=$GIT_SHA`, which had been declared as an ARG and never used, so
+nothing had ever been inlined. It shows at the foot of the admin page and in the
+Logs tab header — the latter because which build produced a log line is the
+first thing you want when reading one.

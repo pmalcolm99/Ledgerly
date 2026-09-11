@@ -8,6 +8,10 @@ Updated at the end of every phase. Read this first in any new session.
 "the restore drill succeeds on a scratch database", and it did — the numbers are
 below and in `docs/private/PHASE9_RESTORE_DRILL.md` (gitignored).
 
+Since then, outside the phase sequence: the automatic receipt email (D-44
+follow-up), two rounds on discount receipts, and the admin Logs tab plus a build
+version (D-46). All committed; all described below, newest first.
+
 Phase 8's gate stays half-closed on the Excel half, Phase 7's on the on-device
 check, and Phase 6's on the two live-API tasks (6.3, 6.12) that need a real
 `ANTHROPIC_API_KEY`; D-12 stays Provisional. All three are unchanged by this
@@ -204,7 +208,7 @@ demonstrated rather than argued:
 
 ### Verification
 
-**794 unit tests**, up from 670. `pnpm build` still traces
+**808 unit tests**, up from 670. `pnpm build` still traces
 `sharp`/`bullmq`/`ioredis` — and now `cron-parser` — into
 `.next/standalone/node_modules`.
 
@@ -231,6 +235,163 @@ compose mode drives `docker compose` from outside the container and it needs
 `python3`, which ARCHITECTURE.md §8.1 explicitly drops from that image. An
 operator reaches it from a checkout — which is how they got `docker-compose.yml`
 in the first place.
+
+## The admin Logs tab, and a build version (D-46)
+
+Both requests came out of the same week. Diagnosing the automatic receipt email
+took two rounds, a production/dev mix-up on my part, and finally reading
+`docker compose logs` beside someone watching their inbox — where the message
+turned out to have been delivered to Junk. Nothing in the product could say an
+email had been skipped, had failed, or had never been queued.
+
+`emailWorker.ts` had written the reason down: _"No database write. See the
+header: the receipt is untouched by a notification failure, so the log is the
+whole record of it."_ Right about not marking the receipt. Wrong about there
+being nowhere else to put it.
+
+### `app_events`, and why it is not `audit_log`
+
+A second table, migration `0007`. `audit_log` says what a PERSON did; this says
+what the SYSTEM did.
+
+The separation is **the write contract**, not taste — and `audit_log` already
+holds actorless rows (`user.identity_conflict`), so "has an actor" was never the
+distinction. `recordAudit` must run inside the transaction of the write it
+documents. An event must not be in one at all: an "extraction failed" row
+written inside a transaction that then rolls back vanishes along with the
+failure it exists to record. It has to survive precisely the case it describes.
+
+**`recordEvent` cannot throw.** Every insert is wrapped internally. A job that
+has already paid for an Anthropic call must not be failed by a logging insert —
+D-44's lesson (never put a notification in the retry path of a job that costs
+money) with a different dependency. Asserted with an exploding fake db.
+
+`event` is a stable code, never prose. The sentence is rendered from the code
+plus metadata in `lib/logLabels.ts`, the way extraction errors already are.
+Prose in a column cannot be filtered, drifts from the metadata beside it, and
+cannot be reworded without a migration. An **unrecognised** code renders as the
+raw code rather than being hidden — a log with a blind spot exactly where a new
+failure would appear is worse than no log.
+
+### The Logs tab
+
+`/admin/logs`, one chronological timeline over both tables, merged with a
+`UNION ALL` and keyset-paginated on `(at DESC, id DESC)`.
+
+**A union rather than two lists**, because paging two lists independently and
+interleaving them client-side is wrong at every page boundary: you cannot know
+whether the next audit row belongs before or after the last event row without
+fetching both past the cut. The tests that matter walk the whole set in small
+pages and assert nothing is dropped or repeated at the seam — at one-second
+spacing, at 100µs spacing, and with every row sharing one timestamp exactly.
+The last two exist because the first one passed against a broken cursor; see
+the review below.
+
+Three things the tests caught that a careful read had not:
+
+- **`db.execute` does not map `timestamptz` to a `Date`.** Drizzle does that
+  only for a typed `select()`; a raw `sql` template hands back what
+  node-postgres parsed, which is a string.
+- **And it must not be mapped to one.** A `Date` cannot hold microseconds, so
+  the cursor carries the timestamp as a string from the row to the
+  `::timestamptz` cast that reads it back, and becomes a `Date` only on the way
+  to the UI. The string's shape is pinned by `to_char` rather than inherited
+  from the session's `DateStyle`, so the cursor's wire format is this query's
+  contract and not a server setting's.
+- **`withCleanDatabase`'s truncate list is hand-written and did not know about
+  `app_events`.** Rows leaked between tests. Exactly the drift `appTableNames()`
+  was introduced to avoid for the backup manifest, in the one list that cannot
+  be derived.
+
+### Email finally has a disposition
+
+`EmailTransport.sendMail` was typed `Promise<unknown>`, discarding nodemailer's
+`messageId`. It is recorded now — the only handle tying a row here to a row in
+smtp2go's dashboard, and the answer to the question that cost two rounds. The
+recipient is stored as a **user id, never an address** (D-44's rule, and
+`audit.ts`'s metadata policy); the Logs UI resolves the name by join.
+
+### The one with a real cost
+
+`system.internal_error` is written from `trpc.ts`'s `errorFormatter` — the
+single biggest log-only bucket, every 500 in the app. It stores the path, the
+code, and the message — scrubbed, reduced to its first line, and capped at 300
+characters; never the stack, never the inputs.
+
+That formatter exists precisely to stop a driver's error text reaching a
+**client**. Storing it for the instance owner is a different threat model, but
+it is a deliberate widening and was flagged to the reviewer as one. It is also
+the only event with a volume guard: an in-process throttle keyed on
+`(path, code)`, because a tight retry loop against a broken dependency would
+otherwise fill the table meant to explain it.
+
+### Retention, including the audit log
+
+`LOG_RETENTION_DAYS=90`, pruning **both** tables on one clock — chosen over
+keeping audit rows forever, with the consequence stated at the time: after 90
+days, "who deleted that receipt" is no longer answerable. `docs/SCHEMA.md`'s
+"Append-only; nothing updates or deletes a row" is narrowed to say so. Splitting
+the variable in two is a one-line change if that stops being the right trade.
+
+Run from the backup job AND the worker's boot sweep — the second so that an
+instance with no backup schedule still prunes, which is exactly the instance
+least likely to notice a table growing. The boot sweep runs last and
+un-awaited: batching bounds each statement, not the loop, and registering the
+backup schedule is the step whose absence is a silent failure, so it must not
+queue behind housekeeping.
+
+### Version and sha
+
+Forkd's versioning is four separable pieces; only the first was wanted, so there
+is no About page, no changelog popup, and no restart button.
+
+`next.config.ts` inlines `APP_VERSION` from the root `package.json` and
+`APP_GIT_SHA` from the build ARG, mirroring Forkd's mechanism. The Dockerfile's
+**builder** stage had declared `ARG GIT_SHA` and never used it, so nothing had
+ever been inlined — `ENV GIT_SHA=$GIT_SHA` was the missing line. Verified by
+building with `GIT_SHA=abc1234def5678` and finding it in the emitted admin
+pages.
+
+Shown at the foot of the admin page and in the Logs tab header, the latter
+because which build produced a log line is the first thing you want when reading
+one. Answering that question took a bundle grep three times in one session.
+
+### Verification
+
+**811 unit tests**, up from 808 for Phase 9 — 17 of them over `admin.logs` and
+`recordEvent`. `pnpm lint`, `pnpm typecheck` and `pnpm build` clean. Migration
+`0007` applied to a freshly reset test database; the index fix measured with
+`EXPLAIN` on 150k seeded rows.
+
+### Review — what was found and what was done
+
+Two `reviewer` passes. The first found **1 high, 3 medium and 7 low**; the
+second, run over the tree as the first pass's fixes were landing, confirmed
+three of those fixes empirically and found **1 medium and 5 low** of its own —
+including a defect in the first pass's own performance fix. All of it is fixed.
+
+The high is the one worth remembering, because **the feature's own test suite
+passed while the feature was broken**, and the test was the reason it passed:
+
+| Sev      | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Fix                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **High** | **The Logs tab silently hid rows at every page boundary.** `timestamptz` is microsecond-precision and a JS `Date` is millisecond-precision, so the cursor carried the boundary row's `at` rounded DOWN — and every row in the rounded-away remainder sorts below it, is skipped by the next page, and is never returned by any page. Reproduced: 10 rows, 3 reachable, `nextCursor` null, UI rendering "That is everything." Not exotic — `created_at` defaults to `now()`, the TRANSACTION timestamp, so two audit rows from one mutation share it exactly.                                                                                                                                                                                                                                                                                                                                                                       | The timestamp is a string end to end and never becomes a `Date` before the cursor. **The seam test could not catch it**: `interleaved()` spaced rows 1000 ms apart, which is precisely the case where truncation is a no-op. New tests at 100µs spacing and at an identical timestamp; both fail on the old code by exactly the reviewer's numbers.                                            |
+| Med      | **Every page seq-scanned both tables in full.** The comment claimed each branch used its own index; `EXPLAIN` at 200k rows said 3964 buffers and 48 ms. A `ROW(at, id) <` comparison cannot use a single-column index, and with no `LIMIT` inside the UNION branches the planner produced every matching row and top-N sorted the lot — the query getting slower exactly as the instance gets sicker.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Composite `(at DESC, id DESC)` indexes on both tables, and `ORDER BY … LIMIT` pushed into each branch. 8 buffers, 0.087 ms.                                                                                                                                                                                                                                                                    |
+| Med      | **…and that fix did not work, which the second pass caught.** `ORDER BY x DESC` means `DESC NULLS FIRST` in postgres; an index declared `DESC` through drizzle is `DESC NULLS LAST`. The pathkeys disagree, so the Merge Append the new indexes existed for was **not a candidate plan at all** — not merely a costlier one. It stays a full sort even with `enable_seqscan = off`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `NULLS LAST` on every ordering key. Both columns are `NOT NULL`, so no result changes. Confirmed on 150k rows: `Seq Scan` on both tables → `Index Only Scan` on both.                                                                                                                                                                                                                          |
+| Med      | **`pruneLogs` materialised every deleted id in the worker heap**, in one unbounded statement holding locks against concurrent `recordAudit` inserts. `.returning({ id })` was used only to call `.length`. The first sweep after this ships is the whole historical backlog at once.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `ctid IN (SELECT … LIMIT 10000)` in a loop, counted by `rowCount`.                                                                                                                                                                                                                                                                                                                             |
+| Med      | **A failing backup prune cancelled log retention.** Both sweeps shared one `try` and the log sweep was second, so an `EACCES` unlinking one stale archive meant retention silently never ran — covered up only by a restart.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Separate `try`/`catch` each. Neither can fail the backup job, which was the property that mattered and which held.                                                                                                                                                                                                                                                                             |
+| Low ×12  | `instance.owner_elected` stored an email address, and the Logs tab now returns audit metadata to a browser verbatim; `safeMetadata`'s path redaction was shallow while the Luhn scrub beside it recursed; the `errorFormatter` reached the database through `DATABASE_URL` rather than `ctx.db`, so the first test to exercise the HTTP adapter would have written into the dev database (D-18); the cursor was an unvalidated string reaching a `::timestamptz` cast, where a malformed value would 500 and write a row into the table it was reading; its format was inherited from the session's `DateStyle` GUC; `new Date()` was parsing postgres' non-ISO text form through V8's implementation-defined fallback; the boot sweep blocked backup-schedule registration behind housekeeping; `logLabels.ts` carried a case for an event nothing emits, and `EVENT_CATEGORIES` offered two filter chips that could never match. | All fixed: the id not the address, recursive redaction, an early return under `NODE_ENV === "test"`, a regex-validated cursor whose format `to_char` pins rather than the server, an explicit ISO parse, the sweep moved after schedule registration and un-awaited, the dead label dropped, `auth` dropped from the enum, and `upload` given the two emitters it was always supposed to have. |
+
+Two more worth recording because they are about the future rather than today.
+`drizzle-orm` is now pinned `~0.41.0`: from 0.42 it wraps failures in
+`DrizzleQueryError`, whose message carries the failing SQL **and its bound
+parameters**, so a caret bump would silently have begun writing request inputs
+into an owner-readable table — and `system.internal_error` now stores the first
+line only, capped, as the version-independent half of that defence. And the
+first pass's own `EXPLAIN` measurements were taken against two indexes that
+existed only in the test database and in no migration; the second pass found
+them, dropped them, and re-measured. A plan verified against a phantom index is
+not verified.
 
 ## Discounts, round two — the prompt was the bug
 

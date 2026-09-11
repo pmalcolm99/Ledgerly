@@ -93,7 +93,7 @@ importers:
         specifier: ^5.34.0
         version: 5.81.4
       drizzle-orm:
-        specifier: ^0.41.0
+        specifier: ~0.41.0
         version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       exceljs:
         specifier: ^4.4.0
@@ -184,7 +184,7 @@ importers:
         specifier: ^4.9.0
         version: 4.9.0
       drizzle-orm:
-        specifier: ^0.41.0
+        specifier: ~0.41.0
         version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       exceljs:
         specifier: ^4.4.0
@@ -221,7 +221,7 @@ importers:
         specifier: workspace:*
         version: link:../db
       drizzle-orm:
-        specifier: ^0.41.0
+        specifier: ~0.41.0
         version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       jose:
         specifier: ^6.0.0
@@ -271,7 +271,7 @@ importers:
   packages/db:
     dependencies:
       drizzle-orm:
-        specifier: ^0.41.0
+        specifier: ~0.41.0
         version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       pg:
         specifier: ^8.14.0
@@ -323,7 +323,7 @@ importers:
         specifier: ^5.34.0
         version: 5.81.4
       drizzle-orm:
-        specifier: ^0.41.0
+        specifier: ~0.41.0
         version: 0.41.0(@types/pg@8.23.1)(pg@8.23.0)
       ioredis:
         specifier: ^5.4.2

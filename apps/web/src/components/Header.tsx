@@ -79,6 +79,18 @@ export function Header({
 
   const nav = isInstanceOwner ? [...BASE_NAV, { href: "/admin", label: "Admin" }] : BASE_NAV;
 
+  /**
+   * Whether a nav entry should read as current.
+   *
+   * Exact match everywhere except Admin, which now has sub-pages (`/admin/logs`)
+   * — without the prefix case, opening the Logs tab leaves the whole header
+   * looking as though you are nowhere.
+   */
+  function isActive(pathname: string, href: string): boolean {
+    if (href === "/admin") return pathname === href || pathname.startsWith("/admin/");
+    return pathname === href;
+  }
+
   const setTheme = trpc.auth.setTheme.useMutation({
     onSuccess: () => utils.auth.me.invalidate(),
   });
@@ -122,10 +134,10 @@ export function Header({
 
       <NavbarContent className="hidden gap-6 sm:flex" justify="center">
         {nav.map((item) => (
-          <NavbarItem key={item.href} isActive={pathname === item.href}>
+          <NavbarItem key={item.href} isActive={isActive(pathname, item.href)}>
             <NextLink
               href={item.href}
-              className={pathname === item.href ? "text-primary" : "text-foreground"}
+              className={isActive(pathname, item.href) ? "text-primary" : "text-foreground"}
             >
               {item.label}
             </NextLink>

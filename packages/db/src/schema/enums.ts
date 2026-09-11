@@ -18,3 +18,15 @@ export const extractionStatusEnum = pgEnum("extraction_status", [
 ]);
 export const backupKindEnum = pgEnum("backup_kind", ["manual", "scheduled"]);
 export const backupStatusEnum = pgEnum("backup_status", ["running", "complete", "failed"]);
+
+// The Logs tab (D-46). `event_level` is ordered info < warn < error and the
+// order is not load-bearing today, but it is declared that way so a future
+// "errors only" filter can use a range rather than an IN list.
+export const eventLevelEnum = pgEnum("event_level", ["info", "warn", "error"]);
+export const eventCategoryEnum = pgEnum("event_category", [
+  "extraction",
+  "email",
+  "backup",
+  "upload",
+  "system",
+]);

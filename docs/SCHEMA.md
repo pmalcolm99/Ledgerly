@@ -470,7 +470,7 @@ CREATE INDEX audit_log_actor_idx   ON audit_log (actor_user_id, created_at DESC)
 CREATE INDEX audit_log_created_idx ON audit_log (created_at DESC);
 ```
 
-Append-only; nothing updates or deletes a row. The security checklist requires
+Append-only while it is retained: nothing UPDATES a row, and only the retention sweep deletes one (D-46, `LOG_RETENTION_DAYS`, 90 days by default). That is a deliberate narrowing of the original guarantee — after the window, a deletion or a permission grant is no longer provable. The security checklist requires
 entries for **permission grants, deletions, and exports**; also logged: first-
 owner election, role changes, the account re-link action (D-06), and category
 deletion.
@@ -506,6 +506,56 @@ CREATE INDEX backups_started_idx ON backups (started_at DESC) WHERE deleted_at I
 per-table row counts, image count, SHA-256 checksums. Retention prunes by
 `started_at` past `BACKUP_RETENTION_DAYS`, soft-deleting the row and unlinking
 the file — Forkd's pattern (`docs/reference/FORKD_INFRA.md`).
+
+---
+
+## app_events
+
+```sql
+CREATE TYPE event_level    AS ENUM ('info', 'warn', 'error');
+CREATE TYPE event_category AS ENUM ('extraction','email','backup','upload','auth','system');
+
+CREATE TABLE app_events (
+  id          uuid           PRIMARY KEY DEFAULT gen_random_uuid(),
+  at          timestamptz    NOT NULL DEFAULT now(),
+  level       event_level    NOT NULL,
+  category    event_category NOT NULL,
+  event       text           NOT NULL,
+  entity_type text,
+  entity_id   uuid,
+  metadata    jsonb          NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX app_events_at_idx       ON app_events (at DESC);
+CREATE INDEX app_events_category_idx ON app_events (category, at DESC);
+```
+
+What the SYSTEM did, as distinct from `audit_log`'s what a PERSON did (D-46).
+Both feed the admin Logs tab as one timeline.
+
+**Why it is a separate table.** `recordAudit` must run inside the transaction of
+the write it documents; `recordEvent` must not. An "extraction failed" row
+written inside the transaction that then rolls back vanishes along with the
+failure it exists to record — the event has to survive precisely the case it
+describes. `audit_log` also already contains actorless rows
+(`user.identity_conflict`), so the distinction is the write contract, not the
+presence of an actor.
+
+`event` is a **stable code**, never prose: `email.skipped`, `backup.failed`. The
+sentence is rendered in the UI from the code plus `metadata`
+(`apps/web/src/lib/logLabels.ts`), the same way extraction errors already are.
+Prose in a column cannot be filtered, drifts from the metadata beside it, and
+cannot be reworded without a migration.
+
+`metadata` follows `audit_log`'s policy exactly — ids, never addresses, never
+secrets. An email's recipient is a `toUserId`; the address is resolved by join
+at read time. `recordEvent` additionally stamps the build's short git sha onto
+every row, because "which build produced this" is the first question asked of
+any log line.
+
+Pruned by `LOG_RETENTION_DAYS` (90 days), from both the backup job and the
+worker's boot sweep — the second so that an instance with no backup schedule
+still prunes.
 
 ---
 

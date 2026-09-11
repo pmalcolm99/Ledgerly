@@ -27,6 +27,7 @@ import { NEEDS_REVIEW_SQL } from "../receiptAccess";
 import { checkRateLimit, checkWindowedRateLimit } from "../rateLimit";
 import { scopedProjects } from "../scope";
 import { SECRET_KEYS, deleteSecret, writeSecret } from "../secrets";
+import { EVENT_CATEGORIES } from "../events";
 import { describeBackupSchedule, serializeBackupSchedule, validateCron } from "../backupSchedule";
 import {
   describeSmtpConfig,
@@ -59,6 +60,25 @@ function priceForModel(model: string): { input: number; output: number } | null 
  */
 
 const CF_ACCESS_SUB_UNIQUE_INDEX = "users_cf_access_sub_key";
+
+/**
+ * The Logs tab's timestamps, rendered to a format this query defines rather
+ * than one it inherits: `2026-09-11T08:33:56.787088Z`, microseconds intact.
+ *
+ * Postgres' own text output for a `timestamptz` (`2026-09-11 08:33:56.787088+00`)
+ * is not ISO 8601 — a space where ISO wants a `T`, a bare `+00` offset — so
+ * parsing it in JS is implementation-defined, and its exact shape depends on
+ * the session's `DateStyle` and `TimeZone` settings. That makes a server
+ * setting part of the cursor's wire format, which is not a contract anyone
+ * chose. `AT TIME ZONE 'UTC'` pins the zone and `to_char` pins the shape, so
+ * the same row yields the same cursor on any instance.
+ */
+function cursorText(column: ReturnType<typeof sql>) {
+  return sql`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+}
+
+/** Exactly what `cursorText` emits, and nothing else. */
+const CURSOR_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 
 export const adminRouter = router({
   /**
@@ -379,6 +399,204 @@ export const adminRouter = router({
         .limit(input?.limit ?? 50);
 
       return rows;
+    }),
+
+  /**
+   * The Logs tab (D-46) — one chronological timeline over two tables.
+   *
+   * `audit_log` says what a PERSON did; `app_events` says what the SYSTEM did.
+   * They are separate tables for a reason (see `events.ts`), but an operator
+   * asking "what happened around 04:54?" does not care which one a row came
+   * from, so they are merged here rather than in the reader's head.
+   *
+   * **Why a UNION rather than two queries.** Paging two lists independently and
+   * interleaving them client-side gets the ordering wrong at every page
+   * boundary — you cannot know whether the next `audit_log` row belongs before
+   * or after the last `app_events` row you fetched without fetching both past
+   * the cut. One ordered query is the only version that is correct at the seam.
+   *
+   * Keyset-paginated on `(at DESC, id DESC)`, the same shape
+   * `receipts.reviewQueue` uses, reversed. Both underlying indexes
+   * (`audit_log_created_idx`, `app_events_at_idx`) are already `DESC`. The id
+   * is the tiebreak, and it matters more here than usual: two rows in two
+   * different tables can share a timestamp to the microsecond, and without a
+   * deterministic second key a page boundary could drop or repeat one.
+   *
+   * Read-only, so no rate limit — matching every other admin query.
+   */
+  logs: ownerProcedure
+    .input(
+      z.object({
+        source: z.enum(["all", "activity", "system"]).default("all"),
+        category: z.enum(EVENT_CATEGORIES).optional(),
+        level: z.enum(["info", "warn", "error"]).optional(),
+        limit: z.number().int().min(1).max(200).default(50),
+        // `at` is a STRING, deliberately. A postgres `timestamptz` is
+        // microsecond-precision and a JS `Date` is millisecond-precision, so
+        // round-tripping the cursor through a `Date` truncates it — and a
+        // truncated boundary is not a no-op, it is data loss: every row in the
+        // sub-millisecond remainder sorts BELOW the boundary row and is skipped
+        // by the next page, permanently. Rows sharing a microsecond are
+        // ordinary here, not exotic — `audit_log.created_at` defaults to
+        // `now()`, which is the TRANSACTION timestamp, so two audit rows
+        // written by one mutation have identical `created_at`. The value is
+        // carried verbatim from the row to the `::timestamptz` cast that reads
+        // it back, and is never parsed in JS at all.
+        //
+        // Validated against the exact shape the query emits (see `at_text`
+        // below), not merely typed as a string. It is a bound parameter, so
+        // there is no injection either way — but an arbitrary string reaches a
+        // `::timestamptz` cast, and a cast error is a 500, which now writes a
+        // `system.internal_error` row. A malformed cursor should be a 400 that
+        // records nothing.
+        cursor: z.object({ at: z.string().regex(CURSOR_AT), id: z.string().uuid() }).nullish(),
+      }),
+    )
+    .query(async ({ ctx, input }) => {
+      // `sql.raw` is never used here: every interpolation below is a bound
+      // parameter, and the enum-ish inputs are already constrained by zod.
+      // The cursor predicate is applied INSIDE each branch rather than around
+      // the union, so each one can use its own index instead of the planner
+      // materialising both tables in full and filtering afterwards.
+      // A row-level filter that applies to `app_events` only. When the caller
+      // asks for a level or a category, audit rows cannot satisfy it — they
+      // have neither — so the activity half is excluded rather than silently
+      // ignoring the filter.
+      const wantsEventOnlyFilter = input.level !== undefined || input.category !== undefined;
+      const includeActivity =
+        (input.source === "all" || input.source === "activity") && !wantsEventOnlyFilter;
+      const includeSystem = input.source === "all" || input.source === "system";
+
+      const levelFilter = input.level ? sql`AND level = ${input.level}::event_level` : sql``;
+      const categoryFilter = input.category
+        ? sql`AND category = ${input.category}::event_category`
+        : sql``;
+
+      // `limit + 1` so "is there another page" is answered without a count.
+      const take = input.limit + 1;
+
+      // Each branch carries its OWN `ORDER BY ... LIMIT`, matching the
+      // `(at DESC, id DESC)` index on its table, and the outer query re-sorts
+      // the two already-sorted heads. Without this the planner has no reason to
+      // stop early: it reads both tables in full, concatenates them, and sorts
+      // the lot to return fifty rows. At most `take` rows can come from either
+      // branch, so limiting each one cannot change the merged result.
+      const activityQuery = sql`
+        (SELECT 'activity'::text AS source, a.id, a.created_at AS at,
+                ${cursorText(sql`a.created_at`)} AS at_text,
+                NULL::event_level AS level, NULL::event_category AS category,
+                a.action AS event, a.entity_type, a.entity_id, a.metadata,
+                a.actor_user_id
+           FROM audit_log a
+          WHERE true ${input.cursor ? sql`AND (a.created_at, a.id) < (${input.cursor.at}::timestamptz, ${input.cursor.id}::uuid)` : sql``}
+          ORDER BY a.created_at DESC NULLS LAST, a.id DESC NULLS LAST
+          LIMIT ${take})
+      `;
+      const systemQuery = sql`
+        (SELECT 'system'::text AS source, e.id, e.at,
+                ${cursorText(sql`e.at`)} AS at_text,
+                e.level, e.category,
+                e.event, e.entity_type, e.entity_id, e.metadata,
+                NULL::uuid AS actor_user_id
+           FROM app_events e
+          WHERE true ${input.cursor ? sql`AND (e.at, e.id) < (${input.cursor.at}::timestamptz, ${input.cursor.id}::uuid)` : sql``}
+                ${levelFilter} ${categoryFilter}
+          ORDER BY e.at DESC NULLS LAST, e.id DESC NULLS LAST
+          LIMIT ${take})
+      `;
+
+      const parts = [
+        ...(includeActivity ? [activityQuery] : []),
+        ...(includeSystem ? [systemQuery] : []),
+      ];
+      if (parts.length === 0) return { items: [], nextCursor: null };
+
+      const unioned = parts.length === 1 ? parts[0]! : sql`${parts[0]!} UNION ALL ${parts[1]!}`;
+
+      // `NULLS LAST` on both keys, and it is load-bearing rather than
+      // decorative: `ORDER BY x DESC` means `DESC NULLS FIRST` in postgres,
+      // while an index declared `DESC` through drizzle is `DESC NULLS LAST`.
+      // The pathkeys then do not match, and the Merge Append these composite
+      // indexes exist for is not a candidate plan at all — not merely a more
+      // expensive one. Both columns are `NOT NULL`, so this changes no result;
+      // it only lets the planner see the index. The same clause is on each
+      // branch above for the same reason.
+      const result = await ctx.db.execute(sql`
+        SELECT * FROM (${unioned}) AS merged
+         ORDER BY at DESC NULLS LAST, id DESC NULLS LAST
+         LIMIT ${take}
+      `);
+
+      // `at` is a STRING, not a Date. Drizzle maps column types only for a
+      // typed `select()`; `execute` with a raw `sql` template hands back
+      // whatever node-postgres parsed, and a timestamptz arrives as text.
+      //
+      // That string is kept as a string all the way to `nextCursor`. It is
+      // converted to a `Date` only where the row is handed to the UI, because
+      // a `Date` cannot hold the microseconds postgres is sorting by.
+      type Row = {
+        source: "activity" | "system";
+        id: string;
+        /** Only ever ordered by; `at_text` is what leaves this procedure. */
+        at: string;
+        at_text: string;
+        level: "info" | "warn" | "error" | null;
+        category: string | null;
+        event: string;
+        entity_type: string | null;
+        entity_id: string | null;
+        metadata: Record<string, unknown>;
+        actor_user_id: string | null;
+      };
+      const all = result.rows as unknown as Row[];
+      const page = all.slice(0, input.limit);
+
+      // Actor names resolved in ONE query rather than per row. `displayNameOf`
+      // with `email: null` for the same reason the export uses it that way: a
+      // log line names the identity, not the person's address.
+      const actorIds = [
+        ...new Set(page.map((r) => r.actor_user_id).filter((v): v is string => !!v)),
+      ];
+      const actors =
+        actorIds.length > 0
+          ? await ctx.db
+              .select({
+                id: users.id,
+                displayName: users.displayName,
+                firstName: users.firstName,
+                lastName: users.lastName,
+              })
+              .from(users)
+              .where(inArray(users.id, actorIds))
+          : [];
+      const actorName = new Map(
+        actors.map((a) => [a.id, displayNameOf({ ...a, email: null })] as const),
+      );
+
+      return {
+        items: page.map((row) => ({
+          source: row.source,
+          id: row.id,
+          // Parsed HERE and only here, and from `at_text` — strict ISO 8601
+          // in UTC, so this is the spec-defined parse rather than V8's
+          // implementation-defined fallback for postgres' native text form.
+          // The microseconds are dropped, which is correct: a `Date` cannot
+          // hold them and the UI renders to the minute. They survive where it
+          // matters, in the cursor, which never becomes a `Date`.
+          at: new Date(row.at_text),
+          level: row.level,
+          category: row.category,
+          event: row.event,
+          entityType: row.entity_type,
+          entityId: row.entity_id,
+          metadata: row.metadata,
+          actorName: row.actor_user_id ? (actorName.get(row.actor_user_id) ?? null) : null,
+        })),
+        nextCursor:
+          all.length > input.limit && page.length > 0
+            ? { at: page[page.length - 1]!.at_text, id: page[page.length - 1]!.id }
+            : null,
+      };
     }),
 
   /**

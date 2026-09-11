@@ -107,6 +107,16 @@ const rawSchema = z.object({
   DEFAULT_CURRENCY: z.string().length(3).default("USD"),
   BACKUP_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   BACKUP_INCLUDE_IMAGES: zBoolEnv(false),
+  /**
+   * How long the Logs tab keeps history (D-46) — BOTH `app_events` and
+   * `audit_log`, on one clock, by explicit choice.
+   *
+   * Worth stating plainly because it changes a property `docs/SCHEMA.md` used
+   * to guarantee: `audit_log` was append-only, and after this a deletion or a
+   * permission grant stops being provable once it ages out. Raise this, or
+   * split it in two, if that trade stops being the right one.
+   */
+  LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
 });
 
 type RawEnv = z.infer<typeof rawSchema>;

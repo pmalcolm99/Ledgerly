@@ -5,6 +5,7 @@ import nodemailer from "nodemailer";
 import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { resolveSmtpConfig, type SmtpConfig } from "@ledgerly/api/smtp";
+import { recordEvent } from "@ledgerly/api/events";
 
 import { getRedisConnection } from "./redis";
 import { RECEIPT_EMAIL_QUEUE_NAME } from "./queue";
@@ -106,11 +107,37 @@ export async function startEmailWorker(redisUrl: string): Promise<Worker<EmailJo
         // answer should be one grep away.
         if (outcome.sent) {
           console.log(`[ledgerly] receipt email sent receipt=${job.data.receiptId}`);
+          await recordEvent(db, {
+            level: "info",
+            category: "email",
+            event: "email.sent",
+            entityType: "receipt",
+            entityId: job.data.receiptId,
+            // The recipient as an ID, not an address (events.ts's policy); the
+            // relay's own message id is the handle that ties this row to a row
+            // in smtp2go's dashboard.
+            metadata: {
+              reason: job.data.reason,
+              toUserId: outcome.toUserId,
+              messageId: outcome.messageId,
+            },
+          });
         } else {
           console.log(
             `[ledgerly] receipt email skipped receipt=${job.data.receiptId} ` +
               `reason=${outcome.skipped}`,
           );
+          // A skip is not an error, but it IS the answer to "why did no email
+          // arrive" — which is the question this feature actually generates,
+          // and which previously could only be answered from container logs.
+          await recordEvent(db, {
+            level: "warn",
+            category: "email",
+            event: "email.skipped",
+            entityType: "receipt",
+            entityId: job.data.receiptId,
+            metadata: { reason: outcome.skipped, trigger: job.data.reason },
+          });
         }
       } catch (error) {
         if (error instanceof EmailError && !error.retryable) {
@@ -135,11 +162,21 @@ export async function startEmailWorker(redisUrl: string): Promise<Worker<EmailJo
     if (!isUnrecoverable && job.attemptsMade < attempts) return;
     const reason =
       error instanceof EmailError ? error.reason : (error?.message ?? "EMAIL_SEND_FAILED");
-    // No database write. See the header: the receipt is untouched by a
-    // notification failure, so the log is the whole record of it.
+    // The RECEIPT is still untouched by a notification failure — see the
+    // header, and that reasoning has not changed. What has changed is that the
+    // log is no longer the whole record of it: the event goes to `app_events`,
+    // which is about the system rather than about the receipt.
     console.error(
       `[ledgerly] receipt email gave up receipt=${job.data.receiptId} reason=${reason}`,
     );
+    void recordEvent(db, {
+      level: "error",
+      category: "email",
+      event: "email.gave_up",
+      entityType: "receipt",
+      entityId: job.data.receiptId,
+      metadata: { reason, trigger: job.data.reason, attempts: job.attemptsMade },
+    });
   });
 
   sharedEmailWorker = worker;

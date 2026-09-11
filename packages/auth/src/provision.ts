@@ -244,7 +244,12 @@ export async function resolveUserForIdentity(
       action: "instance.owner_elected",
       entityId: outcome.user.id,
       actorUserId: outcome.user.id,
-      metadata: { email: outcome.user.email },
+      // The id, not the address. `audit.ts`'s policy always said so, and this
+      // row was the one exception — invisible until the Logs tab started
+      // returning audit metadata to a browser verbatim (D-46). The console
+      // line above still names the address, because a boot warning telling an
+      // operator to "verify this is the intended owner" is useless without it.
+      metadata: { userId: outcome.user.id },
     });
   }
 
