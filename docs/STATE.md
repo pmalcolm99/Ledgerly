@@ -47,6 +47,24 @@ The button also gained a busy state and an error line. The bug was **silent** �
 a blank view is indistinguishable from a slow one — and the handler already
 answers a rate limit as prose written for a person, which was being thrown away.
 
+**Three attempts, and the third one is the lesson.** The final cause was one
+line: `browserSaveDeps` returned `fetchImpl: fetch`, a bare reference, and
+`saveExport` calls it as `deps.fetchImpl(...)` — a method call, so `this` is the
+deps object. WebKit enforces the receiver on `Window.fetch`; Chrome, Firefox and
+Node do not. **The request never left the device**, so every theory built on
+what the server sent back was reasoning about a response nobody had asked for.
+
+No test caught it because the injection seam exists to let the routing logic be
+tested without a browser — which means the one function that touches the browser
+is the one function no test ran. `browserSaveDeps` had no test at all. It has
+two now, stubbing the platform with implementations that record their RECEIVER,
+so a wrongly-bound call fails in Node too.
+
+The account below is what was believed at attempt two. It is kept because the
+reasoning is instructive and because the `inline` disposition it introduced is
+still in the code — defensible on its own terms, and explicitly not claimed as
+the fix.
+
 **The first fix was not enough, and the second attempt is the interesting one.**
 On the device it still failed — but now with a visible error, which is what the
 error line was added for. Desktop and Safari-as-a-browser were fine, and that

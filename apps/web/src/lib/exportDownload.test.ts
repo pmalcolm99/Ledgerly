@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { filenameFromDisposition, saveExport } from "./exportDownload";
+import { browserSaveDeps, filenameFromDisposition, saveExport } from "./exportDownload";
 import type { SaveDeps } from "./exportDownload";
 
 /**
@@ -205,5 +205,68 @@ describe("saveExport — an installed app", () => {
     if (result.ok) return;
     expect(result.message).toContain("TypeError");
     expect(result.message).toContain("Load failed");
+  });
+});
+
+/**
+ * THE ONLY TESTS THAT TOUCH `browserSaveDeps`, and the reason they exist.
+ *
+ * The injection seam above lets the routing logic be tested without a browser
+ * — which means the one function that actually touches the browser was the one
+ * function no test ever ran. It shipped as `fetchImpl: fetch`, a bare
+ * reference, and `saveExport` calls it as `deps.fetchImpl(...)`: a method call,
+ * so `this` is the deps object. WebKit enforces the receiver on `Window.fetch`
+ * and threw *"Can only call Window.fetch on instances of Window"*. Chrome,
+ * Firefox and Node are all lenient, so it failed on exactly one platform and
+ * nowhere the suite was looking.
+ *
+ * These stub the platform with implementations that RECORD their receiver, so
+ * the wrongly-bound call is visible in an environment that would otherwise
+ * accept it.
+ */
+describe("browserSaveDeps", () => {
+  function withFakeWindow<T>(body: () => T): T {
+    const globals = globalThis as unknown as Record<string, unknown>;
+    const realWindow = globals.window;
+    const realFetch = globals.fetch;
+    globals.window = {
+      navigator: { standalone: true },
+      matchMedia: () => ({ matches: false }),
+    };
+    try {
+      return body();
+    } finally {
+      globals.window = realWindow;
+      globals.fetch = realFetch;
+    }
+  }
+
+  it("calls fetch with the right receiver, not with the deps object", async () => {
+    const receivers: unknown[] = [];
+    let deps: ReturnType<typeof browserSaveDeps> | undefined;
+
+    await withFakeWindow(async () => {
+      (globalThis as unknown as Record<string, unknown>).fetch = function (this: unknown) {
+        receivers.push(this);
+        return Promise.resolve(new Response("ok"));
+      };
+
+      deps = browserSaveDeps();
+      // Invoked exactly as `saveExport` invokes it — as a method on `deps`.
+      await deps.fetchImpl("/api/projects/p/export");
+    });
+
+    expect(receivers).toHaveLength(1);
+    // THE ASSERTION. With `fetchImpl: fetch` the receiver is the deps object,
+    // which is what WebKit rejects. A plain call from inside a wrapper gives
+    // `undefined` under strict-mode ESM, and the real `Window.fetch` treats
+    // that as the global — which is the whole point.
+    expect(receivers[0]).not.toBe(deps);
+  });
+
+  it("reports an installed app from the legacy iOS flag", () => {
+    withFakeWindow(() => {
+      expect(browserSaveDeps().installed).toBe(true);
+    });
   });
 });

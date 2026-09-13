@@ -185,11 +185,27 @@ export async function saveExport(
   return { ok: true, via: "blob" };
 }
 
-/** The real dependencies. Separated from `saveExport` so the logic above has
- *  no direct DOM or `navigator` reference. */
+/**
+ * The real dependencies. Separated from `saveExport` so the logic above has no
+ * direct DOM or `navigator` reference.
+ *
+ * **Every platform method here is WRAPPED, never handed over as a bare
+ * reference.** `fetchImpl: fetch` reads fine and is a real bug: `saveExport`
+ * calls it as `deps.fetchImpl(...)`, which makes `this` the deps object, and
+ * WebKit enforces the receiver on `Window.fetch` — *"Can only call
+ * Window.fetch on instances of Window"*. Chrome, Firefox and Node are lenient
+ * about it, so it fails on exactly one platform and nowhere a test would
+ * ordinarily look.
+ *
+ * That is the trap in this whole seam, and it is worth naming: the injection
+ * boundary exists so the routing logic can be tested without a browser, which
+ * means the one line that actually touches the browser is the one line the
+ * tests never execute. Everything below is a closure for that reason, not for
+ * style.
+ */
 export function browserSaveDeps(): SaveDeps {
   return {
-    fetchImpl: fetch,
+    fetchImpl: (input, init) => fetch(input, init),
     installed: isInstalledApp(),
     canShareFiles: (files) => {
       const nav = navigator as Navigator & { canShare?: (data: { files: File[] }) => boolean };

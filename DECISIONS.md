@@ -1930,7 +1930,44 @@ silent failure on a download is indistinguishable from a slow one. The export
 handler already answers a rate limit as prose written for a person; that text is
 now shown rather than discarded.
 
-### Amendment (same day): fetching an attachment is itself the problem
+### Amendment 2 (same day): the fetch was never running
+
+The diagnosis in Amendment 1 was **wrong**, and the improved error message is
+what proved it. The third attempt failed with:
+
+> `TypeError: Can only call Window.fetch on instances of Window`
+
+`browserSaveDeps` returned `fetchImpl: fetch` — a bare reference. `saveExport`
+invokes it as `deps.fetchImpl(...)`, which is a METHOD call, so `this` is the
+deps object; WebKit enforces the receiver on `Window.fetch` and refuses.
+Chrome, Firefox and Node are all lenient about it. So the request never left
+the device at all, and every explanation built on what the server sent back was
+reasoning about a response that was never requested.
+
+"Could not reach the server" in Amendment 1 was this same `TypeError`, caught
+and relabelled by a `catch` that assumed a network failure — which is how a
+one-line binding bug got explained as a WebKit download-machinery behaviour. A
+guess stated as a diagnosis survives exactly as long as nobody prints the
+exception.
+
+**The real fix is one line**: every platform method in `browserSaveDeps` is now
+a closure rather than a bare reference.
+
+**Why no test caught it.** The injection seam exists so the routing logic can be
+tested without a browser — which means the one function that actually touches
+the browser is the one function the tests never executed. `browserSaveDeps` had
+no test at all. It has two now, and they stub the platform with implementations
+that record their RECEIVER, so a wrongly-bound call is visible in Node, which
+would otherwise accept it happily.
+
+**The `inline` disposition from Amendment 1 is kept, and is not claimed as the
+fix.** It was introduced on a theory the next error disproved. It stays because
+it is independently defensible — a client that reads the bytes itself is not
+downloading, and WebKit's attachment diversion is real behaviour that this code
+may yet meet now that the request actually runs — but it is unproven, and
+labelling it as the cure would be the same mistake twice.
+
+### Amendment 1 (same day): fetching an attachment is itself the problem — SUPERSEDED, see above
 
 The first version of this fix was tested on a device and **still failed** — now
 with a visible error: _"Could not reach the server."_ Desktop and Safari-as-a-
