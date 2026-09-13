@@ -309,14 +309,31 @@ Runs in the BullMQ worker, never in a request. See D-08.
 
 ### 6.1 The ladder
 
-| Pass | Model (env)      | Default           | When                                                                                                                 |
-| ---- | ---------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------- |
-| 1    | `AI_MODEL_PASS1` | `claude-sonnet-5` | every receipt                                                                                                        |
-| 2    | `AI_MODEL_PASS2` | `claude-sonnet-5` | pass 1 returned null `total`, null `transaction_date`, zero items, or `confidence < AI_ESCALATE_BELOW` (default 0.6) |
+| Pass | Model        | Default           | When                                                      |
+| ---- | ------------ | ----------------- | --------------------------------------------------------- |
+| 1    | `modelPass1` | `claude-sonnet-5` | every receipt                                             |
+| 2    | `modelPass2` | `claude-sonnet-5` | a second opinion is wanted — see the three triggers below |
 
-Model IDs are exact and carry no date suffix. Both are env-tunable so the ladder
-can be re-pointed without a code change. See D-12 for why these two, and for the
-corrected pricing.
+Model IDs are exact and carry no date suffix. Since D-47 they come from
+`app_config` with `AI_MODEL_PASS1`/`AI_MODEL_PASS2` as the bootstrap default
+beneath them, and are resolved per job, so re-pointing the ladder is a setting
+rather than a restart. See D-12 for why these two, and for the corrected pricing.
+
+**One second read, three reasons to want it** (D-47). The triggers differ in
+whether they need a model distinct from pass 1:
+
+| trigger                                                                            | needs a distinct model? |
+| ---------------------------------------------------------------------------------- | ----------------------- |
+| null `total`, null `transaction_date`, zero items, or `confidence < escalateBelow` | yes                     |
+| the reading does not reconcile, and `rescanOnReview` is on                         | yes                     |
+| `transaction_date` is more than 7 days old                                         | no                      |
+
+The first two ask whether a better model can do more, and re-running the same
+model buys a second identical answer for a second identical price. The third
+asks whether two independent reads agree, which two samples from one model
+answer perfectly well — so date confirmation works on an instance that has never
+configured an escalation model. Whatever the trigger, at most one extra call is
+made, and the date comparison falls out of having two readings for free.
 
 **The two passes are not the same request.** Haiku 4.5 rejects
 `output_config.effort` and uses the older `thinking: {type:"enabled",
@@ -398,34 +415,34 @@ The schema is also where cross-field invariants live:
 
 ### 7.2 Key variables
 
-| Variable                    | Default              | Notes                                                        |
-| --------------------------- | -------------------- | ------------------------------------------------------------ |
-| `APP_PORT`                  | 3000                 | host bind and container port (D-16)                          |
-| `APP_HOSTNAME`              | —                    | public hostname; used for absolute URLs (D-16)               |
-| `DATABASE_URL`              | —                    | composed in compose from `POSTGRES_*`                        |
-| `REDIS_URL`                 | `redis://redis:6379` |                                                              |
-| `MASTER_KEY`                | —                    | 32 bytes base64; encrypts `app_config`. Back up out-of-band  |
-| `UPLOADS_DIR`               | `/app/uploads`       | named volume                                                 |
-| `BACKUPS_DIR`               | `/app/backups`       | named volume                                                 |
-| `CF_ACCESS_ENABLED`         | `false`              |                                                              |
-| `CF_ACCESS_AUD`             | —                    | never committed                                              |
-| `CF_ACCESS_TEAM_DOMAIN`     | —                    | never committed                                              |
-| `CF_ACCESS_JWKS_TTL_MS`     | `3600000`            | JWKS `cacheMaxAge`; explicit, not inherited (D-29)           |
-| `ACCESS_ALLOW_SUB_RELINK`   | `false`              | IdP-migration recovery only; WARNs at boot while true (D-27) |
-| `DEV_AUTH_BYPASS`           | `false`              | hard-fails under production                                  |
-| `ANTHROPIC_API_KEY`         | —                    | server-side only                                             |
-| `AI_MODEL_PASS1`            | `claude-sonnet-5`    | D-12 amended; equal to pass 2, so the ladder does not climb  |
-| `AI_MODEL_PASS2`            | `claude-sonnet-5`    |                                                              |
-| `AI_ESCALATE_BELOW`         | `0.6`                |                                                              |
-| `AI_CONCURRENCY`            | `3`                  |                                                              |
-| `MAX_UPLOAD_BYTES`          | `52428800`           | 50 MB                                                        |
-| `RETAIN_ORIGINALS`          | `false`              | ~10x storage if true (D-09)                                  |
-| `MAX_UPLOAD_MEGAPIXELS`     | `100`                | decompression-bomb cap, checked header-only before decode    |
-| `UPLOAD_RATE_LIMIT_PER_MIN` | `60`                 | per-user, whole-batch atomic (Phase 5)                       |
-| `INGEST_CONCURRENCY`        | `3`                  | render-worker concurrency; distinct from `AI_CONCURRENCY`    |
-| `DEFAULT_CURRENCY`          | `USD`                | no UI in v1 (D-17)                                           |
-| `BACKUP_RETENTION_DAYS`     | `30`                 |                                                              |
-| `BACKUP_INCLUDE_IMAGES`     | `false`              |                                                              |
+| Variable                    | Default              | Notes                                                            |
+| --------------------------- | -------------------- | ---------------------------------------------------------------- |
+| `APP_PORT`                  | 3000                 | host bind and container port (D-16)                              |
+| `APP_HOSTNAME`              | —                    | public hostname; used for absolute URLs (D-16)                   |
+| `DATABASE_URL`              | —                    | composed in compose from `POSTGRES_*`                            |
+| `REDIS_URL`                 | `redis://redis:6379` |                                                                  |
+| `MASTER_KEY`                | —                    | 32 bytes base64; encrypts `app_config`. Back up out-of-band      |
+| `UPLOADS_DIR`               | `/app/uploads`       | named volume                                                     |
+| `BACKUPS_DIR`               | `/app/backups`       | named volume                                                     |
+| `CF_ACCESS_ENABLED`         | `false`              |                                                                  |
+| `CF_ACCESS_AUD`             | —                    | never committed                                                  |
+| `CF_ACCESS_TEAM_DOMAIN`     | —                    | never committed                                                  |
+| `CF_ACCESS_JWKS_TTL_MS`     | `3600000`            | JWKS `cacheMaxAge`; explicit, not inherited (D-29)               |
+| `ACCESS_ALLOW_SUB_RELINK`   | `false`              | IdP-migration recovery only; WARNs at boot while true (D-27)     |
+| `DEV_AUTH_BYPASS`           | `false`              | hard-fails under production                                      |
+| `ANTHROPIC_API_KEY`         | —                    | server-side only                                                 |
+| `AI_MODEL_PASS1`            | `claude-sonnet-5`    | D-47: bootstrap default; `app_config` wins. Resolved per job     |
+| `AI_MODEL_PASS2`            | `claude-sonnet-5`    | equal to pass 1 by default, so the ladder does not climb         |
+| `AI_ESCALATE_BELOW`         | `0.6`                | D-47: bootstrap default; resolved per job                        |
+| `AI_CONCURRENCY`            | `3`                  | D-47: bootstrap default, but read once at boot — needs a restart |
+| `MAX_UPLOAD_BYTES`          | `52428800`           | 50 MB                                                            |
+| `RETAIN_ORIGINALS`          | `false`              | ~10x storage if true (D-09)                                      |
+| `MAX_UPLOAD_MEGAPIXELS`     | `100`                | decompression-bomb cap, checked header-only before decode        |
+| `UPLOAD_RATE_LIMIT_PER_MIN` | `60`                 | per-user, whole-batch atomic (Phase 5)                           |
+| `INGEST_CONCURRENCY`        | `3`                  | render-worker concurrency; distinct from `AI_CONCURRENCY`        |
+| `DEFAULT_CURRENCY`          | `USD`                | no UI in v1 (D-17)                                               |
+| `BACKUP_RETENTION_DAYS`     | `30`                 |                                                                  |
+| `BACKUP_INCLUDE_IMAGES`     | `false`              |                                                                  |
 
 Only variables explicitly whitelisted as public are re-exported to the client.
 `ANTHROPIC_API_KEY`, `MASTER_KEY`, `DATABASE_URL`, and `CF_ACCESS_AUD` are never

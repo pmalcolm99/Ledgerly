@@ -9,13 +9,145 @@ Updated at the end of every phase. Read this first in any new session.
 below and in `docs/private/PHASE9_RESTORE_DRILL.md` (gitignored).
 
 Since then, outside the phase sequence: the automatic receipt email (D-44
-follow-up), two rounds on discount receipts, and the admin Logs tab plus a build
-version (D-46). All committed; all described below, newest first.
+follow-up), two rounds on discount receipts, the admin Logs tab plus a build
+version (D-46), and a nine-part batch covering editable AI settings, three
+misread receipt shapes, the project page, and holding the automatic email until
+a receipt has been reviewed (D-47). All committed; all described below, newest
+first.
 
 Phase 8's gate stays half-closed on the Excel half, Phase 7's on the on-device
 check, and Phase 6's on the two live-API tasks (6.3, 6.12) that need a real
 `ANTHROPIC_API_KEY`; D-12 stays Provisional. All three are unchanged by this
 phase and still listed under "Blocked / open questions".
+
+## Editable AI settings, three receipt shapes, the project page (D-47)
+
+Nine requests in one batch, in four commits. The thread running through the
+first group: each was something the instance owner could see was wrong and could
+not change without a shell on the host.
+
+### Extraction is tuned from a screen now
+
+`AI_MODEL_PASS1`, `AI_MODEL_PASS2`, `AI_ESCALATE_BELOW`, `AI_CONCURRENCY` and
+the system prompt were code or environment. They move to one encrypted
+`app_config` blob — `backup_schedule`'s precedent, and none of it is secret; it
+lives there because the table has one storage format.
+
+The setting that most wanted changing was the one nobody could see. D-12's
+amendment put both passes on Sonnet 5, and `extract.ts` skips the ladder
+whenever the two models match — so the escalation path existed, never ran, and
+the admin screen reported **0% escalation**, which reads as a bug rather than as
+the configuration saying so. The card now says it in words.
+
+Models, threshold, prompt and the rescan toggle are resolved **per job**, beside
+the API key, so they apply to the next receipt. Concurrency is a BullMQ
+constructor argument read once at boot, and the mutation returns "takes effect
+on the next restart" rather than pretending — the same honesty
+`applyBackupSchedule` uses.
+
+**The model list is a union, not a fetch.** `GET /v1/models` returns dated
+snapshots and never the undated aliases this app is built around; D-12's first
+amendment records exactly that, and it is the detail that would have made the
+selector silently drop the admin's own setting. The catalogue merges curated
+aliases, the API's answer, and the two ids currently in use. Vision capability is
+decided locally because the response does not carry it — known text-only
+families are excluded, unrecognised ones are offered with a warning, since a new
+family is far more likely to read images than not.
+
+The prompt moved to `packages/shared` so the API side can offer revert-to-default
+(`packages/api` cannot import `packages/queue`, D-07). Revert deletes the
+override rather than storing a copy, so an instance that reverted picks up later
+improvements. **The tool schema stays code** — a bad prompt edit can degrade a
+reading; it cannot make a response unparseable or defeat the Luhn scrub.
+
+### The three receipt shapes
+
+| shape                | what went wrong                                                                                                                                                                                       | fix                                                                                     |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| order-level coupon   | the prompt said to emit it as a negative line item, which put it inside the item sum, dropped the sum below the printed subtotal, and flagged `arithmetic_mismatch_items` on a receipt read perfectly | `transaction_discount`, outside both the items and the subtotal                         |
+| fuel / tax-inclusive | the pump price already contains the tax, and the memo line got copied into `sales_tax`, adding it twice                                                                                               | `tax_included` forces tax to `0.00` and stops a blank tax being a missing field         |
+| dates                | misread several times, usually the year                                                                                                                                                               | a stale date triggers a second read; the flag fires only when the two readings DISAGREE |
+
+The date rule is the one worth recording, because the literal request — flag
+anything more than a week old — was put back to the user with its cost.
+Uploading a receipt a fortnight after buying something is completely ordinary,
+so that rule flags a large share of honest receipts and teaches people to
+dismiss the flag without reading it. Two independent reads landing on the same
+date is strong evidence the receipt really says so; a misread rarely repeats
+itself identically.
+
+**Case (a) of the prompt is untouched, verbatim** — it is the fix from
+`783a957`, and the regression test now asserts the old case-(b) rule is GONE
+rather than merely contradicted somewhere else in the prompt.
+
+`date_unconfirmed` and `tax_included` are stored columns, not derived: they are
+facts about how the receipt was READ, and both readings are gone by the time
+anyone edits a field. Migration `0008` is additive and every default reproduces
+the previous behaviour, so **no existing receipt changes state** — including on a
+later edit, which re-runs the checks. A test asserts that reduction explicitly
+rather than trusting it.
+
+### The project page
+
+Six orderings, persisted on `users.receipt_sort` following the `users.theme`
+precedent. The filters stay in the URL for the opposite reason: a filtered view
+is something you share or export, an ordering is something you prefer.
+
+**The cursor was the real work.** `receipts.list` had a hand-written
+three-branch `OR` matched by eye to one hard-coded `ORDER BY` — already the
+subtlest code in the file with a single ordering. Six as three parallel switch
+statements would be six chances for a predicate to disagree with its own sort,
+and a keyset cursor that disagrees does not throw; it silently skips or repeats
+rows at a page boundary. That is exactly what D-46's review found in
+`admin.logs` three days earlier. Each ordering is now one object carrying its
+`ORDER BY`, its predicate and its cursor value, and the test walks all six page
+by page against the whole set. Deleting a single null-block clause fails eight of
+those tests — verified, not assumed.
+
+Search shares its `ILIKE` predicate with the export rather than copying it, for
+the reason `NEEDS_REVIEW_SQL` is shared. `%` and `_` are escaped: typed into a
+search box they are characters, and unescaped a search for "50%" returns every
+receipt in the project.
+
+Totals split into four rows. "Tax, tip and unitemised" was one client-side
+subtraction covering four unrelated things — and unitemised spend, the only one
+of the four that means something went unread, was the hardest to see.
+
+### The automatic email waits
+
+It fired the moment extraction returned, before anyone had looked at the flags,
+so the permanent record could be the version that was wrong — and an email is
+not recallable.
+
+Evaluated at send time beside the project setting and the once-only marker,
+which is what makes it work with no scheduler: the job skips as
+`awaiting_review`, and the same job id is re-added when the last flag clears.
+What counts as blocking is a setting, as asked — warnings only, or warnings plus
+every missing field.
+
+`recomputeReceiptDerivedState` reports the not-clear -> clear **edge**, not the
+level. On a level, every later edit of a settled receipt would re-enqueue,
+leaving `already_sent` as the only thing between a receipt and a second email.
+
+### Verification
+
+**870 unit tests**, up from 811. `pnpm lint`, `pnpm typecheck` and `pnpm build`
+clean. Migrations `0008` and `0009` applied to a freshly reset test database.
+
+One note for whoever hits it next. The suite's isolation is **within** a
+process, not between processes: `pnpm test` runs `--concurrency=1` and the api
+package sets `fileParallelism: false`, but nothing stops a second `vitest`
+against the same `TEST_DATABASE_URL`. Two of them truncating and seeding one
+database produces deadlocks, foreign-key violations on rows just inserted, and
+`users_single_owner_key` collisions — 72 failures in one run here, zero on a
+re-run. `turbo.json` already names the durable fix ("a database per package")
+and it is still not built.
+
+The practical rule until it is: do not run the suite while a review agent is
+running one. A single `phase7Permissions` failure earlier in this batch had the
+same shape and no concurrent runner I could identify, so that one stays
+unexplained — recorded so a second sighting is recognised rather than
+investigated from scratch.
 
 ## Phase 9 — Backups (D-45)
 

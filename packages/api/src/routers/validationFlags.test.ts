@@ -358,3 +358,77 @@ describe("releasing the held email when review finishes", () => {
     ).resolves.toBeDefined();
   });
 });
+
+/**
+ * D-47 migration safety: a receipt extracted BEFORE the three new columns
+ * existed must not change state when someone later edits it.
+ *
+ * The pure-function version of this lives in `pipeline/validate.test.ts`. This
+ * is the end-to-end one, and it is the one that matters: `0008` gives existing
+ * rows `transaction_discount = NULL`, `tax_included = false` and
+ * `date_unconfirmed = false`, and every user edit re-runs `runSanityChecks`
+ * through `recomputeReceiptDerivedState`. If the new arithmetic did not reduce
+ * exactly to the old, months-old settled receipts would silently sprout flags
+ * the first time anyone touched them.
+ */
+describe("pre-D-47 receipts are unaffected", () => {
+  it("keeps its flags and status across an unrelated edit", async () => {
+    const { id, user } = await discountedReceipt();
+    const caller = appRouter.createCaller(ctxFor(user));
+
+    const [before] = await db.select().from(receipts).where(eq(receipts.id, id));
+    // The columns as `0008` leaves a pre-existing row.
+    expect(before?.transactionDiscount).toBeNull();
+    expect(before?.taxIncluded).toBe(false);
+    expect(before?.dateUnconfirmed).toBe(false);
+    expect(before?.validationFlags).toEqual([
+      "arithmetic_mismatch_total",
+      "arithmetic_mismatch_items",
+    ]);
+
+    // An edit that touches nothing the checks look at.
+    await caller.receipts.update({ id, merchantName: "Safelite AutoGlass" });
+
+    const [after] = await db.select().from(receipts).where(eq(receipts.id, id));
+    expect(after?.validationFlags).toEqual(before?.validationFlags);
+    expect(after?.extractionStatus).toBe(before?.extractionStatus);
+    expect(after?.missingFields).toEqual(before?.missingFields);
+  });
+
+  /** And a receipt that was CLEAN stays clean — the direction that would show
+   *  up as a new flag on a settled receipt. */
+  it("does not invent a flag on a clean pre-D-47 receipt", async () => {
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "owner",
+      members: [],
+    });
+    const [receipt] = await db
+      .insert(receipts)
+      .values({
+        projectId: project.id,
+        uploadedBy: users.owner!.id,
+        extractionStatus: "ok",
+        merchantName: "Ace Hardware",
+        transactionDate: "2026-09-09",
+        subtotal: "20.00",
+        salesTax: "1.60",
+        total: "21.60",
+        missingFields: [],
+        validationFlags: [],
+      })
+      .returning({ id: receipts.id });
+    await db.insert(receiptItems).values({
+      receiptId: receipt!.id,
+      lineNo: 1,
+      description: "Paint",
+      lineTotal: "20.00",
+    });
+
+    const caller = appRouter.createCaller(ctxFor(users.owner! as unknown as AuthUser));
+    await caller.receipts.update({ id: receipt!.id, merchantPhone: "555-0100" });
+
+    const [after] = await db.select().from(receipts).where(eq(receipts.id, receipt!.id));
+    expect(after?.validationFlags).toEqual([]);
+    expect(after?.extractionStatus).toBe("ok");
+  });
+});

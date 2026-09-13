@@ -463,6 +463,37 @@ not add up still raise flags, which is why they became acknowledgeable in the
 same change — see `receipts.acknowledgeValidationFlag` and
 `receipts.acknowledged_flags`.
 
+### Amendment (2026-09-13): the ladder climbs again, on a third trigger.
+
+The amendment above declined escalation-on-failed-arithmetic, and that reasoning
+was right about what it addressed: as a **replacement** for fixing the prompt it
+treats a symptom, because a discount misread that still reconciles sails through
+it. The prompt has since been fixed twice (`783a957`, and D-47's case (b)
+rewrite). On top of a corrected prompt the same mechanism is a different
+proposition — a safety net under the cases nobody has thought of yet, rather
+than a substitute for thinking.
+
+So `rescanOnReview` (D-47, default on) adds a third trigger to the existing
+two, and D-47 folds all three into ONE second read rather than three:
+
+| trigger                                           | needs a distinct model? |
+| ------------------------------------------------- | ----------------------- |
+| low confidence / missing answer (D-12's original) | yes                     |
+| the reading does not reconcile                    | yes                     |
+| the date is more than a week old                  | **no**                  |
+
+The asymmetry is the interesting part. The first two ask "can a better model do
+more", and asking the same model again buys a second identical answer for a
+second identical price — which is exactly what the amendment above guards. The
+third asks "do two independent reads agree", and two samples from one model
+answer that perfectly well. So date confirmation works on an instance that has
+never configured an escalation model, and the other two do not.
+
+**Consequence.** The 0% escalation rate above is now a configuration an admin
+can change from the settings screen rather than an `.env` edit and a restart
+(D-47), and the screen says out loud when both passes are the same model — which
+is the state that makes the number read as a bug.
+
 ---
 
 ## D-13 — gitleaks in CI alongside secretlint in pre-commit. **Settled.**
@@ -1646,3 +1677,144 @@ mirroring Forkd's mechanism exactly; the Dockerfile's builder stage needed
 nothing had ever been inlined. It shows at the foot of the admin page and in the
 Logs tab header — the latter because which build produced a log line is the
 first thing you want when reading one.
+
+---
+
+## D-47 — AI settings are editable, and three receipt shapes read correctly. **Settled** (user request).
+
+**Context.** Four unrelated-looking requests with one thing in common: each was
+a thing the instance owner could see was wrong and could not change.
+
+**Extraction is tuned from the admin screen, not `.env`.** `AI_MODEL_PASS1`,
+`AI_MODEL_PASS2`, `AI_ESCALATE_BELOW`, `AI_CONCURRENCY` and the system prompt
+were all code or environment, so changing a model meant an `.env` edit and a
+container restart on a box the operator may not have a shell on. They move to
+one encrypted `app_config` blob, `backup_schedule`'s precedent exactly, and none
+of it is a secret — it lives there because that table has one storage format.
+
+Resolution is **app_config -> env -> default**, the same direction as
+`resolveAiKey` and for the same reason: an operator who types a setting in and
+watches the environment override it has no way to tell what went wrong.
+
+**Consequence.** `resolveAiSettings` degrades to the environment on an
+unreadable row, where `resolveAiKey` deliberately does not. The blast radius
+differs: an unreadable key means extracting with the WRONG credential, which
+must surface; unreadable settings mean extracting with the shipped defaults,
+which is what a fresh instance does anyway. Refusing to extract at all would be
+a worse answer to a rotated `MASTER_KEY`.
+
+**Consequence.** Models, threshold, prompt and the rescan toggle are resolved
+per job, so they apply to the next receipt. **Concurrency is not** — BullMQ takes
+it in the `Worker` constructor, read once at `startWorkers()`. The mutation says
+"takes effect on the next restart" rather than pretending, which is the same
+honesty `applyBackupSchedule` uses.
+
+**The model list is a union, not a fetch.** `GET /v1/models` returns dated
+snapshots and never the undated aliases this app is built around — D-12's first
+amendment records exactly that. A dropdown built from the endpoint alone would
+not contain the value currently configured, so the admin would watch their own
+setting vanish from its own selector. The catalogue merges curated aliases, the
+API's answer, and the two ids in use. It also carries no capability data, so
+vision is decided locally: families known to be text-only are excluded,
+unrecognised ones are offered with a warning, because a new family is far more
+likely to read images than not and hiding it would leave an admin unable to pick
+a model that works. Refreshed at most once a UTC day, only when an owner opens
+the page — no scheduler, because an instance nobody administers does not need a
+fresh model list.
+
+**The prompt is editable; the tool schema is not.** The prose moves to
+`packages/shared` so the API side can offer "revert to default" (`packages/api`
+cannot import `packages/queue`, D-07). Revert DELETES the override rather than
+storing a copy, so an instance that reverted picks up later improvements. The
+schema stays code because it carries the JSON contract and the `required` list
+strict mode demands: a bad prompt edit can degrade a reading, but it cannot make
+a response unparseable or defeat the Luhn scrub.
+
+### The three receipt shapes
+
+**Order-level credits get their own column.** The prompt said a whole-order
+coupon should be a negative line item. That puts it inside the item sum, drops
+the sum below the printed subtotal, and raises `arithmetic_mismatch_items` on a
+receipt that was read perfectly — the mirror image of the bug fixed in
+`783a957`. `receipts.transaction_discount` sits outside both:
+
+    items -> subtotal -> + transaction_discount -> + tax + tip -> total
+
+Case (a) — a discount already inside a line's own price — is untouched,
+verbatim, and the regression test asserts the old rule is GONE rather than
+merely contradicted elsewhere in the prompt.
+
+**Tax-inclusive prices.** A fuel receipt's pump price already contains the tax
+and the receipt often prints it as a memo; copying that memo into `sales_tax`
+adds it a second time. `receipts.tax_included` records the layout, forces tax to
+`0.00`, and stops a blank tax being reported as a missing field — a tax-inclusive
+receipt has no separate tax to read, so blank is the right answer, not a gap.
+Every other check still fires.
+
+**Dates flag on DISAGREEMENT, not on age.** The literal rule considered was
+"flag anything more than a week old", and it was put to the user with its cost:
+uploading a receipt a fortnight after buying something is completely ordinary,
+so that rule flags a large share of honest receipts and trains people to dismiss
+the flag without reading it. Instead a stale date triggers a second read, and
+`date_unconfirmed` fires only when the two readings differ. Two independent
+reads landing on the same date is strong evidence the receipt really says that;
+a misread rarely repeats itself identically.
+
+`date_unconfirmed` and `tax_included` are **stored columns, not derived**: they
+are facts about how the receipt was READ, and both readings are gone by the time
+a user edits a field. `recomputeReceiptDerivedState` passes them through rather
+than re-deriving, or a later edit would quietly clear a flag nobody resolved.
+
+**Consequence.** Migration 0008 is additive and every default reproduces the
+previous behaviour, so no existing receipt changes state — including on a later
+edit. A test asserts that reduction explicitly rather than trusting it.
+
+### The project page
+
+Six orderings, persisted on `users.receipt_sort` following the `users.theme`
+precedent, because the ask was a choice that persists. The filters beside it
+stay in the URL for the opposite reason: a filtered view is something you share
+or export, an ordering is something you just prefer.
+
+**The cursor is the real work.** Each ordering is one object carrying its
+`ORDER BY`, its keyset predicate and its cursor value, rather than three
+parallel switch statements — which would be six chances for a predicate to
+disagree with its own sort, and a keyset cursor that disagrees does not throw,
+it silently skips or repeats rows at a page boundary. That is precisely what
+D-46's review found in `admin.logs` three days earlier. The test walks all six
+page by page against the whole set; removing one null-block clause fails eight
+of them.
+
+Search is `q` on the merchant name, added to all four surfaces the filter
+convention spans, sharing one `ILIKE` predicate with the export for the same
+reason `NEEDS_REVIEW_SQL` is shared. `%` and `_` are escaped — typed into a
+search box they are characters, and unescaped a search for "50%" returns
+everything.
+
+**Totals are split.** "Tax, tip and unitemised" was one client-side subtraction
+covering four unrelated things. Tax and tip are facts about a receipt, a
+discount is a credit, and unitemised spend is the only one of the four that
+means something went unread. Summing them made the one actionable number the
+hardest to see.
+
+### The automatic email waits for review
+
+The email fired the moment extraction returned, before anyone had looked at the
+flags, so the permanent record could be the version that was wrong — and an
+email is not recallable.
+
+Evaluated at SEND time beside the project setting and the once-only marker,
+which is what makes the waiting work with no scheduler: the job skips as
+`awaiting_review`, and the same job id is re-added when the last flag clears.
+
+**What counts as blocking is a setting**, at the user's request: warnings only,
+or warnings plus every missing field. Default is warnings only — a receipt can
+be complete and correct with a field genuinely blank, and the stricter gate
+leaves receipts unsent over a `card_last4` nobody cares about.
+
+**Consequence.** `recomputeReceiptDerivedState` reports the not-clear -> clear
+EDGE rather than the level. On a level, every later edit of a settled receipt
+would re-enqueue, leaving `already_sent` as the only thing between a receipt and
+a second email — a thin place to put that guarantee. The enqueue happens after
+the transaction commits, never inside it: an email queued against a transaction
+that then rolls back is an email nobody can recall.

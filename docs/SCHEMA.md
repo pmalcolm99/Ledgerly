@@ -91,6 +91,7 @@ CREATE TABLE users (
   display_name   text,
   role           user_role   NOT NULL DEFAULT 'user',
   theme          text        NOT NULL DEFAULT 'light',
+  receipt_sort   text        NOT NULL DEFAULT 'date_desc',
   onboarded_at   timestamptz,
   last_seen_at   timestamptz,
   created_at     timestamptz NOT NULL DEFAULT now(),
@@ -114,6 +115,13 @@ CREATE UNIQUE INDEX users_email_lower_key   ON users (lower(email));
   behaviour, and correct.
 - `role` is never downgraded by the auth layer. Promotion and demotion are
   explicit owner actions that write `audit_log`.
+- `theme` and `receipt_sort` are the two per-user preferences, and they share a
+  shape deliberately: a typed column with a default, a mutation on the `auth`
+  router validated against a `z.enum` derived from a list in
+  `packages/shared`, and the value shipped down on `auth.me`. Both are free text
+  at the database level so adding a theme or an ordering is not a migration;
+  a value this build does not recognise falls back to the default rather than
+  breaking the page (D-47).
 - No `deleted_at`. Deleting a user is rare and would orphan receipts; the
   supported path is demotion and removal from project membership.
 
@@ -281,6 +289,9 @@ CREATE TABLE receipts (
   sales_tax             numeric(12,2),
   tip                   numeric(12,2),
   total                 numeric(12,2),
+  transaction_discount  numeric(12,2),
+  tax_included          boolean           NOT NULL DEFAULT false,
+  date_unconfirmed      boolean           NOT NULL DEFAULT false,
   currency              char(3)           NOT NULL DEFAULT 'USD',
 
   card_last4            char(4),
@@ -348,6 +359,23 @@ CREATE INDEX receipts_pending_idx
   receipt, and separate from `extraction_error` (a single string, reserved
   for `extraction_status = 'failed'` from either the ingest or the AI
   stage) because a `partial` receipt is not a failure.
+- `transaction_discount` is an order-level credit — a whole-order coupon, a
+  store credit — as a NEGATIVE amount (D-47). Distinct from a discount already
+  inside a line's own price, which stays inside that line's `line_total` and
+  must never be emitted separately. The arithmetic is
+  `items -> subtotal -> + transaction_discount -> + tax + tip -> total`, so the
+  credit sits outside both the item sum and the subtotal. NULL means none, and
+  is treated as zero, which is what leaves every pre-D-47 receipt's arithmetic
+  untouched.
+- `tax_included` records that the printed prices already contain tax — fuel,
+  usually. `sales_tax` is then `0.00` by construction and a blank tax is not a
+  missing field, because there is no separate tax to read.
+- `date_unconfirmed` records that two independent readings of the receipt
+  disagreed about `transaction_date`. A STORED fact rather than a derived one:
+  the check is "did the second opinion agree", and both readings are gone by the
+  time anyone edits the row. `recomputeReceiptDerivedState` passes it through
+  rather than re-deriving it, or a later edit would clear a flag nobody
+  resolved. Same for `tax_included`.
 - `acknowledged_flags` is the `validation_flags` counterpart of
   `dismissed_fields`: checks the user has looked at and asserted are correct
   anyway. It exists because there was no way to clear a flag at all — a receipt
@@ -574,15 +602,29 @@ Encrypted key-value store for runtime settings, following Forkd's
 `getDecryptedConfigValue()` / `setEncryptedConfigValue()` pattern with
 `MASTER_KEY` (32 bytes, base64, validated at startup by D-14). Keys actually in
 use, as a closed union in `packages/api/src/secrets.ts`: `anthropic_api_key`
-(D-39), `smtp_config` (D-44), and `backup_schedule` (D-45).
+(D-39), `smtp_config` (D-44), `backup_schedule` (D-45), `ai_settings` and
+`ai_model_catalog` (both D-47).
 
-`backup_schedule` is the one key holding something that is not a secret. It is
-encrypted because this table has exactly one storage format; the consequence —
-a rotated `MASTER_KEY` makes the schedule unreadable — is handled as a
-first-class `undecryptable` state rather than reported as "not configured"
-(D-45). `backup.include_images` was planned and is not built: `BACKUP_INCLUDE_IMAGES`
-owns that, in the environment. `ai.escalate_below` likewise stayed
-`AI_ESCALATE_BELOW`.
+**Three of the five hold nothing secret.** `backup_schedule`, `ai_settings` and
+`ai_model_catalog` are encrypted because this table has exactly one storage
+format, not because they need protecting; the consequence — a rotated
+`MASTER_KEY` makes them unreadable — is handled as a first-class `undecryptable`
+state rather than reported as "not configured" (D-45). `ai_settings` differs
+from the others in what it does about it: it falls back to the environment
+values, because extracting with the shipped defaults is what a fresh instance
+does anyway, where an unreadable API KEY must surface rather than silently use a
+different credential (D-47).
+
+`ai_model_catalog` is a cache rather than configuration in the strict sense — a
+copy of `GET /v1/models` refreshed at most once a day when an owner opens the
+settings page. It lives here because it needs exactly what this table provides:
+one row, an `updated_at`, and survival across restarts. Losing it costs one API
+call.
+
+`backup.include_images` was planned and is not built: `BACKUP_INCLUDE_IMAGES`
+owns that, in the environment. `ai.escalate_below` was likewise left as
+`AI_ESCALATE_BELOW` — until D-47, which moved it and the rest of the AI settings
+here, with the environment retained as the bootstrap default beneath them.
 
 **`MASTER_KEY` is irreplaceable.** A backup archive contains the encrypted values
 and nothing that can decrypt them. `SETUP.md` says so in bold, and the key is
