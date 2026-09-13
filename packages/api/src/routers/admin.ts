@@ -30,6 +30,20 @@ import { SECRET_KEYS, deleteSecret, writeSecret } from "../secrets";
 import { EVENT_CATEGORIES } from "../events";
 import { describeBackupSchedule, serializeBackupSchedule, validateCron } from "../backupSchedule";
 import {
+  EMAIL_GATES,
+  aiSettingsSchema,
+  describeAiSettings,
+  resolveAiSettings,
+  serializeAiSettings,
+} from "../aiSettings";
+import {
+  catalogIsStale,
+  fetchModelCatalog,
+  readModelCatalog,
+  serializeModelCatalog,
+} from "../modelCatalog";
+import { DEFAULT_EXTRACTION_PROMPT } from "@ledgerly/shared/extractionPrompt";
+import {
   describeSmtpConfig,
   mergeSmtpConfig,
   resolveSmtpConfig,
@@ -1022,8 +1036,189 @@ export const adminRouter = router({
       };
     }
 
-    return runAiKeyTest(apiKey, [env.AI_MODEL_PASS1, env.AI_MODEL_PASS2]);
+    // The RESOLVED models, not `env.AI_MODEL_PASS1/PASS2`. Since D-47 the
+    // stored settings win over the environment, so testing the env pair would
+    // cheerfully report that two models nobody is using both resolve.
+    const { settings } = await resolveAiSettings(ctx.db, env.MASTER_KEY, aiEnvDefaults());
+    const models = [...new Set([settings.modelPass1, settings.modelPass2])];
+    return runAiKeyTest(apiKey, models);
   }),
+
+  /**
+   * Everything the AI settings card needs: the resolved settings, the model
+   * catalogue, and whether that catalogue is due a refresh (D-47).
+   *
+   * **This query never writes.** The daily refresh is a separate mutation the
+   * client fires when `catalogStale` comes back true — a query with a
+   * side effect is a query that runs on every focus, every refetch interval,
+   * and every React strict-mode double-render.
+   */
+  aiSettings: ownerProcedure.query(async ({ ctx }) => {
+    const env = getEnv();
+    const description = await describeAiSettings(ctx.db, env.MASTER_KEY, aiEnvDefaults());
+    const catalog = await readModelCatalog(ctx.db, env.MASTER_KEY);
+
+    let updatedByName: string | null = null;
+    if (description.updatedBy) {
+      const [row] = await ctx.db
+        .select({
+          displayName: users.displayName,
+          firstName: users.firstName,
+          lastName: users.lastName,
+        })
+        .from(users)
+        .where(eq(users.id, description.updatedBy))
+        .limit(1);
+      updatedByName = row ? displayNameOf({ ...row, email: null }) : null;
+    }
+
+    return {
+      ...description,
+      updatedBy: undefined,
+      updatedByName,
+      catalog,
+      catalogStale: catalogIsStale(catalog),
+      /** So the card can show what "Revert" would restore, and diff against
+       *  it, without shipping the default twice. */
+      defaultPrompt: DEFAULT_EXTRACTION_PROMPT,
+      envDefaults: aiEnvDefaults(),
+    };
+  }),
+
+  /**
+   * Saves the AI settings. A full replace, not a patch: the card always sends
+   * every field, so a partial write cannot leave two settings from different
+   * intentions.
+   *
+   * `prompt` is omitted rather than sent when it matches the default, which is
+   * how Revert works — the override is deleted, not replaced with a copy, so an
+   * instance that reverted picks up a later improvement to the shipped prompt.
+   */
+  setAiSettings: ownerProcedure
+    .input(aiSettingsSchema.extend({ emailGate: z.enum(EMAIL_GATES) }))
+    .mutation(async ({ ctx, input }) => {
+      const env = getEnv();
+      const stored = { ...input };
+      // A prompt equal to the default is stored as "no override" — see above.
+      if (stored.prompt !== undefined && stored.prompt === DEFAULT_EXTRACTION_PROMPT) {
+        delete stored.prompt;
+      }
+
+      await ctx.db.transaction(async (tx) => {
+        await writeSecret(
+          tx,
+          SECRET_KEYS.aiSettings,
+          serializeAiSettings(stored),
+          env.MASTER_KEY,
+          ctx.user.id,
+        );
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.updated",
+          entityType: "app_config",
+          entityId: null,
+          // The values go in, because none of them is a credential and the
+          // whole point of the Logs tab is being able to see when a model
+          // changed. The prompt itself does not — it is up to 20k characters
+          // and would swamp every other audit row; `promptCustomised` is the
+          // fact worth recording.
+          metadata: {
+            key: SECRET_KEYS.aiSettings,
+            via: "admin.setAiSettings",
+            modelPass1: stored.modelPass1,
+            modelPass2: stored.modelPass2,
+            escalateBelow: stored.escalateBelow,
+            concurrency: stored.concurrency,
+            rescanOnReview: stored.rescanOnReview,
+            emailGate: stored.emailGate,
+            promptCustomised: stored.prompt !== undefined,
+          },
+        });
+      });
+
+      // Honest about what is and is not live. The models, the threshold, the
+      // prompt and the rescan toggle are resolved per job by `worker.ts`, so
+      // they apply to the very next receipt. Concurrency is a BullMQ `Worker`
+      // constructor argument read once at `startWorkers()`, and nothing here
+      // can change that without restarting the process.
+      const concurrencyChanged =
+        stored.concurrency !== undefined && stored.concurrency !== env.AI_CONCURRENCY;
+      return {
+        ok: true as const,
+        message: concurrencyChanged
+          ? "Saved. Concurrency takes effect the next time the app restarts; everything else applies to the next receipt."
+          : "Saved. Applies to the next receipt.",
+      };
+    }),
+
+  /**
+   * Refreshes the model catalogue from `GET /v1/models`, at most once a day.
+   *
+   * Staleness is re-checked HERE rather than trusted from the client, so two
+   * admins (or two tabs, or a strict-mode double-render) opening the page at
+   * once make one API call between them. `force` is the manual refresh button,
+   * which is the one case where "I know, do it anyway" is the whole intent.
+   */
+  refreshModelCatalog: ownerProcedure
+    .input(z.object({ force: z.boolean().default(false) }))
+    .mutation(async ({ ctx, input }) => {
+      if (ctx.rateLimitRedis) {
+        const limit = await checkRateLimit(
+          ctx.rateLimitRedis,
+          `model_catalog:${ctx.user.id}`,
+          1,
+          MODEL_CATALOG_RATE_LIMIT_PER_MIN,
+        );
+        if (!limit.allowed) {
+          throw new TRPCError({
+            code: "TOO_MANY_REQUESTS",
+            message: "Too many refreshes. Try again shortly.",
+          });
+        }
+      }
+
+      const env = getEnv();
+      const existing = await readModelCatalog(ctx.db, env.MASTER_KEY);
+      if (!input.force && !catalogIsStale(existing)) {
+        return { ok: true as const, refreshed: false, catalog: existing, message: null };
+      }
+
+      const { apiKey, source } = await resolveAiKey(ctx.db, env.MASTER_KEY, env.ANTHROPIC_API_KEY);
+      if (source === "undecryptable" || !apiKey) {
+        // Not an error. The catalogue is a convenience, and a settings screen
+        // that throws because no key is set yet is a settings screen you
+        // cannot use to set the key.
+        return {
+          ok: false as const,
+          refreshed: false,
+          catalog: existing,
+          message: "No usable API key, so the model list could not be refreshed.",
+        };
+      }
+
+      const { settings } = await resolveAiSettings(ctx.db, env.MASTER_KEY, aiEnvDefaults());
+      const result = await fetchModelCatalog(apiKey, [settings.modelPass1, settings.modelPass2]);
+      if (!result.ok) {
+        // The previous catalogue is KEPT. A failed refresh must not empty the
+        // dropdown an admin is in the middle of using.
+        return { ok: false as const, refreshed: false, catalog: existing, message: result.message };
+      }
+
+      await ctx.db.transaction(async (tx) => {
+        await writeSecret(
+          tx,
+          SECRET_KEYS.modelCatalog,
+          serializeModelCatalog(result.catalog),
+          env.MASTER_KEY,
+          ctx.user.id,
+        );
+      });
+      // Deliberately NOT audited. This is a cache refresh triggered by opening
+      // a page, not a configuration change a person made — auditing it would
+      // put a row in the log every day for every admin visit and drown the
+      // rows that record an actual decision.
+      return { ok: true as const, refreshed: true, catalog: result.catalog, message: null };
+    }),
 
   /**
    * The SMTP settings' STATUS — every field except the password (D-44).
@@ -1215,6 +1410,22 @@ export const adminRouter = router({
 /** An owner-only outbound probe. Generous enough that a genuine
  *  diagnose-and-retry loop never hits it. */
 const AI_KEY_TEST_RATE_LIMIT_PER_MIN = 10;
+
+/** Higher than the key test's: opening the settings page fires one of these,
+ *  and an admin reloading a few times should not be told off. */
+const MODEL_CATALOG_RATE_LIMIT_PER_MIN = 20;
+
+/** The environment half of the AI settings resolution order, in one place so
+ *  the query, the mutation and the key test cannot read different defaults. */
+function aiEnvDefaults() {
+  const env = getEnv();
+  return {
+    modelPass1: env.AI_MODEL_PASS1,
+    modelPass2: env.AI_MODEL_PASS2,
+    escalateBelow: env.AI_ESCALATE_BELOW,
+    concurrency: env.AI_CONCURRENCY,
+  };
+}
 
 /** Lower than the AI key's: this one actually delivers a message, and a relay
  *  counts every one against the instance's sending reputation. */

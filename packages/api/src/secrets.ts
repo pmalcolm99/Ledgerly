@@ -71,6 +71,28 @@ export const SECRET_KEYS = {
    * reporting "no schedule".
    */
   backupSchedule: "backup_schedule",
+  /**
+   * D-47. How extraction is tuned: models, escalation threshold, concurrency,
+   * the review-rescan toggle, the email gate, and an optional prompt override.
+   *
+   * Not a secret either, for the same reason as `backupSchedule` above. One
+   * blob rather than a key per setting, matching `smtp_config`: one read, one
+   * decrypt, one atomic write, and no way for a later addition to be left
+   * behind in a separate row that some code path forgets to update.
+   */
+  aiSettings: "ai_settings",
+  /**
+   * D-47. A cached copy of `GET /v1/models`, refreshed at most once a day when
+   * an owner opens the settings page.
+   *
+   * A cache in a table called `app_config` deserves a word. It is configuration
+   * in the sense that matters here — it is what the model selector offers — and
+   * it needs exactly what this table provides: one row, an `updated_at`, and
+   * survival across restarts. A second store for one JSON blob would be a
+   * migration and a second code path to hold data that is regenerated on demand
+   * anyway. Losing it costs one API call.
+   */
+  modelCatalog: "ai_model_catalog",
 } as const;
 export type SecretKey = (typeof SECRET_KEYS)[keyof typeof SECRET_KEYS];
 

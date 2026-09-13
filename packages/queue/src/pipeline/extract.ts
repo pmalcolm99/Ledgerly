@@ -74,6 +74,12 @@ export type ProcessReceiptExtractionDeps = {
   modelPass1: string;
   modelPass2: string;
   escalateBelow: number;
+  /**
+   * The system prompt, resolved from `app_config` by the caller (D-47).
+   * Optional so every existing test keeps working against the shipped default;
+   * `worker.ts` always passes the resolved value.
+   */
+  systemPrompt?: string;
 };
 
 type PassResult = {
@@ -192,9 +198,11 @@ async function runPass(params: {
   pass: number;
   escalated: boolean;
   hint?: string;
+  systemPrompt?: string;
 }): Promise<PassResult> {
-  const { db, client, model, imageBytes, tool, receiptId, pass, escalated, hint } = params;
-  const request = buildExtractionRequest(model, imageBytes, tool, hint);
+  const { db, client, model, imageBytes, tool, receiptId, pass, escalated, hint, systemPrompt } =
+    params;
+  const request = buildExtractionRequest(model, imageBytes, tool, hint, systemPrompt);
   const startedAt = Date.now();
 
   let response: Anthropic.Message;
@@ -292,8 +300,10 @@ async function retryIfItemsDoNotReconcile(params: {
   tool: Anthropic.Tool;
   receiptId: string;
   escalated: boolean;
+  systemPrompt?: string;
 }): Promise<PassResult> {
-  const { db, client, previous, model, imageBytes, tool, receiptId, escalated } = params;
+  const { db, client, previous, model, imageBytes, tool, receiptId, escalated, systemPrompt } =
+    params;
 
   const check = itemsReconcile({
     subtotal: previous.input.subtotal ?? null,
@@ -317,6 +327,7 @@ async function retryIfItemsDoNotReconcile(params: {
       receiptId,
       pass: 2,
       escalated,
+      systemPrompt,
       hint: arithmeticHint({
         itemsSum: formatMoney(check.itemsCents),
         subtotal: formatMoney(check.subtotalCents),
@@ -388,8 +399,16 @@ export async function processReceiptExtraction(
   deps: ProcessReceiptExtractionDeps,
   data: ExtractJobData,
 ): Promise<void> {
-  const { db, anthropicClient, uploadsDir, maxMegapixels, modelPass1, modelPass2, escalateBelow } =
-    deps;
+  const {
+    db,
+    anthropicClient,
+    uploadsDir,
+    maxMegapixels,
+    modelPass1,
+    modelPass2,
+    escalateBelow,
+    systemPrompt,
+  } = deps;
   const { receiptId, forcePass2 = false } = data;
 
   const [receipt] = await db
@@ -461,6 +480,7 @@ export async function processReceiptExtraction(
       receiptId,
       pass: 2,
       escalated: false, // a manual force, not an automatic ladder escalation
+      systemPrompt,
     });
   } else {
     const pass1 = await runPass({
@@ -472,6 +492,7 @@ export async function processReceiptExtraction(
       receiptId,
       pass: 1,
       escalated: false,
+      systemPrompt,
     });
 
     // Escalating to the SAME model is a second identical paid call for an
@@ -490,6 +511,7 @@ export async function processReceiptExtraction(
         receiptId,
         pass: 2,
         escalated: true,
+        systemPrompt,
       });
     } else {
       finalPass = pass1;
@@ -523,6 +545,7 @@ export async function processReceiptExtraction(
       tool,
       receiptId,
       escalated,
+      systemPrompt,
     });
   }
 

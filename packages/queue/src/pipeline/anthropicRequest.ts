@@ -1,4 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
+import { DEFAULT_EXTRACTION_PROMPT } from "@ledgerly/shared/extractionPrompt";
 
 /**
  * packages/queue/src/pipeline/anthropicRequest.ts — per-model request shapes
@@ -59,36 +60,6 @@ function capabilityForModel(model: string): ModelCapability {
   };
 }
 
-const SYSTEM_PROMPT = `You extract structured data from a single photographed or scanned receipt image.
-
-Work out how THIS receipt is laid out before you read values off it. Receipts differ in structure, not just in wording, and the same number can mean different things in different layouts.
-
-Rules, all non-negotiable:
-- Return null rather than guessing. A null field the user fills in by hand is fine; a confidently wrong value is not.
-- Never invent a line item that is not printed on the receipt.
-- card_last4 is exactly the last 4 digits of a payment card, or null. Never return a full card number under any field.
-- Assign every item a category from the given enum. Use "uncategorized" when genuinely unclear rather than forcing a bad fit.
-- Report your honest confidence in the 0.0-1.0 field — a low number for a blurry or partial receipt is more useful than a falsely confident one.
-
-DISCOUNTS. Getting these wrong is the single most common extraction error, because two different layouts look similar and mean opposite things. Decide which one you are looking at:
-
-(a) The discount MODIFIES THE LINE ABOVE IT and is already reflected in that line's price. Typical shape — the item's own price on the right is the NET price, and an indented sub-line under it explains how that price was reached:
-
-    295429 GRACO MAGNUM X5        360.05
-       379.00 DISCOUNT EACH      -18.95
-
-  Here 379.00 is the list price, 18.95 the discount, and 360.05 the price actually charged (379.00 - 18.95 = 360.05). Emit ONE line item with line_total 360.05. Do NOT also emit a -18.95 item: the discount is already inside 360.05, and adding it again subtracts it twice. Use unit_price for the pre-discount price when it is printed.
-
-(b) The discount is ITS OWN LINE, applied to the order rather than to one item — a whole-order coupon, a store credit, a loyalty award, usually near the totals. Emit it as a line item with a NEGATIVE line_total.
-
-THE TEST THAT SETTLES IT: the line_total values you return must add up to the subtotal. Sum them before you answer. If your sum is BELOW the printed subtotal by exactly the discounts you emitted, you are in case (a) and have subtracted them twice — drop those discount items and keep the net prices. Many receipts also print a "TOTAL SAVINGS" figure; that is a summary of discounts already taken, never a line item.
-
-Signs are written with a leading minus ("-4.50") whatever notation the receipt uses — some print the sign after the number ("4.50-"), some use parentheses ("(4.50)").
-
-Before calling the tool, check your own arithmetic: line items should sum to subtotal, and subtotal + tax + tip should equal total. If they do not, re-read the receipt rather than adjusting a number to make them fit.
-
-Call record_receipt exactly once with your best extraction.`;
-
 /**
  * Appended to the user turn on a corrective retry.
  *
@@ -117,13 +88,19 @@ export function buildExtractionRequest(
   tool: Anthropic.Tool,
   /** Corrective feedback for a retry. See `arithmeticHint`. */
   hint?: string,
+  /**
+   * The system prompt, resolved by the caller (D-47). Defaults to the shipped
+   * one so every existing call site and test keeps its current behaviour; the
+   * worker passes the admin's override when there is one.
+   */
+  systemPrompt: string = DEFAULT_EXTRACTION_PROMPT,
 ): Anthropic.MessageCreateParamsNonStreaming {
   const capability = capabilityForModel(model);
 
   return {
     model,
     max_tokens: MAX_TOKENS,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt,
     ...(capability.thinking ? { thinking: capability.thinking } : {}),
     ...(capability.effort ? { output_config: { effort: capability.effort } } : {}),
     tools: [tool],

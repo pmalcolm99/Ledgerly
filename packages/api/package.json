@@ -18,7 +18,9 @@
     "./aiKey": "./src/aiKey.ts",
     "./secrets": "./src/secrets.ts",
     "./smtp": "./src/smtp.ts",
-    "./backupSchedule": "./src/backupSchedule.ts"
+    "./backupSchedule": "./src/backupSchedule.ts",
+    "./aiSettings": "./src/aiSettings.ts",
+    "./modelCatalog": "./src/modelCatalog.ts"
   },
   "scripts": {
     "lint": "eslint .",

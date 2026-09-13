@@ -6,6 +6,7 @@ import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { resolveAiKey } from "@ledgerly/api/aiKey";
+import { resolveAiSettings } from "@ledgerly/api/aiSettings";
 import { recordEvent } from "@ledgerly/api/events";
 import { receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
@@ -81,6 +82,30 @@ async function reconcilePendingExtractions(db: Database, redisUrl: string): Prom
 
 let sharedExtractWorker: Worker<ExtractJobData> | undefined;
 
+/**
+ * The one AI setting read at construction rather than per job.
+ *
+ * Never throws. A settings row that cannot be read must not stop the worker
+ * from starting — a container that refuses to boot because a cached preference
+ * went bad is a far worse failure than one running at the default parallelism,
+ * and `resolveAiSettings` already degrades to the environment for exactly this
+ * reason.
+ */
+async function resolveConcurrency(db: Database, env: ReturnType<typeof getEnv>): Promise<number> {
+  try {
+    const { settings } = await resolveAiSettings(db, env.MASTER_KEY, {
+      modelPass1: env.AI_MODEL_PASS1,
+      modelPass2: env.AI_MODEL_PASS2,
+      escalateBelow: env.AI_ESCALATE_BELOW,
+      concurrency: env.AI_CONCURRENCY,
+    });
+    return settings.concurrency;
+  } catch (error) {
+    console.error("[ledgerly] could not read AI settings at boot, using AI_CONCURRENCY:", error);
+    return env.AI_CONCURRENCY;
+  }
+}
+
 export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobData>> {
   if (sharedExtractWorker) return sharedExtractWorker;
 
@@ -128,15 +153,32 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
     RECEIPT_EXTRACT_QUEUE_NAME,
     async (job: Job<ExtractJobData>) => {
       try {
+        // Resolved PER JOB, exactly like the API key above and for the same
+        // reason: an operator who changes a model on the admin screen must not
+        // have to restart the container to see it take effect. `env` here is a
+        // frozen snapshot taken at `startWorkers()`, so reading these off it
+        // directly — which is what this used to do — meant the settings screen
+        // would have been decorative (D-47).
+        //
+        // `concurrency` is the one that genuinely cannot move: BullMQ takes it
+        // in the `Worker` constructor below, which has already run by now.
+        const { settings } = await resolveAiSettings(db, env.MASTER_KEY, {
+          modelPass1: env.AI_MODEL_PASS1,
+          modelPass2: env.AI_MODEL_PASS2,
+          escalateBelow: env.AI_ESCALATE_BELOW,
+          concurrency: env.AI_CONCURRENCY,
+        });
+
         await processReceiptExtraction(
           {
             db,
             anthropicClient: await anthropicForJob(),
             uploadsDir: env.UPLOADS_DIR,
             maxMegapixels: env.MAX_UPLOAD_MEGAPIXELS,
-            modelPass1: env.AI_MODEL_PASS1,
-            modelPass2: env.AI_MODEL_PASS2,
-            escalateBelow: env.AI_ESCALATE_BELOW,
+            modelPass1: settings.modelPass1,
+            modelPass2: settings.modelPass2,
+            escalateBelow: settings.escalateBelow,
+            systemPrompt: settings.prompt,
           },
           job.data,
         );
@@ -199,7 +241,11 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
     },
     {
       connection: getRedisConnection(redisUrl),
-      concurrency: env.AI_CONCURRENCY,
+      // Read once, here, and therefore the one AI setting that needs a restart
+      // — `admin.setAiSettings` says so rather than pretending otherwise. The
+      // stored value wins over the env one when there is one, so this still
+      // honours the admin screen; it just honours it one boot late.
+      concurrency: await resolveConcurrency(db, env),
       autorun: true,
     },
   );

@@ -7,6 +7,7 @@ import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
 import { buildLabel } from "../lib/buildInfo";
 import { trpc } from "../lib/trpc";
 import { AiKeyCard } from "./AiKeyCard";
+import { AiSettingsCard } from "./AiSettingsCard";
 import { BackupsCard } from "./BackupsCard";
 import { SmtpCard } from "./SmtpCard";
 
@@ -35,6 +36,7 @@ export function AdminView() {
       </div>
 
       <AiKeyCard />
+      <AiSettingsCard />
       <SmtpCard />
 
       <Card shadow="sm">
