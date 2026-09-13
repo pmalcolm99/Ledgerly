@@ -39,6 +39,7 @@ function mb(bytes: number | null): string | null {
  */
 const EMAIL_SKIP: Record<string, string> = {
   receipt_not_found: "the receipt no longer exists",
+  awaiting_review: "it is waiting for its warnings to be resolved",
   project_setting_off: "receipt emails are turned off for that project",
   already_sent: "it had already been sent once",
   recipient_not_a_member: "the recipient is not a member of that project",

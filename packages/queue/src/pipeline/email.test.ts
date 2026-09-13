@@ -322,3 +322,103 @@ describe("processReceiptEmail — the on-demand send", () => {
     expect(row?.at).toBeNull();
   });
 });
+
+/**
+ * D-47 — the emailed receipt is meant to be the SETTLED version.
+ *
+ * The gate is evaluated at SEND time, like the project setting and the
+ * once-only marker beside it, which is what lets a held receipt simply be
+ * re-enqueued when its review finishes rather than needing a scheduler.
+ */
+describe("processReceiptEmail — waiting for review", () => {
+  async function seedWith(patch: {
+    validationFlags?: string[];
+    missingFields?: string[];
+  }): Promise<string> {
+    const { receiptId } = await seed();
+    await db
+      .update(receipts)
+      .set({
+        validationFlags: patch.validationFlags ?? [],
+        missingFields: patch.missingFields ?? [],
+      })
+      .where(eq(receipts.id, receiptId));
+    return receiptId;
+  }
+
+  it("holds an automatic send while a warning is outstanding", async () => {
+    const receiptId = await seedWith({ validationFlags: ["arithmetic_mismatch_items"] });
+    const { transport, sent } = fakeTransport();
+
+    const outcome = await processReceiptEmail(deps(transport), { receiptId, reason: "auto" });
+
+    expect(outcome).toEqual({ sent: false, skipped: "awaiting_review" });
+    expect(sent).toHaveLength(0);
+    // The marker must stay null, or the release would later skip as
+    // `already_sent` and the email would never arrive at all.
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.receiptEmailSentAt).toBeNull();
+  });
+
+  it("sends once the warning is resolved", async () => {
+    const receiptId = await seedWith({ validationFlags: [] });
+    const { transport, sent } = fakeTransport();
+
+    const outcome = await processReceiptEmail(deps(transport), { receiptId, reason: "auto" });
+
+    expect(outcome.sent).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
+  /** The default gate. A receipt can be complete and correct with a field
+   *  genuinely blank, so a missing card_last4 is not a reason to withhold it. */
+  it("does not hold for a missing field under the default gate", async () => {
+    const receiptId = await seedWith({ missingFields: ["card_last4"] });
+    const { transport } = fakeTransport();
+
+    const outcome = await processReceiptEmail(
+      { ...deps(transport), emailGate: "flags" },
+      { receiptId, reason: "auto" },
+    );
+
+    expect(outcome.sent).toBe(true);
+  });
+
+  it("does hold for a missing field under the stricter gate", async () => {
+    const receiptId = await seedWith({ missingFields: ["card_last4"] });
+    const { transport } = fakeTransport();
+
+    const outcome = await processReceiptEmail(
+      { ...deps(transport), emailGate: "flags_and_missing" },
+      { receiptId, reason: "auto" },
+    );
+
+    expect(outcome).toEqual({ sent: false, skipped: "awaiting_review" });
+  });
+
+  /** An on-demand send is a deliberate act by a person who is looking at the
+   *  receipt. The gate is about the AUTOMATIC one. */
+  it("never holds an on-demand send", async () => {
+    const receiptId = await seedWith({ validationFlags: ["arithmetic_mismatch_items"] });
+    const { project, users } = await createTestProjectWithMembers(db, {
+      ownerKey: "requester",
+      members: [],
+    });
+    void project;
+    const { transport } = fakeTransport();
+
+    const outcome = await processReceiptEmail(
+      { ...deps(transport), emailGate: "flags_and_missing" },
+      {
+        receiptId,
+        reason: "on_demand",
+        toUserId: users.requester!.id,
+        requestedBy: users.requester!.id,
+      },
+    );
+
+    // Not a member of THAT receipt's project, so it skips for the membership
+    // reason — which is the point: it got past the review gate to reach it.
+    expect(outcome).toEqual({ sent: false, skipped: "recipient_not_a_member" });
+  });
+});

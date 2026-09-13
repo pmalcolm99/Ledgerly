@@ -280,3 +280,81 @@ describe("authorization", () => {
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });
+
+/**
+ * D-47 — releasing the held automatic email.
+ *
+ * The property under test is that it is an EDGE, not a level. Firing on
+ * "the receipt is clear" would re-enqueue on every subsequent edit of an
+ * already-settled receipt, and since the job id is stable that is mostly
+ * harmless — but `already_sent` would then be the only thing standing between
+ * a receipt and a second email, which is a thin place to put the guarantee.
+ */
+describe("releasing the held email when review finishes", () => {
+  function trackingCtx(user: AuthUser, enqueued: string[]): Context {
+    return {
+      db,
+      user,
+      enqueueAutoReceiptEmail: async ({ receiptId }) => {
+        enqueued.push(receiptId);
+      },
+    };
+  }
+
+  it("enqueues the automatic email when the last flag is acknowledged", async () => {
+    const { id, user } = await discountedReceipt();
+    const enqueued: string[] = [];
+    const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+
+    // Two flags trip on this receipt; clearing the first must NOT release it.
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_items" });
+    expect(enqueued).toEqual([]);
+
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_total" });
+    expect(enqueued).toEqual([id]);
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, id));
+    expect(row?.validationFlags).toEqual([]);
+    expect(row?.reviewedAt).not.toBeNull();
+  });
+
+  /** An edge, not a level. */
+  it("does not re-enqueue on a later edit of an already-clear receipt", async () => {
+    const { id, user } = await discountedReceipt();
+    const enqueued: string[] = [];
+    const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_items" });
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_total" });
+    expect(enqueued).toEqual([id]);
+
+    await caller.receipts.update({ id, merchantName: "Safelite AutoGlass" });
+    expect(enqueued).toEqual([id]);
+  });
+
+  /** Undoing an acknowledgement puts the receipt back into review, and the
+   *  NEXT resolution has to be able to release it again. */
+  it("releases again after the receipt goes back into review and out", async () => {
+    const { id, user } = await discountedReceipt();
+    const enqueued: string[] = [];
+    const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_items" });
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_total" });
+    await caller.receipts.unacknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_total" });
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_total" });
+
+    expect(enqueued).toEqual([id, id]);
+  });
+
+  /** The capability is optional on the context (tests and RSC do not supply
+   *  it), and a missing one must be a no-op rather than a crash. */
+  it("is a no-op when the queue capability is absent", async () => {
+    const { id, user } = await discountedReceipt();
+    const caller = appRouter.createCaller(ctxFor(user));
+
+    await expect(
+      caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_items" }),
+    ).resolves.toBeDefined();
+  });
+});

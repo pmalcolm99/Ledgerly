@@ -40,6 +40,23 @@ export type EnqueueReceiptEmail = (params: {
   requestedBy: string;
 }) => Promise<void>;
 
+/**
+ * Re-enqueues the AUTOMATIC receipt email for a receipt whose review has just
+ * been finished (D-47).
+ *
+ * Separate from `EnqueueReceiptEmail` above because the two jobs are not the
+ * same shape and must not be: an automatic send resolves its own recipient
+ * and carries the `${receiptId}-auto` job id, while an on-demand send names a
+ * recipient and deliberately carries no id so a re-send is never deduplicated.
+ * Collapsing them into one capability with optional fields would make it
+ * possible to accidentally send an automatic email to a chosen address.
+ *
+ * The job may well skip again when it runs — the project setting, the
+ * once-only marker and the review gate are all still evaluated at send time.
+ * This only says "it is worth asking again".
+ */
+export type EnqueueAutoReceiptEmail = (params: { receiptId: string }) => Promise<void>;
+
 /** Sends one message NOW, used only by `admin.testSmtp`. Injected because
  * `nodemailer` lives in `packages/queue` (which already depends on this
  * package, so the import would be circular) and because the credential-
@@ -89,6 +106,7 @@ export type Context = {
   user: AuthUser | null;
   enqueueReceiptExtract?: EnqueueReceiptExtract;
   enqueueReceiptEmail?: EnqueueReceiptEmail;
+  enqueueAutoReceiptEmail?: EnqueueAutoReceiptEmail;
   sendEmail?: SendEmail;
   enqueueBackup?: EnqueueBackup;
   rescheduleBackup?: RescheduleBackup;
@@ -110,6 +128,7 @@ export async function createContext(opts: {
   headers: Headers;
   enqueueReceiptExtract?: EnqueueReceiptExtract;
   enqueueReceiptEmail?: EnqueueReceiptEmail;
+  enqueueAutoReceiptEmail?: EnqueueAutoReceiptEmail;
   sendEmail?: SendEmail;
   enqueueBackup?: EnqueueBackup;
   rescheduleBackup?: RescheduleBackup;
@@ -121,6 +140,7 @@ export async function createContext(opts: {
     user: await resolveIdentityFromHeaders(opts.headers),
     enqueueReceiptExtract: opts.enqueueReceiptExtract,
     enqueueReceiptEmail: opts.enqueueReceiptEmail,
+    enqueueAutoReceiptEmail: opts.enqueueAutoReceiptEmail,
     sendEmail: opts.sendEmail,
     enqueueBackup: opts.enqueueBackup,
     rescheduleBackup: opts.rescheduleBackup,

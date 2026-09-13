@@ -90,6 +90,12 @@ export type EmailDeps = {
   maxMegapixels: number;
   /** `https://receipts.example.com`, or null when no usable hostname is set. */
   appOrigin: string | null;
+  /**
+   * Which unresolved state holds back an automatic send (D-47). Resolved from
+   * `app_config` by the worker. Defaults to `flags` so a caller that has not
+   * been updated gets the narrower, less surprising gate.
+   */
+  emailGate?: "flags" | "flags_and_missing";
 };
 
 /** Mirrors `ExtractError` (`pipeline/extract.ts`): a stable reason code, and
@@ -218,6 +224,30 @@ function formatFrom(from: { address: string; name: string }): string {
   return `"${name}" <${from.address}>`;
 }
 
+/**
+ * Whether an automatic send waits for a human (D-47).
+ *
+ * Deliberately NOT `NEEDS_REVIEW_SQL`. That predicate includes
+ * `extraction_status <> 'ok'`, which covers `pending` and `failed` — states
+ * where there is nothing for a person to resolve and the email should simply
+ * never come. This asks a narrower question: is there something outstanding
+ * that a person is expected to act on.
+ *
+ * The two gates answer to the user's setting:
+ *  - `flags` — warnings only. A receipt can be complete and correct with a
+ *    field genuinely blank, so a missing `card_last4` does not hold up mail.
+ *  - `flags_and_missing` — the strictest reading of "static, complete and
+ *    correct", at the cost of receipts sitting unsent over a field nobody
+ *    cares about.
+ */
+export function emailIsHeldForReview(
+  receipt: { validationFlags: string[]; missingFields: string[] },
+  gate: "flags" | "flags_and_missing",
+): boolean {
+  if (receipt.validationFlags.length > 0) return true;
+  return gate === "flags_and_missing" && receipt.missingFields.length > 0;
+}
+
 export async function processReceiptEmail(
   deps: EmailDeps,
   data: EmailJobData,
@@ -233,6 +263,16 @@ export async function processReceiptEmail(
     // The once-only marker. `receipts.reextract` re-enters the persistence
     // path, so without this every manual re-extract would send again.
     if (loaded.receipt.receiptEmailSentAt) return { sent: false, skipped: "already_sent" };
+    // D-47: the emailed receipt is meant to be the SETTLED version. A receipt
+    // that still has unresolved warnings is one nobody has confirmed is
+    // correct, and an email is not recallable — so it waits.
+    //
+    // Checked at send time like everything else above, which is what makes the
+    // waiting work without a scheduler: `recomputeReceiptDerivedState` re-adds
+    // this same job when the last flag clears, and by then this test passes.
+    if (emailIsHeldForReview(loaded.receipt, deps.emailGate ?? "flags")) {
+      return { sent: false, skipped: "awaiting_review" };
+    }
   }
 
   if (!deps.transport) {

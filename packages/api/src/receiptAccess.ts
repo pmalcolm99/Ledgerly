@@ -227,7 +227,33 @@ export type { EditableReceiptColumn, MissingFieldToken } from "@ledgerly/shared/
  *    definition of "this receipt has left the review queue" and no second
  *    source of truth to disagree with the badge.
  */
-export async function recomputeReceiptDerivedState(tx: Tx, receiptId: string): Promise<void> {
+/**
+ * What changed about a receipt's review state, so the caller can act on it
+ * AFTER the transaction commits (D-47).
+ *
+ * Returned rather than acted on here, because the one action anyone wants —
+ * enqueueing the held receipt email — must not happen inside the transaction.
+ * An email queued against a transaction that then rolls back is an email
+ * nobody can recall, which is the same rule `worker.ts` follows for the
+ * automatic send and the reason `recordEvent` takes a `Database` and not a
+ * `Tx`.
+ */
+export type RecomputeResult = {
+  /** The receipt this result is about. Carried here so the caller can act on
+   *  it after the transaction, where the ids that were in scope inside it are
+   *  not. */
+  receiptId: string | null;
+  /** The receipt has just gone from having something outstanding to having
+   *  nothing outstanding. False when it was already clear — this is an EDGE,
+   *  not a level, so a second edit to an already-clear receipt does not
+   *  re-trigger anything. */
+  becameClear: boolean;
+};
+
+export async function recomputeReceiptDerivedState(
+  tx: Tx,
+  receiptId: string,
+): Promise<RecomputeResult> {
   const [receipt] = await tx.select().from(receipts).where(eq(receipts.id, receiptId)).limit(1);
   if (!receipt) throw new TRPCError({ code: "NOT_FOUND" });
 
@@ -275,6 +301,10 @@ export async function recomputeReceiptDerivedState(tx: Tx, receiptId: string): P
 
   const nextMissing = [...missing];
   const isClear = nextMissing.length === 0 && validationFlags.length === 0;
+  // The BEFORE state, read from the row this function was handed at the top.
+  // An edge rather than a level: acting on `isClear` alone would re-fire on
+  // every subsequent edit of a receipt that was already settled.
+  const wasClear = receipt.missingFields.length === 0 && receipt.validationFlags.length === 0;
 
   await tx
     .update(receipts)
@@ -289,6 +319,33 @@ export async function recomputeReceiptDerivedState(tx: Tx, receiptId: string): P
       updatedAt: new Date(),
     })
     .where(eq(receipts.id, receiptId));
+
+  return { receiptId, becameClear: isClear && !wasClear };
+}
+
+/**
+ * Releases a held automatic receipt email, if this edit is what finished the
+ * review (D-47).
+ *
+ * Called AFTER the transaction commits, never inside it — see `RecomputeResult`.
+ * Every failure is swallowed to a console line for the same reason the
+ * extraction worker swallows its enqueue: the user's edit has already
+ * succeeded and been committed, and a Redis hiccup while queueing a
+ * NOTIFICATION must not turn a successful save into an error toast. The cost
+ * of losing it is one email that does not arrive, and the next edit to the
+ * receipt will try again.
+ */
+export async function releaseHeldEmail(
+  ctx: { enqueueAutoReceiptEmail?: (params: { receiptId: string }) => Promise<void> },
+  result: RecomputeResult,
+): Promise<void> {
+  if (!result.becameClear || result.receiptId === null || !ctx.enqueueAutoReceiptEmail) return;
+  const receiptId = result.receiptId;
+  try {
+    await ctx.enqueueAutoReceiptEmail({ receiptId });
+  } catch (error) {
+    console.error(`[ledgerly] could not release the held email for ${receiptId}:`, error);
+  }
 }
 
 /**

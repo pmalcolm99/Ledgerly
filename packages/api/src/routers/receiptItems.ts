@@ -15,7 +15,9 @@ import {
   assertMayEditReceipt,
   loadEditableReceipt,
   recomputeReceiptDerivedState,
+  releaseHeldEmail,
 } from "../receiptAccess";
+import type { RecomputeResult } from "../receiptAccess";
 import { protectedProcedure, router } from "../trpc";
 import { auditOwnerOverrideIfApplicable } from "./projects";
 
@@ -103,7 +105,11 @@ export const receiptItemsRouter = router({
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.receiptId, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
 
@@ -153,7 +159,7 @@ export const receiptItemsRouter = router({
         }
         if (!item) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
 
-        await recomputeReceiptDerivedState(tx, input.receiptId);
+        recomputed = await recomputeReceiptDerivedState(tx, input.receiptId);
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
           action: "receipt_item.created",
@@ -175,6 +181,8 @@ export const receiptItemsRouter = router({
 
         return item;
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   update: protectedProcedure
@@ -198,7 +206,11 @@ export const receiptItemsRouter = router({
         throw new TRPCError({ code: "BAD_REQUEST", message: "No fields to update." });
       }
 
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const receiptId = await receiptIdForItem(tx, id);
         const access = await loadEditableReceipt(tx, receiptId, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -231,7 +243,7 @@ export const receiptItemsRouter = router({
         }
         if (!updated) throw new TRPCError({ code: "NOT_FOUND" });
 
-        await recomputeReceiptDerivedState(tx, receiptId);
+        recomputed = await recomputeReceiptDerivedState(tx, receiptId);
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
           action: "receipt_item.updated",
@@ -254,12 +266,18 @@ export const receiptItemsRouter = router({
 
         return updated;
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   delete: protectedProcedure
     .input(z.object({ id: z.string().uuid() }))
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const receiptId = await receiptIdForItem(tx, input.id);
         const access = await loadEditableReceipt(tx, receiptId, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -274,7 +292,7 @@ export const receiptItemsRouter = router({
 
         // Removing the last item puts the `items` token back into
         // missing_fields, which is what this call recomputes.
-        await recomputeReceiptDerivedState(tx, receiptId);
+        recomputed = await recomputeReceiptDerivedState(tx, receiptId);
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
           action: "receipt_item.deleted",
@@ -292,5 +310,7 @@ export const receiptItemsRouter = router({
 
         return { id: input.id };
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 });

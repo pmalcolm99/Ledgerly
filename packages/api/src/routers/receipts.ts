@@ -45,7 +45,9 @@ import {
   loadEditableReceipt,
   merchantMatchesSql,
   recomputeReceiptDerivedState,
+  releaseHeldEmail,
 } from "../receiptAccess";
+import type { RecomputeResult } from "../receiptAccess";
 import { checkEmailReceiptRateLimit, checkReextractRateLimit } from "../rateLimit";
 import type { EditableReceiptColumn } from "../receiptAccess";
 import {
@@ -551,7 +553,11 @@ export const receiptsRouter = router({
         throw new TRPCError({ code: "BAD_REQUEST", message: "No fields to update." });
       }
 
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
@@ -596,7 +602,7 @@ export const receiptsRouter = router({
         // and reviewed_at from the row as it now stands. Without this, a user
         // who corrects a mistyped total keeps the arithmetic_mismatch_total
         // badge forever.
-        await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -622,6 +628,8 @@ export const receiptsRouter = router({
 
         return selectEditableReceipt(tx, receipt.id);
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   /**
@@ -641,7 +649,11 @@ export const receiptsRouter = router({
   dismissMissingField: protectedProcedure
     .input(z.object({ id: z.string().uuid(), field: z.enum(MISSING_FIELD_TOKENS) }))
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
@@ -662,7 +674,7 @@ export const receiptsRouter = router({
           })
           .where(eq(receipts.id, receipt.id));
 
-        await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -674,6 +686,8 @@ export const receiptsRouter = router({
 
         return selectEditableReceipt(tx, receipt.id);
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   /**
@@ -702,7 +716,11 @@ export const receiptsRouter = router({
   acknowledgeValidationFlag: protectedProcedure
     .input(z.object({ id: z.string().uuid(), flag: z.enum(VALIDATION_FLAGS) }))
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
@@ -722,7 +740,7 @@ export const receiptsRouter = router({
         // acknowledgement and re-derives both the flags and the status from
         // one rule. Writing the array here as well would be a second place for
         // that rule to live, and the two would eventually disagree.
-        await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -734,6 +752,8 @@ export const receiptsRouter = router({
 
         return selectEditableReceipt(tx, receipt.id);
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   /** The mirror of `acknowledgeValidationFlag`. The flag comes back only if the
@@ -741,7 +761,11 @@ export const receiptsRouter = router({
   unacknowledgeValidationFlag: protectedProcedure
     .input(z.object({ id: z.string().uuid(), flag: z.enum(VALIDATION_FLAGS) }))
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
@@ -755,7 +779,7 @@ export const receiptsRouter = router({
           .set({ acknowledgedFlags: [...acknowledged], updatedAt: new Date() })
           .where(eq(receipts.id, receipt.id));
 
-        await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -767,6 +791,8 @@ export const receiptsRouter = router({
 
         return selectEditableReceipt(tx, receipt.id);
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   /** The mirror of `dismissMissingField`. Without it a mis-dismissal is
@@ -774,7 +800,11 @@ export const receiptsRouter = router({
   undismissMissingField: protectedProcedure
     .input(z.object({ id: z.string().uuid(), field: z.enum(MISSING_FIELD_TOKENS) }))
     .mutation(async ({ ctx, input }) => {
-      return ctx.db.transaction(async (tx) => {
+      // `recomputed` is read after the transaction commits, never inside it:
+      // releasing a held email against a transaction that then rolls back is an
+      // email nobody can recall (D-47).
+      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
@@ -800,7 +830,7 @@ export const receiptsRouter = router({
           })
           .where(eq(receipts.id, receipt.id));
 
-        await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -812,6 +842,8 @@ export const receiptsRouter = router({
 
         return selectEditableReceipt(tx, receipt.id);
       });
+      await releaseHeldEmail(ctx, recomputed);
+      return outcome;
     }),
 
   /**

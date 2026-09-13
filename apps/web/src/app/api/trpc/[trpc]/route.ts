@@ -2,6 +2,7 @@ import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { appRouter, createContext } from "@ledgerly/api";
 import { getEnv } from "@ledgerly/config/env";
 import {
+  autoEmailJobId,
   getBackupQueue,
   getBackupScheduleState,
   getReceiptEmailQueue,
@@ -53,6 +54,19 @@ function handler(request: Request): Promise<Response> {
             toUserId,
             requestedBy,
           });
+        },
+        enqueueAutoReceiptEmail: async ({ receiptId }) => {
+          // D-47: the held automatic email, released now the receipt's review
+          // is finished. The SAME job id the extraction worker uses, which is
+          // what makes this idempotent — re-adding it after the first
+          // attempt completed as a skip is fine because the queue sets
+          // `removeOnComplete: {count: 0}`, and two resolutions racing produce
+          // one job rather than two emails.
+          await getReceiptEmailQueue(getEnv().REDIS_URL).add(
+            "email",
+            { receiptId, reason: "auto" },
+            { jobId: autoEmailJobId(receiptId) },
+          );
         },
         sendEmail: sendOneEmail,
         enqueueBackup: async ({ backupId, kind }) => {

@@ -191,6 +191,15 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
                 ) : null}
               </div>
             ))}
+            {/* D-47. The email is held until this list is empty, and a
+                receipt sitting unsent with no explanation is exactly the
+                silent failure the Logs tab was built for — so say it here,
+                where the person who can clear it is already looking. */}
+            {receipt.receiptEmailSentAt === null ? (
+              <p className="text-xs text-default-500">
+                The automatic email is waiting until these are resolved.
+              </p>
+            ) : null}
           </CardBody>
         </Card>
       ) : null}

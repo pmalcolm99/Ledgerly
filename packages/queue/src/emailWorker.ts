@@ -5,6 +5,7 @@ import nodemailer from "nodemailer";
 import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { resolveSmtpConfig, type SmtpConfig } from "@ledgerly/api/smtp";
+import { resolveAiSettings } from "@ledgerly/api/aiSettings";
 import { recordEvent } from "@ledgerly/api/events";
 
 import { getRedisConnection } from "./redis";
@@ -91,6 +92,16 @@ export async function startEmailWorker(redisUrl: string): Promise<Worker<EmailJo
     async (job: Job<EmailJobData>) => {
       try {
         const { transport, from } = await transportForJob();
+        // Resolved per job, like the SMTP config above: an operator who
+        // changes the gate must not have to restart the container, and a job
+        // already sitting in the queue should be judged by the setting in
+        // force when it runs (D-47).
+        const { settings } = await resolveAiSettings(db, env.MASTER_KEY, {
+          modelPass1: env.AI_MODEL_PASS1,
+          modelPass2: env.AI_MODEL_PASS2,
+          escalateBelow: env.AI_ESCALATE_BELOW,
+          concurrency: env.AI_CONCURRENCY,
+        });
         const outcome = await processReceiptEmail(
           {
             db,
@@ -99,6 +110,7 @@ export async function startEmailWorker(redisUrl: string): Promise<Worker<EmailJo
             uploadsDir: env.UPLOADS_DIR,
             maxMegapixels: env.MAX_UPLOAD_MEGAPIXELS,
             appOrigin: appOrigin(env.APP_HOSTNAME),
+            emailGate: settings.emailGate,
           },
           job.data,
         );
