@@ -163,7 +163,7 @@ export const receiptItemsRouter = router({
         }
         if (!item) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
 
-        recomputed = await recomputeReceiptDerivedState(tx, input.receiptId);
+        recomputed = await recomputeReceiptDerivedState(tx, input.receiptId, access.receipt);
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
           action: "receipt_item.created",
@@ -251,7 +251,7 @@ export const receiptItemsRouter = router({
         }
         if (!updated) throw new TRPCError({ code: "NOT_FOUND" });
 
-        recomputed = await recomputeReceiptDerivedState(tx, receiptId);
+        recomputed = await recomputeReceiptDerivedState(tx, receiptId, access.receipt);
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
           action: "receipt_item.updated",
@@ -304,7 +304,7 @@ export const receiptItemsRouter = router({
 
         // Removing the last item puts the `items` token back into
         // missing_fields, which is what this call recomputes.
-        recomputed = await recomputeReceiptDerivedState(tx, receiptId);
+        recomputed = await recomputeReceiptDerivedState(tx, receiptId, access.receipt);
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
           action: "receipt_item.deleted",

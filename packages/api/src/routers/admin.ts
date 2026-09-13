@@ -43,6 +43,7 @@ import {
   serializeModelCatalog,
 } from "../modelCatalog";
 import { DEFAULT_EXTRACTION_PROMPT } from "@ledgerly/shared/extractionPrompt";
+import { resolveLogSettings, serializeLogSettings } from "../logSettings";
 import {
   describeSmtpConfig,
   mergeSmtpConfig,
@@ -1149,6 +1150,43 @@ export const adminRouter = router({
           ? "Saved. Concurrency takes effect the next time the app restarts; everything else applies to the next receipt."
           : "Saved. Applies to the next receipt.",
       };
+    }),
+
+  /** Whether the instance is recording every step or only the failures
+   *  (D-48). Its own tiny pair of procedures rather than part of
+   *  `aiSettings`, so the Logs tab does not have to submit the extraction
+   *  config to flip one boolean. */
+  logSettings: ownerProcedure.query(async ({ ctx }) => {
+    return resolveLogSettings(ctx.db, getEnv().MASTER_KEY);
+  }),
+
+  setVerboseLogging: ownerProcedure
+    .input(z.object({ verbose: z.boolean() }))
+    .mutation(async ({ ctx, input }) => {
+      const env = getEnv();
+      await ctx.db.transaction(async (tx) => {
+        await writeSecret(
+          tx,
+          SECRET_KEYS.logSettings,
+          serializeLogSettings({ verbose: input.verbose }),
+          env.MASTER_KEY,
+          ctx.user.id,
+        );
+        await recordAudit(tx, {
+          actorUserId: ctx.user.id,
+          action: "app_config.updated",
+          entityType: "app_config",
+          entityId: null,
+          metadata: {
+            key: SECRET_KEYS.logSettings,
+            via: "admin.setVerboseLogging",
+            verbose: input.verbose,
+          },
+        });
+      });
+      // Read per job by the extraction worker, so the next receipt is logged
+      // at the new level — no restart, same as the other per-job settings.
+      return { ok: true as const, verbose: input.verbose };
     }),
 
   /**

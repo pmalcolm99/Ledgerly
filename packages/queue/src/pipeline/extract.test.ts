@@ -13,7 +13,7 @@ import {
   withCleanDatabase,
 } from "@ledgerly/db/testHarness";
 import * as schema from "@ledgerly/db/schema";
-import { aiUsage, receiptItems, receipts } from "@ledgerly/db/schema";
+import { aiUsage, appEvents, receiptItems, receipts } from "@ledgerly/db/schema";
 import { receiptFilePath, writeReceiptFile } from "@ledgerly/api/storage";
 
 import { ExtractError, processReceiptExtraction } from "./extract";
@@ -1108,5 +1108,102 @@ describe("tax-inclusive and order-level credits (D-47)", () => {
     const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
     expect(row?.transactionDiscount).toBeNull();
     expect(row?.validationFlags).toEqual([]);
+  });
+});
+
+/**
+ * D-48 — the verbose log.
+ *
+ * The assertion that matters is the pair: OFF writes nothing beyond the
+ * existing failure rows, and ON answers "which model, and why twice". A
+ * verbose switch that cannot be switched off is a retention problem, and one
+ * that does not record the reason is just noise.
+ */
+describe("verbose logging (D-48)", () => {
+  async function newReceipt() {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    return insertReceiptWithRender(project.id);
+  }
+
+  async function eventsFor(receiptId: string) {
+    return db.select().from(appEvents).where(eq(appEvents.entityId, receiptId));
+  }
+
+  it("writes nothing extra when it is off", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([{ input: cleanRecordReceiptInput() }]);
+
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    expect(await eventsFor(receiptId)).toHaveLength(0);
+  });
+
+  it("records each step, the model, and why a second read happened", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput({ confidence: 0.2 }) },
+      { input: cleanRecordReceiptInput() },
+    ]);
+
+    await processReceiptExtraction({ ...deps(client), verboseLogging: true }, { receiptId });
+
+    const events = await eventsFor(receiptId);
+    const codes = events.map((e) => e.event);
+    expect(codes).toContain("extraction.started");
+    expect(codes).toContain("extraction.pass_complete");
+    expect(codes).toContain("extraction.second_opinion");
+    expect(codes).toContain("extraction.finished");
+
+    // The two facts the operator actually wants.
+    const second = events.find((e) => e.event === "extraction.second_opinion");
+    expect(second?.metadata).toMatchObject({ reason: "confidence", model: "claude-sonnet-5" });
+  });
+
+  /** "Why did it NOT escalate" is the other half of the question, and with
+   *  both passes on one model the answer is about the configuration. */
+  it("records why no second opinion happened", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([{ input: cleanRecordReceiptInput() }]);
+
+    await processReceiptExtraction(
+      {
+        ...deps(client),
+        verboseLogging: true,
+        modelPass1: "claude-sonnet-5",
+        modelPass2: "claude-sonnet-5",
+      },
+      { receiptId },
+    );
+
+    const none = (await eventsFor(receiptId)).find(
+      (e) => e.event === "extraction.no_second_opinion",
+    );
+    expect(none?.metadata).toMatchObject({ ladderDisabled: true });
+  });
+
+  /** Logging must never be able to affect the job it describes. */
+  it("still extracts when the event insert fails", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([{ input: cleanRecordReceiptInput() }]);
+    // A Proxy, not a spread: drizzle's db carries its methods on the
+    // prototype, so `{ ...db }` produces an object with none of them.
+    const failingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== "insert") return Reflect.get(target, prop, receiver);
+        return (table: unknown) =>
+          table === appEvents
+            ? { values: () => Promise.reject(new Error("log table is on fire")) }
+            : (Reflect.get(target, prop, receiver) as (t: unknown) => unknown).call(target, table);
+      },
+    });
+    const exploding = {
+      ...deps(client),
+      verboseLogging: true,
+      db: failingDb,
+    } as unknown as ProcessReceiptExtractionDeps;
+
+    await expect(processReceiptExtraction(exploding, { receiptId })).resolves.toBeUndefined();
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.extractionStatus).toBe("ok");
   });
 });

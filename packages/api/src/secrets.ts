@@ -93,6 +93,12 @@ export const SECRET_KEYS = {
    * anyway. Losing it costs one API call.
    */
   modelCatalog: "ai_model_catalog",
+  /**
+   * D-48. Whether `app_events` records the ordinary steps or only the
+   * failures. Not a secret either; see `logSettings.ts` for why it is its own
+   * key rather than part of `ai_settings`.
+   */
+  logSettings: "log_settings",
 } as const;
 export type SecretKey = (typeof SECRET_KEYS)[keyof typeof SECRET_KEYS];
 

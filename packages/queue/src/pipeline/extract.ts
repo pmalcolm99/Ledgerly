@@ -4,6 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { and, eq, isNull } from "drizzle-orm";
 import { aiUsage, categories, receiptItems, receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
+import { recordEvent } from "@ledgerly/api/events";
 
 import { arithmeticHint, buildExtractionRequest } from "./anthropicRequest";
 import {
@@ -80,6 +81,12 @@ export type ProcessReceiptExtractionDeps = {
    * unaffected; `worker.ts` passes the admin's setting.
    */
   rescanOnReview?: boolean;
+  /**
+   * Record the ordinary steps as well as the failures (D-48). Resolved once
+   * per job by the worker and threaded down rather than read here, so a
+   * verbose run costs the same one settings read as a quiet one.
+   */
+  verboseLogging?: boolean;
   /**
    * Injectable clock, matching `pipeline/backup.ts`'s `deps.now`. The date
    * confirmation compares the receipt's date against today, so without this a
@@ -314,6 +321,7 @@ async function retryIfItemsDoNotReconcile(params: {
   receiptId: string;
   escalated: boolean;
   systemPrompt?: string;
+  verboseLogging?: boolean;
 }): Promise<PassResult> {
   const { db, client, previous, model, imageBytes, tool, receiptId, escalated, systemPrompt } =
     params;
@@ -352,6 +360,17 @@ async function retryIfItemsDoNotReconcile(params: {
       subtotal: retry.input.subtotal ?? null,
       items: pricedItems(retry.input),
     });
+    await logStep(db, params.verboseLogging ?? false, {
+      event: "extraction.corrective_reread",
+      entityId: receiptId,
+      metadata: {
+        model,
+        itemsSum: formatMoney(check.itemsCents),
+        subtotal: formatMoney(check.subtotalCents),
+        reconciled: after?.reconciles === true,
+      },
+    });
+
     if (after?.reconciles) {
       console.log(`[ledgerly] corrected reading reconciles receipt=${receiptId}`);
       return retry;
@@ -365,6 +384,31 @@ async function retryIfItemsDoNotReconcile(params: {
     console.error(`[ledgerly] corrective re-read failed receipt=${receiptId}:`, error);
     return previous;
   }
+}
+
+/**
+ * An `app_events` row that only exists when verbose logging is on (D-48).
+ *
+ * One helper rather than an `if` at each site, for the reason `recordEvent`
+ * itself is one function: the property that matters — that logging can never
+ * affect the job — has to hold at every call, and the way to guarantee that is
+ * to give callers one thing to call. `recordEvent` already swallows its own
+ * failures, so this adds only the switch.
+ */
+async function logStep(
+  db: Database,
+  verbose: boolean,
+  entry: { event: string; entityId: string; metadata: Record<string, unknown> },
+): Promise<void> {
+  if (!verbose) return;
+  await recordEvent(db, {
+    level: "info",
+    category: "extraction",
+    event: entry.event,
+    entityType: "receipt",
+    entityId: entry.entityId,
+    metadata: entry.metadata,
+  });
 }
 
 /** At most zero — see the call site. `null` passes through as "no credit". */
@@ -490,6 +534,7 @@ export async function processReceiptExtraction(
     modelPass2,
     escalateBelow,
     rescanOnReview = false,
+    verboseLogging = false,
     systemPrompt,
     now,
   } = deps;
@@ -571,6 +616,11 @@ export async function processReceiptExtraction(
       systemPrompt,
     });
   } else {
+    await logStep(db, verboseLogging, {
+      event: "extraction.started",
+      entityId: receiptId,
+      metadata: { model: modelPass1, pass: 1 },
+    });
     const pass1 = await runPass({
       db,
       client: anthropicClient,
@@ -581,6 +631,16 @@ export async function processReceiptExtraction(
       pass: 1,
       escalated: false,
       systemPrompt,
+    });
+    await logStep(db, verboseLogging, {
+      event: "extraction.pass_complete",
+      entityId: receiptId,
+      metadata: {
+        model: modelPass1,
+        pass: 1,
+        confidence: normalizeConfidence(pass1.input.confidence),
+        items: Array.isArray(pass1.input.items) ? pass1.input.items.length : 0,
+      },
     });
 
     // ONE second opinion, three reasons to want it (D-47). See
@@ -603,6 +663,17 @@ export async function processReceiptExtraction(
     });
 
     finalPass = pass1;
+
+    if (!reason) {
+      await logStep(db, verboseLogging, {
+        event: "extraction.no_second_opinion",
+        entityId: receiptId,
+        // Recorded because "why did it NOT escalate" is the other half of the
+        // question, and with both models equal the answer is usually
+        // `ladderDisabled` rather than anything about this receipt.
+        metadata: { ladderDisabled: !hasDistinctModel, rescanOnReview },
+      });
+    }
 
     if (reason) {
       const model = hasDistinctModel ? modelPass2 : modelPass1;
@@ -663,6 +734,20 @@ export async function processReceiptExtraction(
         console.log(
           `[ledgerly] second opinion receipt=${receiptId} reason=${reason} model=${model}`,
         );
+        await logStep(db, verboseLogging, {
+          event: "extraction.second_opinion",
+          entityId: receiptId,
+          // `reason` is the whole point of this row: "why did it read the
+          // receipt twice" is the question the verbose log exists to answer,
+          // and the console line that used to carry it is not something an
+          // operator can reach.
+          metadata: {
+            reason,
+            model,
+            escalated: hasDistinctModel,
+            confidence: normalizeConfidence(secondPass.input.confidence),
+          },
+        });
 
         // The date check falls out of having two readings, whatever the reason
         // for the second one. Two independent reads landing on the same date is
@@ -724,6 +809,7 @@ export async function processReceiptExtraction(
       receiptId,
       escalated,
       systemPrompt,
+      verboseLogging,
     });
 
     // The corrective re-read can replace the whole reading, including the date
@@ -733,6 +819,17 @@ export async function processReceiptExtraction(
     // already covers it.
     if (normalizeDate(finalPass.input.transaction_date) === null) dateUnconfirmed = false;
   }
+
+  await logStep(db, verboseLogging, {
+    event: "extraction.finished",
+    entityId: receiptId,
+    metadata: {
+      model: finalPass.model,
+      pass: forcePass2 || escalated ? 2 : 1,
+      escalated,
+      dateUnconfirmed,
+    },
+  });
 
   const input = finalPass.input;
 

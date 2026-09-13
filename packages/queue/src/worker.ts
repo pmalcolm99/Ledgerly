@@ -7,6 +7,7 @@ import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { resolveAiKey } from "@ledgerly/api/aiKey";
 import { resolveAiSettings } from "@ledgerly/api/aiSettings";
+import { resolveLogSettings } from "@ledgerly/api/logSettings";
 import { recordEvent } from "@ledgerly/api/events";
 import { receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
@@ -169,9 +170,12 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
           concurrency: env.AI_CONCURRENCY,
         });
 
+        const logs = await resolveLogSettings(db, env.MASTER_KEY);
+
         await processReceiptExtraction(
           {
             db,
+            verboseLogging: logs.verbose,
             anthropicClient: await anthropicForJob(),
             uploadsDir: env.UPLOADS_DIR,
             maxMegapixels: env.MAX_UPLOAD_MEGAPIXELS,
@@ -205,6 +209,20 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
             { receiptId: job.data.receiptId, reason: "auto" },
             { jobId: autoEmailJobId(job.data.receiptId) },
           );
+          if (logs.verbose) {
+            await recordEvent(db, {
+              level: "info",
+              category: "email",
+              event: "email.queued",
+              entityType: "receipt",
+              entityId: job.data.receiptId,
+              // The step between "extraction finished" and "email sent or
+              // skipped" — without it a lost enqueue and a skipped send look
+              // identical in the log, which is the pair that took two rounds
+              // to tell apart last time (D-48).
+              metadata: { trigger: "auto" },
+            });
+          }
         } catch (enqueueError) {
           console.error(
             `[ledgerly] failed to enqueue receipt email for ${job.data.receiptId}:`,

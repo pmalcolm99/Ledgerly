@@ -20,7 +20,8 @@
     "./smtp": "./src/smtp.ts",
     "./backupSchedule": "./src/backupSchedule.ts",
     "./aiSettings": "./src/aiSettings.ts",
-    "./modelCatalog": "./src/modelCatalog.ts"
+    "./modelCatalog": "./src/modelCatalog.ts",
+    "./logSettings": "./src/logSettings.ts"
   },
   "scripts": {
     "lint": "eslint .",

@@ -603,10 +603,10 @@ Encrypted key-value store for runtime settings, following Forkd's
 `MASTER_KEY` (32 bytes, base64, validated at startup by D-14). Keys actually in
 use, as a closed union in `packages/api/src/secrets.ts`: `anthropic_api_key`
 (D-39), `smtp_config` (D-44), `backup_schedule` (D-45), `ai_settings` and
-`ai_model_catalog` (both D-47).
+`ai_model_catalog` (both D-47), and `log_settings` (D-48).
 
-**Three of the five hold nothing secret.** `backup_schedule`, `ai_settings` and
-`ai_model_catalog` are encrypted because this table has exactly one storage
+**Four of the six hold nothing secret.** `backup_schedule`, `ai_settings`,
+`ai_model_catalog` and `log_settings` are encrypted because this table has exactly one storage
 format, not because they need protecting; the consequence — a rotated
 `MASTER_KEY` makes them unreadable — is handled as a first-class `undecryptable`
 state rather than reported as "not configured" (D-45). `ai_settings` differs

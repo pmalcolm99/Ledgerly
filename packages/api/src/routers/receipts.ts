@@ -618,6 +618,13 @@ export const receiptsRouter = router({
         const access = await loadEditableReceipt(tx, id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
+        // Captured BEFORE anything is written. Several of these procedures
+        // rewrite `missing_fields` themselves, so the row as it stands by the
+        // time the recompute reads it is already the after-state (D-47).
+        const before = {
+          validationFlags: receipt.validationFlags,
+          missingFields: receipt.missingFields,
+        };
 
         // CLAUDE.md's scrub rule is written about model output, but this
         // procedure accepts free text straight from a person, and a card
@@ -664,7 +671,7 @@ export const receiptsRouter = router({
         // and reviewed_at from the row as it now stands. Without this, a user
         // who corrects a mistyped total keeps the arithmetic_mismatch_total
         // badge forever.
-        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id, before);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -723,6 +730,13 @@ export const receiptsRouter = router({
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
+        // Captured BEFORE anything is written. Several of these procedures
+        // rewrite `missing_fields` themselves, so the row as it stands by the
+        // time the recompute reads it is already the after-state (D-47).
+        const before = {
+          validationFlags: receipt.validationFlags,
+          missingFields: receipt.missingFields,
+        };
 
         const dismissed = new Set(receipt.dismissedFields);
         const missing = new Set(receipt.missingFields);
@@ -740,7 +754,7 @@ export const receiptsRouter = router({
           })
           .where(eq(receipts.id, receipt.id));
 
-        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id, before);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -794,6 +808,13 @@ export const receiptsRouter = router({
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
+        // Captured BEFORE anything is written. Several of these procedures
+        // rewrite `missing_fields` themselves, so the row as it stands by the
+        // time the recompute reads it is already the after-state (D-47).
+        const before = {
+          validationFlags: receipt.validationFlags,
+          missingFields: receipt.missingFields,
+        };
 
         const acknowledged = new Set(receipt.acknowledgedFlags);
         const flags = new Set(receipt.validationFlags);
@@ -810,7 +831,7 @@ export const receiptsRouter = router({
         // acknowledgement and re-derives both the flags and the status from
         // one rule. Writing the array here as well would be a second place for
         // that rule to live, and the two would eventually disagree.
-        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id, before);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -843,6 +864,13 @@ export const receiptsRouter = router({
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
+        // Captured BEFORE anything is written. Several of these procedures
+        // rewrite `missing_fields` themselves, so the row as it stands by the
+        // time the recompute reads it is already the after-state (D-47).
+        const before = {
+          validationFlags: receipt.validationFlags,
+          missingFields: receipt.missingFields,
+        };
 
         const acknowledged = new Set(receipt.acknowledgedFlags);
         if (!acknowledged.has(input.flag)) return receipt;
@@ -853,7 +881,7 @@ export const receiptsRouter = router({
           .set({ acknowledgedFlags: [...acknowledged], updatedAt: new Date() })
           .where(eq(receipts.id, receipt.id));
 
-        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id, before);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,
@@ -886,6 +914,13 @@ export const receiptsRouter = router({
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
         const { receipt } = access;
+        // Captured BEFORE anything is written. Several of these procedures
+        // rewrite `missing_fields` themselves, so the row as it stands by the
+        // time the recompute reads it is already the after-state (D-47).
+        const before = {
+          validationFlags: receipt.validationFlags,
+          missingFields: receipt.missingFields,
+        };
 
         const dismissed = new Set(receipt.dismissedFields);
         if (!dismissed.has(input.field)) return receipt;
@@ -908,7 +943,7 @@ export const receiptsRouter = router({
           })
           .where(eq(receipts.id, receipt.id));
 
-        recomputed = await recomputeReceiptDerivedState(tx, receipt.id);
+        recomputed = await recomputeReceiptDerivedState(tx, receipt.id, before);
 
         await recordAudit(tx, {
           actorUserId: ctx.user.id,

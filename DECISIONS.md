@@ -1818,3 +1818,70 @@ would re-enqueue, leaving `already_sent` as the only thing between a receipt and
 a second email — a thin place to put that guarantee. The enqueue happens after
 the transaction commits, never inside it: an email queued against a transaction
 that then rolls back is an email nobody can recall.
+
+---
+
+## D-48 — A verbose log level, off by default. **Settled** (user request).
+
+**Context.** Reported after D-47 shipped: _"logs could probably be a little
+more verbose. It would be nice to have a verbose option that shows each task —
+scan, rescan, model used, why a rescan happened."_
+
+`app_events` only ever recorded things that went WRONG — a skipped email, a
+failed extraction, an unregistered schedule. That is the right default: one row
+per failure is a log you read, one row per step is a log you scroll past. But it
+cannot answer the question an operator actually has when a receipt comes out
+wrong and nothing failed — **which model read this, and why did it read it
+twice?** D-47 made that question much more likely to be asked, because it added
+two new reasons for a second read and a settings screen for choosing the model.
+
+**A switch, not a new default.** Off records failures as before. On records
+`extraction.started`, `extraction.pass_complete`, `extraction.second_opinion`
+(with the REASON, which is the whole point), `extraction.no_second_opinion`
+(with `ladderDisabled`, because "why did it not escalate" is the other half of
+the question), `extraction.corrective_reread`, `extraction.finished`, and
+`email.queued`.
+
+**Consequence.** `email.released` is recorded at BOTH levels. It is the moment
+the held-email feature either works or silently does not, and the bug that
+prompted this decision — see below — would have been visible from the Logs tab
+in seconds rather than from a user noticing an email that never arrived.
+
+**Consequence.** Its own `app_config` key rather than a field on `ai_settings`.
+It would fit there and save a read, but it is operated from a different screen
+by someone asking a different question: you turn it on while diagnosing and off
+afterwards, and folding it in would mean the Logs tab had to submit the whole
+extraction config to flip one boolean. A mis-submitted model id is a worse
+outcome than an extra indexed read.
+
+**Consequence.** Resolved once per job and threaded down, not read at each call
+site, so a verbose run costs the same single settings read as a quiet one. The
+emitter is one guarded helper rather than an `if` at each site, for the reason
+`recordEvent` is one function: the property that matters — that logging can
+never affect the job — has to hold at every call, and the way to guarantee that
+is to give callers one thing to call.
+
+### The bug that came with it
+
+The same report noted that a cleared warning released the email but a dismissed
+field did not. Under the strict gate both should.
+
+`recomputeReceiptDerivedState` computed the released-yet edge from the row IT
+read. But `dismissMissingField` and `receipts.update` write `missing_fields`
+themselves and only then recompute — so by the time it read the row, the field
+was already gone and there was nothing outstanding to have just finished.
+Acknowledging a flag worked by luck: that path writes `acknowledged_flags` and
+leaves `validation_flags` to be derived inside the recompute, so its before-state
+genuinely was before.
+
+**Consequence.** The before-state is now a REQUIRED parameter, supplied by each
+caller from the receipt it loaded at the top of the mutation. A default would
+have preserved the trap for the next person; making it an argument makes the
+caller state what it saw, which is the only thing that can be true regardless of
+what that caller has already written.
+
+This is the third bug in this sequence of the same shape — one idea expressed
+twice, in two places that drifted. D-47's review found the other two. Worth
+naming as a pattern: **when two pieces of code must agree about something, the
+cheapest correct answer is usually one function, and the cheapest wrong answer
+is two that look alike.**

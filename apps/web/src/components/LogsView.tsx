@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Button, Card, CardBody, Chip, Skeleton } from "@heroui/react";
+import { Button, Card, CardBody, Chip, Skeleton, Switch } from "@heroui/react";
 import { ScrollText } from "lucide-react";
 import { EVENT_CATEGORIES } from "@ledgerly/shared/events";
 
@@ -50,16 +50,20 @@ export function LogsView() {
           <ScrollText className="h-6 w-6" aria-hidden />
           Logs
         </h1>
-        {/* Which build produced these lines is the first thing you want when
-            reading them — and answering it previously meant grepping a JS
-            bundle inside the container. */}
-        <span className="font-mono text-xs text-default-400">{buildLabel()}</span>
+        <div className="flex items-center gap-3">
+          <VerboseToggle />
+          {/* Which build produced these lines is the first thing you want when
+              reading them — and answering it previously meant grepping a JS
+              bundle inside the container. */}
+          <span className="font-mono text-xs text-default-400">{buildLabel()}</span>
+        </div>
       </div>
 
       <p className="text-sm text-default-500">
         What this instance has been doing. Stack traces and framework noise stay in{" "}
         <code>docker compose logs</code>; this is the record of actions, failures, and every email
-        with its outcome.
+        with its outcome. <strong>Verbose</strong> adds every step of each receipt — which model
+        read it, whether it was read twice and why — from the next receipt onward.
       </p>
 
       <div className="flex flex-wrap gap-2">
@@ -158,6 +162,37 @@ export function LogsView() {
         <p className="self-center text-xs text-default-400">That is everything.</p>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The verbose switch (D-48).
+ *
+ * Here rather than on the settings page because this is where the question
+ * arises: you turn it on while looking at a log that does not say enough, and
+ * off again once you have your answer. Invalidating the log query on change is
+ * deliberate — the next receipt is logged at the new level, so the list should
+ * stop showing yesterday's density as though it were current.
+ */
+function VerboseToggle() {
+  const utils = trpc.useUtils();
+  const settings = trpc.admin.logSettings.useQuery();
+  const setVerbose = trpc.admin.setVerboseLogging.useMutation({
+    onSuccess: async () => {
+      await utils.admin.logSettings.invalidate();
+      await utils.admin.logs.invalidate();
+    },
+  });
+
+  return (
+    <Switch
+      size="sm"
+      isSelected={settings.data?.verbose ?? false}
+      isDisabled={settings.isPending || setVerbose.isPending}
+      onValueChange={(verbose) => setVerbose.mutate({ verbose })}
+    >
+      <span className="text-xs text-default-500">Verbose</span>
+    </Switch>
   );
 }
 

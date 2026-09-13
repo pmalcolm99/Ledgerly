@@ -10,15 +10,61 @@ below and in `docs/private/PHASE9_RESTORE_DRILL.md` (gitignored).
 
 Since then, outside the phase sequence: the automatic receipt email (D-44
 follow-up), two rounds on discount receipts, the admin Logs tab plus a build
-version (D-46), and a nine-part batch covering editable AI settings, three
-misread receipt shapes, the project page, and holding the automatic email until
-a receipt has been reviewed (D-47). All committed; all described below, newest
+version (D-46), a nine-part batch covering editable AI settings, three misread
+receipt shapes, the project page, and holding the automatic email until a
+receipt has been reviewed (D-47), and a verbose log level (D-48). All committed; all described below, newest
 first.
 
 Phase 8's gate stays half-closed on the Excel half, Phase 7's on the on-device
 check, and Phase 6's on the two live-API tasks (6.3, 6.12) that need a real
 `ANTHROPIC_API_KEY`; D-12 stays Provisional. All three are unchanged by this
 phase and still listed under "Blocked / open questions".
+
+## A verbose log level, and the bug it was reported alongside (D-48)
+
+Reported from dev after D-47 shipped: a cleared warning released the held email,
+a dismissed field did not. Under the strict gate both should.
+
+**The before-state was not before.** `recomputeReceiptDerivedState` computed the
+just-finished edge from the row it read — but `dismissMissingField` and
+`receipts.update` write `missing_fields` themselves and only then recompute, so
+by the time it looked, the field was already gone and there was nothing
+outstanding to have just finished. Acknowledging a flag worked by luck: that
+path writes `acknowledged_flags` and lets `validation_flags` be derived inside
+the recompute, so its before-state really was before.
+
+The before-state is now a required parameter, supplied by each caller from the
+receipt it loaded before writing anything. A default would have kept the trap;
+an argument makes the caller state what it saw.
+
+**This is the third bug of the same shape in this sequence** — one idea written
+twice. The email hold and release were two predicates; the sort key was a column
+and a JS `Date`; this was a before-state read from two different moments. All
+three passed their tests, because the tests were written from the same
+understanding as the code.
+
+**The verbose switch** answers the question the failure-only log could not:
+which model read this receipt, whether it was read twice, and why. Off by
+default — one row per failure is a log you read, one row per step is a log you
+scroll past. On, each extraction records its start, each pass with its
+confidence and item count, the second opinion WITH ITS REASON, the
+no-second-opinion case with `ladderDisabled` (because "why did it not escalate"
+is the other half of the question), the corrective re-read with the numbers that
+disagreed, and the finish.
+
+`email.released` is recorded at both levels, deliberately: it is the moment this
+feature either works or silently does not, and it is the row that would have
+turned the bug above into a five-second answer from the Logs tab.
+
+The switch lives in the Logs tab header rather than the settings page, because
+that is where the question arises — you turn it on while looking at a log that
+does not say enough.
+
+### Verification
+
+**882 unit tests**, up from 875. The two regression tests for the release bug
+fail against the previous code and pass now; the default-gate test correctly
+stays green in both, since a missing field never held the email under it.
 
 ## Editable AI settings, three receipt shapes, the project page (D-47)
 

@@ -7,7 +7,11 @@ import {
   withCleanDatabase,
 } from "@ledgerly/db/testHarness";
 import * as schema from "@ledgerly/db/schema";
-import { auditLog, receiptItems, receipts } from "@ledgerly/db/schema";
+import { appConfig, auditLog, receiptItems, receipts, users } from "@ledgerly/db/schema";
+import { getEnv } from "@ledgerly/config/env";
+
+import { serializeAiSettings } from "../aiSettings";
+import { SECRET_KEYS, writeSecret } from "../secrets";
 import type { AuthUser } from "@ledgerly/auth/types";
 
 import { appRouter } from "../root";
@@ -291,6 +295,31 @@ describe("authorization", () => {
  * a receipt and a second email, which is a thin place to put the guarantee.
  */
 describe("releasing the held email when review finishes", () => {
+  /**
+   * Runs `body` with the instance configured for `flags_and_missing`.
+   *
+   * The gate is read from `app_config` at release time, so a test about the
+   * strict gate has to actually store it — asserting against the default would
+   * be asserting about a different feature.
+   */
+  async function withStrictGate(body: () => Promise<void>): Promise<void> {
+    const [actor] = await db.select().from(users).limit(1);
+    await db.transaction(async (tx) => {
+      await writeSecret(
+        tx,
+        SECRET_KEYS.aiSettings,
+        serializeAiSettings({ emailGate: "flags_and_missing" }),
+        getEnv().MASTER_KEY,
+        actor!.id,
+      );
+    });
+    try {
+      await body();
+    } finally {
+      await db.delete(appConfig).where(eq(appConfig.key, SECRET_KEYS.aiSettings));
+    }
+  }
+
   function trackingCtx(user: AuthUser, enqueued: string[]): Context {
     return {
       db,
@@ -329,6 +358,85 @@ describe("releasing the held email when review finishes", () => {
     expect(row?.missingFields.length).toBeGreaterThan(0);
     expect(row?.validationFlags).toEqual([]);
     expect(enqueued).toEqual([id]);
+  });
+
+  /**
+   * REPORTED FROM DEV, and the second time the same mistake has bitten: the
+   * "before" state has to be from before the MUTATION, not from before the
+   * recompute.
+   *
+   * Under the strict gate a receipt with an unread phone number is held.
+   * Dismissing it is what finishes the review — but `dismissMissingField`
+   * writes the cleared `missing_fields` to the row and only then recomputes,
+   * so the recompute's own read already showed nothing outstanding, the edge
+   * was false, and the email stayed held forever. Acknowledging a flag worked
+   * by luck: that path leaves `validation_flags` to be derived inside the
+   * recompute, so its before-state genuinely was before.
+   */
+  it("releases when dismissing the last missing field under the strict gate", async () => {
+    const { id, user } = await discountedReceipt();
+    await withStrictGate(async () => {
+      // Nothing outstanding except one unread field — the shape the user hit.
+      await db
+        .update(receipts)
+        .set({
+          validationFlags: [],
+          acknowledgedFlags: ["arithmetic_mismatch_total", "arithmetic_mismatch_items"],
+          missingFields: ["merchant_phone"],
+        })
+        .where(eq(receipts.id, id));
+
+      const enqueued: string[] = [];
+      const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+      await caller.receipts.dismissMissingField({ id, field: "merchant_phone" });
+
+      const [row] = await db.select().from(receipts).where(eq(receipts.id, id));
+      expect(row?.missingFields).toEqual([]);
+      expect(row?.dismissedFields).toContain("merchant_phone");
+      expect(enqueued).toEqual([id]);
+    });
+  });
+
+  /** The same edge through `receipts.update`, which also rewrites
+   *  `missing_fields` before recomputing. */
+  it("releases when filling in the last missing field under the strict gate", async () => {
+    const { id, user } = await discountedReceipt();
+    await withStrictGate(async () => {
+      await db
+        .update(receipts)
+        .set({
+          validationFlags: [],
+          acknowledgedFlags: ["arithmetic_mismatch_total", "arithmetic_mismatch_items"],
+          missingFields: ["merchant_phone"],
+        })
+        .where(eq(receipts.id, id));
+
+      const enqueued: string[] = [];
+      const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+      await caller.receipts.update({ id, merchantPhone: "555-0100" });
+
+      expect(enqueued).toEqual([id]);
+    });
+  });
+
+  /** Under the DEFAULT gate a missing field never held the email in the first
+   *  place, so dismissing one is not an edge and must not enqueue. */
+  it("does not release on a dismissal under the default gate", async () => {
+    const { id, user } = await discountedReceipt();
+    await db
+      .update(receipts)
+      .set({
+        validationFlags: [],
+        acknowledgedFlags: ["arithmetic_mismatch_total", "arithmetic_mismatch_items"],
+        missingFields: ["merchant_phone"],
+      })
+      .where(eq(receipts.id, id));
+
+    const enqueued: string[] = [];
+    const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+    await caller.receipts.dismissMissingField({ id, field: "merchant_phone" });
+
+    expect(enqueued).toEqual([]);
   });
 
   it("enqueues the automatic email when the last flag is acknowledged", async () => {

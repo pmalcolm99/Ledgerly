@@ -45,6 +45,14 @@ const EMAIL_SKIP: Record<string, string> = {
   recipient_not_a_member: "the recipient is not a member of that project",
 };
 
+/** Why the pipeline paid for a second read. The whole point of the verbose
+ *  log: "why did it read this receipt twice" is otherwise unanswerable. */
+const SECOND_OPINION: Record<string, string> = {
+  confidence: "the first reading was incomplete or unconfident",
+  date: "the date looked old enough to be worth confirming",
+  review: "the first reading did not add up",
+};
+
 const EMAIL_FAILURE: Record<string, string> = {
   SMTP_NOT_CONFIGURED: "no SMTP settings are configured",
   SMTP_UNDECRYPTABLE: "the stored SMTP settings cannot be decrypted",
@@ -78,8 +86,35 @@ export function logLabel(row: LogRow): string {
       return `Receipt email failed — ${EMAIL_FAILURE[str(m, "reason") ?? ""] ?? str(m, "reason") ?? "unknown reason"}`;
     case "email.enqueue_failed":
       return "Receipt email could not be queued, so it was never attempted";
+    case "email.queued":
+      return "Receipt email queued";
+    case "email.released":
+      return "Receipt email released — the review is finished";
 
     // --- extraction ----------------------------------------------------
+    case "extraction.started":
+      return `Reading a receipt with ${str(m, "model") ?? "the configured model"}`;
+    case "extraction.pass_complete": {
+      const confidence = num(m, "confidence");
+      const items = num(m, "items");
+      const parts = [
+        confidence !== null ? `${Math.round(confidence * 100)}% confident` : null,
+        items !== null ? `${items} ${items === 1 ? "item" : "items"}` : null,
+      ].filter(Boolean);
+      return `Pass ${num(m, "pass") ?? 1} done${parts.length > 0 ? ` — ${parts.join(", ")}` : ""}`;
+    }
+    case "extraction.second_opinion":
+      return `Read again with ${str(m, "model") ?? "another model"} — ${SECOND_OPINION[str(m, "reason") ?? ""] ?? "a second opinion was wanted"}`;
+    case "extraction.no_second_opinion":
+      return m.ladderDisabled === true
+        ? "No second opinion — both passes use the same model, so there is nowhere to escalate"
+        : "No second opinion needed";
+    case "extraction.corrective_reread":
+      return m.reconciled === true
+        ? `Re-read after the numbers disagreed (${str(m, "itemsSum") ?? "?"} vs ${str(m, "subtotal") ?? "?"}) — the second reading adds up`
+        : `Re-read after the numbers disagreed (${str(m, "itemsSum") ?? "?"} vs ${str(m, "subtotal") ?? "?"}) — it still does not add up`;
+    case "extraction.finished":
+      return `Finished reading with ${str(m, "model") ?? "the configured model"} (pass ${num(m, "pass") ?? 1})${m.dateUnconfirmed === true ? ", date unconfirmed" : ""}`;
     case "extraction.failed":
       return `Could not read a receipt — ${str(m, "reason") ?? "unknown reason"}`;
     case "extraction.status_write_failed":

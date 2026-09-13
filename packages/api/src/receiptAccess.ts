@@ -11,6 +11,7 @@ import { getEnv } from "@ledgerly/config/env";
 import type { Database } from "@ledgerly/db";
 
 import { resolveAiSettings } from "./aiSettings";
+import { recordEvent } from "./events";
 
 import type { Tx } from "./audit";
 import { lockScopedProject, scopedProjects } from "./scope";
@@ -268,6 +269,24 @@ export type RecomputeResult = {
 export async function recomputeReceiptDerivedState(
   tx: Tx,
   receiptId: string,
+  /**
+   * The receipt's review state BEFORE this mutation touched anything —
+   * `access.receipt` from the `loadEditableReceipt` at the top of the caller.
+   *
+   * **Required, and not defaulted to the row this function reads.** That is
+   * precisely what was wrong the first time: several callers write
+   * `missing_fields` themselves and only then call this, so the row it reads
+   * is already the AFTER state and the edge it computed was always false.
+   * `dismissMissingField` is the clearest case — it removes the token, writes
+   * the row, and by the time this runs there is nothing outstanding to have
+   * just finished. Acknowledging a flag happened to work because that path
+   * writes `acknowledged_flags` and leaves `validation_flags` to be derived
+   * here, so its before-state really was before.
+   *
+   * Passing it in makes the caller state what it saw, which is the only thing
+   * that can be true regardless of what the caller has already written.
+   */
+  before: ReviewState,
 ): Promise<RecomputeResult> {
   const [receipt] = await tx.select().from(receipts).where(eq(receipts.id, receiptId)).limit(1);
   if (!receipt) throw new TRPCError({ code: "NOT_FOUND" });
@@ -336,12 +355,7 @@ export async function recomputeReceiptDerivedState(
 
   return {
     receiptId,
-    // Read from the row this function was handed at the top, before the update
-    // below rewrote it.
-    before: {
-      validationFlags: receipt.validationFlags,
-      missingFields: receipt.missingFields,
-    },
+    before: { validationFlags: before.validationFlags, missingFields: before.missingFields },
     after: { validationFlags, missingFields: nextMissing },
   };
 }
@@ -394,6 +408,18 @@ export async function releaseHeldEmail(
 
   try {
     await ctx.enqueueAutoReceiptEmail({ receiptId });
+    // Always recorded, not only when verbose. This is the moment the feature
+    // either works or silently does not, and it is exactly the row that would
+    // have made the dismissed-field bug obvious from the Logs tab rather than
+    // from a user noticing an email that never arrived.
+    await recordEvent(ctx.db, {
+      level: "info",
+      category: "email",
+      event: "email.released",
+      entityType: "receipt",
+      entityId: receiptId,
+      metadata: { gate },
+    });
   } catch (error) {
     console.error(`[ledgerly] could not release the held email for ${receiptId}:`, error);
   }
