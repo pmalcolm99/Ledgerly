@@ -1885,3 +1885,52 @@ twice, in two places that drifted. D-47's review found the other two. Worth
 naming as a pattern: **when two pieces of code must agree about something, the
 cheapest correct answer is usually one function, and the cheapest wrong answer
 is two that look alike.**
+
+---
+
+## D-49 — An installed PWA fetches its export; a browser tab still streams it. **Settled** (reported bug).
+
+**Context.** Reported from an iPhone with Ledgerly on the home screen: the
+export opens a view with an X to dismiss, and **nothing downloads** — a blank
+white page and no file.
+
+This is the second bug in the same place. The first was `location.assign`:
+correct download, but a standalone PWA has one document and no chrome, so the
+"Open in Excel" sheet took the whole screen with no way back except killing the
+app. The fix was a `target="_blank"` anchor, which restored the way back — and
+an installed iOS app opens such a link in an in-app browser view that **cannot
+save a `Content-Disposition: attachment` response at all.** It renders blank and
+discards the body.
+
+**The mistake both times was treating this as a navigation problem.** In a
+standalone PWA there is nowhere to navigate to. Both fixes argued about WHICH
+window should receive the file; neither asked whether any window could.
+
+**An installed app fetches the file itself** and offers it through the Web Share
+API — the native sheet, "Save to Files" or "Open in Excel", with the document
+never going anywhere. Dismissing it returns you where you were because you never
+left. A browser tab keeps the anchor: it streams, nothing is buffered, and
+`Content-Disposition` names the file.
+
+**Consequence.** The share path buffers the whole response, because the Web
+Share API takes a complete `File` and there is no streaming form of it. Confined
+to the installed-app path deliberately: a phone exporting a project is the case
+where the file is small and the alternative is no file at all. The streamed path
+— which can produce something much larger than a phone would — is untouched.
+
+**Consequence.** Two fallbacks, because iOS wants a share inside a user gesture
+and the `await` on the fetch can outlive it. A `NotAllowedError` falls through
+to a blob-URL save rather than being reported; a dismissed sheet (`AbortError`)
+is treated as done, since falling through to a second save would be a strange
+thing to do to someone who just said no.
+
+**Consequence.** The button now has a busy state and shows the server's own
+error text. The bug being fixed was SILENT — a blank view and no file — and a
+silent failure on a download is indistinguishable from a slow one. The export
+handler already answers a rate limit as prose written for a person; that text is
+now shown rather than discarded.
+
+**What this does not do.** It is not verified on a real device from here — the
+detection is feature-based (`display-mode: standalone`, `navigator.standalone`)
+and the routing is unit-tested, but "the share sheet appears and saves a working
+file" needs the phone. Recorded as untested rather than implied to be confirmed.

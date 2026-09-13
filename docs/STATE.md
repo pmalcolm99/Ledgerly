@@ -12,13 +12,44 @@ Since then, outside the phase sequence: the automatic receipt email (D-44
 follow-up), two rounds on discount receipts, the admin Logs tab plus a build
 version (D-46), a nine-part batch covering editable AI settings, three misread
 receipt shapes, the project page, and holding the automatic email until a
-receipt has been reviewed (D-47), and a verbose log level (D-48). All committed; all described below, newest
+receipt has been reviewed (D-47), a verbose log level (D-48), and the iOS
+export download (D-49). All committed; all described below, newest
 first.
 
 Phase 8's gate stays half-closed on the Excel half, Phase 7's on the on-device
 check, and Phase 6's on the two live-API tasks (6.3, 6.12) that need a real
 `ANTHROPIC_API_KEY`; D-12 stays Provisional. All three are unchanged by this
 phase and still listed under "Blocked / open questions".
+
+## The iOS export downloaded nothing (D-49)
+
+Reported from an iPhone with the app on the home screen: the export opens a view
+with an X to dismiss, and no file ever arrives — blank white page.
+
+**Second bug in the same place, same root misconception.** The first was
+`location.assign`: the file downloaded, but a standalone PWA has one document
+and no chrome, so the share sheet took the whole screen with no way back. The
+fix was a `target="_blank"` anchor — which restored the way back and broke the
+download, because an installed iOS app opens such a link in an in-app browser
+view that cannot save an attachment at all.
+
+Both fixes argued about WHICH window should receive the file. Neither asked
+whether any window could. In a standalone PWA there is nowhere to navigate to,
+so the page that already exists has to fetch the file and hand it to the OS
+directly — `navigator.share` with a `File`, which opens the native sheet without
+the document going anywhere.
+
+A browser tab keeps the anchor: it streams, and the streamed response can be far
+larger than anything a phone exports. Only the installed-app path buffers, and
+only because the Web Share API takes a complete file.
+
+The button also gained a busy state and an error line. The bug was **silent** —
+a blank view is indistinguishable from a slow one — and the handler already
+answers a rate limit as prose written for a person, which was being thrown away.
+
+**Not verified on a device from here.** The detection is feature-based and the
+routing is unit-tested (an installed app must never be sent to a browser view; a
+tab must never buffer); the share sheet itself needs the phone.
 
 ## A verbose log level, and the bug it was reported alongside (D-48)
 
