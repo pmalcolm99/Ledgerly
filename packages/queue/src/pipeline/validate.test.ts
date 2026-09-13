@@ -15,6 +15,82 @@ function baseInput(overrides: Partial<ValidationInput> = {}): ValidationInput {
   };
 }
 
+/**
+ * D-47 — the three inputs added for transaction-level credits, tax-inclusive
+ * pricing, and a date two reads disagreed about.
+ *
+ * The assertion that matters most is the LAST one: every existing receipt has
+ * `transaction_discount = NULL`, `tax_included = false` and
+ * `date_unconfirmed = false`, so the new arithmetic has to reduce exactly to
+ * the old arithmetic for them. `recomputeReceiptDerivedState` re-runs these
+ * checks whenever anyone edits a field, so a change in behaviour here would
+ * silently re-flag receipts that have been settled for months.
+ */
+describe("runSanityChecks — transaction-level credits (D-47)", () => {
+  /** The bug this exists to fix. A $5 coupon applied to the order: the items
+   *  still sum to the subtotal, and the total is $5 lower than
+   *  subtotal + tax. Before D-47 the model emitted the coupon as a negative
+   *  line item, which broke the items check instead. */
+  it("accepts a receipt whose total is reduced by an order-level credit", () => {
+    const result = runSanityChecks(
+      baseInput({
+        subtotal: "10.00",
+        transactionDiscount: "-5.00",
+        salesTax: "1.00",
+        total: "6.00",
+        items: [{ lineTotal: "10.00" }],
+      }),
+    );
+    expect(result).toEqual({ status: "ok", validationFlags: [] });
+  });
+
+  it("still flags a total that does not add up once the credit is counted", () => {
+    const result = runSanityChecks(baseInput({ transactionDiscount: "-5.00", total: "11.00" }));
+    expect(result.validationFlags).toContain("arithmetic_mismatch_total");
+  });
+
+  /** The credit sits OUTSIDE the item sum by construction — that separation is
+   *  the whole point, and is what keeps case (a) working. */
+  it("leaves the items-vs-subtotal check untouched", () => {
+    const result = runSanityChecks(
+      baseInput({
+        subtotal: "10.00",
+        transactionDiscount: "-5.00",
+        total: "6.00",
+        items: [{ lineTotal: "10.00" }],
+      }),
+    );
+    expect(result.validationFlags).not.toContain("arithmetic_mismatch_items");
+  });
+
+  it("flags a date two readings disagreed about", () => {
+    const result = runSanityChecks(baseInput({ dateUnconfirmed: true }));
+    expect(result.status).toBe("partial");
+    expect(result.validationFlags).toContain("date_unconfirmed");
+  });
+
+  it("lets an acknowledged date_unconfirmed clear, like any other flag", () => {
+    const result = runSanityChecks(
+      baseInput({ dateUnconfirmed: true, acknowledgedFlags: ["date_unconfirmed"] }),
+    );
+    expect(result).toEqual({ status: "ok", validationFlags: [] });
+  });
+
+  /** THE REGRESSION GUARD. Absent discount, absent flags: byte-for-byte the
+   *  behaviour every already-extracted receipt was saved with. */
+  it("reduces exactly to the pre-D-47 behaviour when the new inputs are absent", () => {
+    const legacy = baseInput({ total: "20.00" });
+    const withExplicitDefaults = baseInput({
+      total: "20.00",
+      transactionDiscount: null,
+      taxIncluded: false,
+      dateUnconfirmed: false,
+    });
+    expect(runSanityChecks(legacy)).toEqual(runSanityChecks(withExplicitDefaults));
+    expect(runSanityChecks(legacy).validationFlags).toEqual(["arithmetic_mismatch_total"]);
+  });
+});
+
 describe("runSanityChecks", () => {
   it("trips nothing on a clean receipt", () => {
     const result = runSanityChecks(baseInput());

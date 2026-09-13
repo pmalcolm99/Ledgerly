@@ -51,6 +51,7 @@ export const VALIDATION_FLAG_LABELS: Record<string, string> = {
   arithmetic_mismatch_items: "Line items don't add up to the subtotal",
   date_in_future: "The date is in the future",
   date_too_old: "The date looked wrong and was cleared",
+  date_unconfirmed: "Two readings disagreed about the date — please confirm it",
 };
 
 export function validationFlagLabel(flag: string): string {

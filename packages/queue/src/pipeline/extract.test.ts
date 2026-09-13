@@ -130,8 +130,20 @@ function cleanRecordReceiptInput(overrides: Record<string, unknown> = {}): Recor
   };
 }
 
+/**
+ * A clock pinned two days after `cleanRecordReceiptInput`'s date, so the
+ * fixture reads as a RECENT receipt.
+ *
+ * Without this every test in this file would trip D-47's stale-date second
+ * opinion — the fixture date is fixed, so it drifts further into the past every
+ * week — and the call-count assertions below would start failing on a calendar
+ * boundary rather than on a code change.
+ */
+const FRESH_NOW = new Date("2026-01-17T12:00:00Z");
+
 function deps(client: AnthropicMessagesClient): ProcessReceiptExtractionDeps {
   return {
+    now: () => FRESH_NOW,
     db,
     anthropicClient: client,
     uploadsDir,
@@ -851,5 +863,250 @@ describe("processReceiptExtraction", () => {
     const items = await db.select().from(receiptItems).where(eq(receiptItems.receiptId, receiptId));
     expect(items).toHaveLength(1);
     expect(items[0]?.description).toBe("Hammer");
+  });
+});
+
+/**
+ * D-47 — one second opinion, three reasons to want it.
+ *
+ * `deps()` pins the clock two days after the fixture's date, so these tests
+ * move the CLOCK rather than the receipt to make a date stale. The date
+ * trigger is the only one that fires without a distinct escalation model, and
+ * the tests below are mostly about that asymmetry.
+ */
+describe("the second opinion (D-47)", () => {
+  const STALE_NOW = new Date("2026-03-01T12:00:00Z"); // six weeks after the fixture
+
+  async function newReceipt() {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    return insertReceiptWithRender(project.id);
+  }
+
+  it("re-reads a stale date even when both passes use the same model", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput() },
+      { input: cleanRecordReceiptInput() },
+    ]);
+
+    await processReceiptExtraction(
+      {
+        ...deps(client),
+        now: () => STALE_NOW,
+        modelPass1: "claude-sonnet-5",
+        modelPass2: "claude-sonnet-5",
+      },
+      { receiptId },
+    );
+
+    // Two calls, on an instance with nowhere to escalate TO. The question is
+    // "do two reads agree", not "can a better model do more".
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    // They agreed, so no flag — this is the case that keeps a genuinely old
+    // receipt quiet instead of asking about every delayed upload.
+    expect(row?.dateUnconfirmed).toBe(false);
+    expect(row?.validationFlags).not.toContain("date_unconfirmed");
+  });
+
+  it("flags the date when the two readings disagree", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput({ transaction_date: "2026-01-15" }) },
+      { input: cleanRecordReceiptInput({ transaction_date: "2025-01-15" }) },
+    ]);
+
+    await processReceiptExtraction({ ...deps(client), now: () => STALE_NOW }, { receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.dateUnconfirmed).toBe(true);
+    expect(row?.validationFlags).toContain("date_unconfirmed");
+    // The flag is acknowledgeable like any other, so the receipt is not stuck.
+    expect(row?.extractionStatus).toBe("partial");
+  });
+
+  /** A second read that lost the date must not take the first read's answer
+   *  with it — that turns "unconfirmed" into "missing", which is strictly less
+   *  information. */
+  it("keeps the first reading's date when the second returns none", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput({ transaction_date: "2026-01-15" }) },
+      { input: cleanRecordReceiptInput({ transaction_date: null }) },
+    ]);
+
+    await processReceiptExtraction({ ...deps(client), now: () => STALE_NOW }, { receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.transactionDate).toBe("2026-01-15");
+    expect(row?.dateUnconfirmed).toBe(true);
+    expect(row?.missingFields).not.toContain("transaction_date");
+  });
+
+  it("does not re-read a recent date", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([{ input: cleanRecordReceiptInput() }]);
+
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    expect(client.messages.create).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The trigger the user asked for: a confident reading that still does not
+   * add up gets a second opinion from the escalation model. D-12's amendment
+   * declined this as a REPLACEMENT for fixing the prompt; as a safety net on
+   * top of a corrected prompt it is a different proposition.
+   */
+  it("re-reads with the escalation model when the first reading needs review", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      // Confident, complete, and the items do not reach the subtotal.
+      { input: cleanRecordReceiptInput({ subtotal: "50.00", total: "51.00" }) },
+      { input: cleanRecordReceiptInput() },
+    ]);
+
+    await processReceiptExtraction({ ...deps(client), rescanOnReview: true }, { receiptId });
+
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.extractionModel).toBe("claude-sonnet-5");
+    expect(row?.validationFlags).toEqual([]);
+  });
+
+  it("does not re-read on review when the setting is off", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput({ subtotal: "50.00", total: "51.00" }) },
+      { input: cleanRecordReceiptInput({ subtotal: "50.00", total: "51.00" }) },
+    ]);
+
+    await processReceiptExtraction({ ...deps(client), rescanOnReview: false }, { receiptId });
+
+    // One extraction call, plus the pre-existing corrective re-read — which is
+    // a different mechanism and is NOT what this setting controls.
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+  });
+
+  /** A same-model rescan-on-review is a second identical paid call for an
+   *  identical answer, so it must not happen. */
+  it("does not rescan on review when there is nowhere to escalate to", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      { input: cleanRecordReceiptInput({ subtotal: "50.00", total: "51.00" }) },
+      { input: cleanRecordReceiptInput({ subtotal: "50.00", total: "51.00" }) },
+    ]);
+
+    await processReceiptExtraction(
+      {
+        ...deps(client),
+        rescanOnReview: true,
+        modelPass1: "claude-sonnet-5",
+        modelPass2: "claude-sonnet-5",
+      },
+      { receiptId },
+    );
+
+    // Only the corrective re-read, which is deliberately not gated on the
+    // model differing because it hands the model new information.
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("tax-inclusive and order-level credits (D-47)", () => {
+  async function newReceipt() {
+    const { project } = await createTestProjectWithMembers(db, { ownerKey: "owner", members: [] });
+    return insertReceiptWithRender(project.id);
+  }
+
+  /** A fuel receipt: the pump price already contains the tax. Tax is zero by
+   *  construction and a blank tax is the right answer, not a gap. */
+  it("stores zero tax and does not call it missing when prices include tax", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      {
+        input: cleanRecordReceiptInput({
+          tax_included_in_prices: true,
+          sales_tax: null,
+          subtotal: "40.00",
+          total: "40.00",
+          items: [
+            {
+              description: "Unleaded 12.5 gal",
+              quantity: "12.5",
+              unit_price: "3.20",
+              line_total: "40.00",
+              category: "transportation-fuel",
+            },
+          ],
+        }),
+      },
+    ]);
+
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.taxIncluded).toBe(true);
+    expect(row?.salesTax).toBe("0.00");
+    expect(row?.missingFields).not.toContain("sales_tax");
+    // The receipt still has to add up; it just adds up with zero tax.
+    expect(row?.validationFlags).toEqual([]);
+  });
+
+  /** The bug this fixes: an order-level coupon used to be emitted as a
+   *  negative line item, which dropped the item sum below the subtotal and
+   *  flagged a correctly-read receipt. */
+  it("keeps an order-level credit out of the item sum", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      {
+        input: cleanRecordReceiptInput({
+          subtotal: "10.00",
+          transaction_discount: "-5.00",
+          sales_tax: "1.00",
+          total: "6.00",
+        }),
+      },
+    ]);
+
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.transactionDiscount).toBe("-5.00");
+    expect(row?.validationFlags).toEqual([]);
+    const items = await db.select().from(receiptItems).where(eq(receiptItems.receiptId, receiptId));
+    expect(items).toHaveLength(1);
+    expect(items[0]?.lineTotal).toBe("10.00");
+  });
+
+  /** Nothing about case (a) changes: a discount already inside a line's price
+   *  is still one item at the net price. */
+  it("leaves an already-applied line discount alone", async () => {
+    const receiptId = await newReceipt();
+    const client = fakeClient([
+      {
+        input: cleanRecordReceiptInput({
+          subtotal: "360.05",
+          sales_tax: "0.00",
+          total: "360.05",
+          transaction_discount: null,
+          items: [
+            {
+              description: "GRACO MAGNUM X5",
+              quantity: "1",
+              unit_price: "379.00",
+              line_total: "360.05",
+              category: "tools-equipment",
+            },
+          ],
+        }),
+      },
+    ]);
+
+    await processReceiptExtraction(deps(client), { receiptId });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, receiptId));
+    expect(row?.transactionDiscount).toBeNull();
+    expect(row?.validationFlags).toEqual([]);
   });
 });

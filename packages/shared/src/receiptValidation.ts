@@ -49,6 +49,17 @@ export const VALIDATION_FLAGS = [
   "arithmetic_mismatch_items",
   "date_in_future",
   "date_too_old",
+  /**
+   * Two independent reads of the receipt disagreed about the date (D-47).
+   *
+   * Not "the date looks old" — a receipt uploaded three weeks after the
+   * purchase is completely ordinary, and flagging every one of those would
+   * train people to dismiss the flag without reading it. The trigger is
+   * disagreement: `extract.ts` re-reads when the date is more than a week old,
+   * and two independent reads landing on the same date is strong evidence the
+   * receipt really says that. A misread rarely repeats itself identically.
+   */
+  "date_unconfirmed",
 ] as const;
 
 export type ValidationFlag = (typeof VALIDATION_FLAGS)[number];
@@ -73,6 +84,18 @@ export type ValidationInput = {
   total: string | null;
   transactionDate: string | null; // ISO YYYY-MM-DD
   items: { lineTotal: string | null }[];
+  /**
+   * An order-level credit, negative, applied after the subtotal is struck
+   * (D-47). `null` or absent means none, which is how every receipt extracted
+   * before this existed keeps exactly the arithmetic it had.
+   */
+  transactionDiscount?: string | null;
+  /** The printed prices already include tax, so a zero `salesTax` is the right
+   *  answer rather than a gap. */
+  taxIncluded?: boolean;
+  /** Set by the pipeline when a second read disagreed about the date. Passed
+   *  through rather than re-derived — see `receipts.date_unconfirmed`. */
+  dateUnconfirmed?: boolean;
   /**
    * Flags the user has looked at and asserted are correct anyway.
    *
@@ -142,6 +165,13 @@ export function runSanityChecks(input: ValidationInput): ValidationResult {
   if (input.subtotal !== null && input.salesTax !== null && input.total !== null) {
     const subtotalCents = parseMoney(input.subtotal);
     const salesTaxCents = parseMoney(input.salesTax);
+    // D-47: an order-level credit sits between the subtotal and the total —
+    //   items -> subtotal -> + discount -> + tax + tip -> total
+    // — so it belongs in this check and deliberately NOT in the items check
+    // below. Stored negative, so this is an addition. Absent means zero, which
+    // is what makes this a no-op for every pre-existing receipt.
+    const discountCents =
+      input.transactionDiscount != null ? parseMoney(input.transactionDiscount) : 0;
     // Review finding L-4: ARCHITECTURE.md §6.3 states this check as
     // `subtotal + sales_tax - total`, but a tipped receipt (restaurants,
     // the exact case tip/`receipts.tip` exists for) legitimately has
@@ -151,7 +181,10 @@ export function runSanityChecks(input: ValidationInput): ValidationResult {
     // check, not a behavior change for untipped receipts.
     const tipCents = input.tip !== null ? parseMoney(input.tip) : 0;
     const totalCents = parseMoney(input.total);
-    if (Math.abs(subtotalCents + salesTaxCents + tipCents - totalCents) > TOTAL_TOLERANCE_CENTS) {
+    if (
+      Math.abs(subtotalCents + discountCents + salesTaxCents + tipCents - totalCents) >
+      TOTAL_TOLERANCE_CENTS
+    ) {
       flags.push("arithmetic_mismatch_total");
     }
   }
@@ -167,6 +200,13 @@ export function runSanityChecks(input: ValidationInput): ValidationResult {
         flags.push("arithmetic_mismatch_items");
       }
     }
+  }
+
+  // Not gated on `transactionDate` being non-null: a second read that returned
+  // no date at all, where the first read did, is exactly the disagreement this
+  // records.
+  if (input.dateUnconfirmed === true) {
+    flags.push("date_unconfirmed");
   }
 
   if (input.transactionDate !== null) {

@@ -44,6 +44,54 @@ export const receipts = pgTable(
     salesTax: numeric("sales_tax", { precision: 12, scale: 2 }),
     tip: numeric("tip", { precision: 12, scale: 2 }),
     total: numeric("total", { precision: 12, scale: 2 }),
+
+    /**
+     * An order-level credit — a whole-order coupon, a store credit, a loyalty
+     * award — as a NEGATIVE amount (D-47).
+     *
+     * Distinct from a discount that modifies one line, which is already inside
+     * that line's `line_total` and must never be emitted separately (the
+     * double-subtraction bug fixed in `783a957`). An order-level credit is
+     * applied AFTER the subtotal is struck, so it belongs to neither the items
+     * nor the subtotal:
+     *
+     *     items  ->  subtotal  ->  + transaction_discount  ->  + tax + tip  ->  total
+     *
+     * Modelling it as a negative line item — which is what the prompt used to
+     * ask for — puts it inside the item sum, drops that sum below the printed
+     * subtotal, and raises `arithmetic_mismatch_items` on a receipt that was
+     * read perfectly.
+     *
+     * NULL means "no order-level credit", and is treated as zero everywhere, so
+     * every receipt extracted before this column existed keeps exactly the
+     * arithmetic it had.
+     */
+    transactionDiscount: numeric("transaction_discount", { precision: 12, scale: 2 }),
+
+    /**
+     * The printed prices already include sales tax (D-47).
+     *
+     * Fuel is the everyday case: the pump price is tax-inclusive and the
+     * receipt often prints the tax as a memo line rather than as an addition.
+     * When this is true `sales_tax` is 0 by construction, and a blank tax is
+     * not a missing field — it is the correct answer. Other checks are
+     * unaffected: the receipt still has to add up.
+     */
+    taxIncluded: boolean("tax_included").notNull().default(false),
+
+    /**
+     * Two independent reads disagreed about `transaction_date` (D-47).
+     *
+     * A STORED FACT, not a derived one, which is why it is a column rather than
+     * something `runSanityChecks` could work out. The check is "did the second
+     * opinion agree with the first", and by the time the row is saved both
+     * readings are gone. Recomputing derived state on a later edit therefore
+     * passes this through rather than re-deriving it.
+     *
+     * False for every receipt extracted before this existed, so none of them
+     * gains a flag it never had.
+     */
+    dateUnconfirmed: boolean("date_unconfirmed").notNull().default(false),
     currency: char("currency", { length: 3 }).notNull().default("USD"),
 
     cardLast4: char("card_last4", { length: 4 }),

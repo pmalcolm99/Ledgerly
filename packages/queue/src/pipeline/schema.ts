@@ -40,6 +40,8 @@ export type RecordReceiptInput = {
   sales_tax: string | null;
   tip: string | null;
   total: string | null;
+  transaction_discount: string | null;
+  tax_included_in_prices: boolean;
   card_last4: string | null;
   payment_method: string | null;
   confidence: number;
@@ -92,6 +94,8 @@ export function buildRecordReceiptTool(categorySlugs: readonly string[]): Anthro
         "sales_tax",
         "tip",
         "total",
+        "transaction_discount",
+        "tax_included_in_prices",
         "card_last4",
         "payment_method",
         "confidence",
@@ -113,6 +117,24 @@ export function buildRecordReceiptTool(categorySlugs: readonly string[]): Anthro
         sales_tax: MONEY_FIELD,
         tip: MONEY_FIELD,
         total: MONEY_FIELD,
+        transaction_discount: {
+          type: ["string", "null"] as const,
+          description:
+            "The total of any credits applied to the WHOLE ORDER rather than to one item — a " +
+            'coupon, a store credit, a loyalty award — as a negative amount, e.g. "-5.00". ' +
+            "These are applied after the subtotal is struck, so they are NOT line items and " +
+            "must not be included in the line-item totals. Sum them if there is more than one. " +
+            "Null if the receipt has none. A discount that is already reflected in an item's " +
+            "own price does NOT belong here.",
+        },
+        tax_included_in_prices: {
+          type: "boolean",
+          description:
+            "True when the printed prices already include sales tax, so tax is not added on " +
+            "top of the subtotal — fuel receipts are the common case, and often print the tax " +
+            'as a memo line such as "INCLUDES $2.14 TAX". Set sales_tax to "0.00" when this ' +
+            "is true. False for an ordinary receipt that adds tax to the subtotal.",
+        },
         card_last4: {
           type: ["string", "null"],
           description:

@@ -236,6 +236,16 @@ export async function recomputeReceiptDerivedState(tx: Tx, receiptId: string): P
       tip: receipt.tip,
       total: receipt.total,
       transactionDate: receipt.transactionDate,
+      // Passed THROUGH, not re-derived. `transactionDiscount` is an edited
+      // value like any other money field, but `taxIncluded` and
+      // `dateUnconfirmed` are facts about how the receipt was READ — whether
+      // two passes agreed on the date, whether the prices were tax-inclusive —
+      // and both readings are long gone by the time a user edits a field. A
+      // recompute that re-derived them would quietly clear a flag nobody
+      // resolved (D-47).
+      transactionDiscount: receipt.transactionDiscount,
+      taxIncluded: receipt.taxIncluded,
+      dateUnconfirmed: receipt.dateUnconfirmed,
       items,
       // Without this the recompute puts an acknowledged flag straight back,
       // and every acknowledgement would last exactly until the next edit.

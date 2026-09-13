@@ -75,6 +75,19 @@ export type ProcessReceiptExtractionDeps = {
   modelPass2: string;
   escalateBelow: number;
   /**
+   * Re-read with the escalation model when the first reading does not
+   * reconcile (D-47). Defaults off so existing callers and tests are
+   * unaffected; `worker.ts` passes the admin's setting.
+   */
+  rescanOnReview?: boolean;
+  /**
+   * Injectable clock, matching `pipeline/backup.ts`'s `deps.now`. The date
+   * confirmation compares the receipt's date against today, so without this a
+   * test would either have to move its fixtures forward every week or assert
+   * on behaviour that changes with the calendar.
+   */
+  now?: () => Date;
+  /**
    * The system prompt, resolved from `app_config` by the caller (D-47).
    * Optional so every existing test keeps working against the shipped default;
    * `worker.ts` always passes the resolved value.
@@ -363,6 +376,68 @@ function shouldEscalate(input: RecordReceiptInput, escalateBelow: number): boole
   );
 }
 
+/**
+ * How far back a date has to be before it is worth a second read (D-47).
+ *
+ * A week. Receipts are usually uploaded within a few days, so a date older
+ * than that is either a genuinely delayed upload — common, and fine — or a
+ * misread year or month, which is the failure this catches. Cheap to check,
+ * and it costs an extra call only on the receipts where it might matter.
+ */
+const DATE_CONFIRM_DAYS = 7;
+
+export function dateIsStale(iso: string | null, now: Date = new Date()): boolean {
+  if (iso === null) return false;
+  const cutoff = new Date(now.getTime() - DATE_CONFIRM_DAYS * 24 * 60 * 60 * 1000);
+  return iso < cutoff.toISOString().slice(0, 10);
+}
+
+/**
+ * Why a second read is worth paying for, or `null` when it is not (D-47).
+ *
+ * ONE mechanism for three triggers, rather than three re-reads bolted on in
+ * sequence. Each one on its own would be another billable call per receipt;
+ * together they are still at most one, because a single independent second
+ * reading answers all three questions at once.
+ *
+ * The distinction that matters is which triggers need a DIFFERENT model:
+ *
+ *  - `confidence` and `review` do. The model said it could not read this well,
+ *    or read it into something that cannot be true. Asking the same model
+ *    again buys a second identical answer for a second identical price — which
+ *    is exactly the waste `modelPass2 !== modelPass1` already guards.
+ *  - `date` does not. The question there is not "can a better model read it"
+ *    but "do two independent reads agree", and two samples from the same model
+ *    are independent enough to answer that. So this one fires even on an
+ *    instance that has never configured an escalation model.
+ */
+export type SecondOpinionReason = "confidence" | "date" | "review";
+
+export function secondOpinionReason(params: {
+  input: RecordReceiptInput;
+  escalateBelow: number;
+  rescanOnReview: boolean;
+  hasDistinctModel: boolean;
+  now?: Date;
+}): SecondOpinionReason | null {
+  if (params.hasDistinctModel && shouldEscalate(params.input, params.escalateBelow)) {
+    return "confidence";
+  }
+  if (dateIsStale(normalizeDate(params.input.transaction_date), params.now)) return "date";
+  // "Needs review" here is the pre-persist approximation of `NEEDS_REVIEW_SQL`:
+  // the numbers do not reconcile. It deliberately does not include missing
+  // fields — a receipt with no printed phone number is not a receipt that was
+  // read badly, and re-reading it would cost a call to learn the same thing.
+  if (params.hasDistinctModel && params.rescanOnReview) {
+    const check = itemsReconcile({
+      subtotal: normalizeMoney(params.input.subtotal),
+      items: pricedItems(params.input),
+    });
+    if (check && !check.reconciles) return "review";
+  }
+  return null;
+}
+
 type MappedItem = {
   description: string;
   quantity: string | null;
@@ -407,7 +482,9 @@ export async function processReceiptExtraction(
     modelPass1,
     modelPass2,
     escalateBelow,
+    rescanOnReview = false,
     systemPrompt,
+    now,
   } = deps;
   const { receiptId, forcePass2 = false } = data;
 
@@ -469,6 +546,10 @@ export async function processReceiptExtraction(
 
   let finalPass: PassResult;
   let escalated = false;
+  /** Set when two independent reads disagreed about the date. Stored on the
+   *  row, because it is a fact about the reading that cannot be re-derived
+   *  from the saved values later. */
+  let dateUnconfirmed = false;
 
   if (forcePass2) {
     finalPass = await runPass({
@@ -495,24 +576,64 @@ export async function processReceiptExtraction(
       systemPrompt,
     });
 
-    // Escalating to the SAME model is a second identical paid call for an
-    // identical answer. With pass 1 on Sonnet (D-12 amended) that is the normal
-    // configuration, not an exotic one, so the ladder has to know when it has
-    // nowhere to climb — otherwise every low-confidence receipt quietly costs
-    // double for nothing.
-    if (modelPass2 !== modelPass1 && shouldEscalate(pass1.input, escalateBelow)) {
-      escalated = true;
-      finalPass = await runPass({
+    // ONE second opinion, three reasons to want it (D-47). See
+    // `secondOpinionReason` for why the date trigger is the only one that does
+    // not require a distinct model: it asks whether two independent reads
+    // agree, not whether a better model can do more.
+    //
+    // Escalating to the SAME model for the other two is a second identical
+    // paid call for an identical answer. With pass 1 on Sonnet (D-12 amended)
+    // that is the normal configuration, not an exotic one, so the ladder has
+    // to know when it has nowhere to climb — otherwise every low-confidence
+    // receipt quietly costs double for nothing.
+    const hasDistinctModel = modelPass2 !== modelPass1;
+    const reason = secondOpinionReason({
+      input: pass1.input,
+      escalateBelow,
+      rescanOnReview,
+      hasDistinctModel,
+      now: now?.(),
+    });
+
+    if (reason) {
+      // `escalated` is the ai_usage accounting flag and means "cost more than
+      // pass 1 would have", so it tracks the MODEL changing, not the fact of a
+      // second call. A same-model date confirmation is a second call at pass-1
+      // prices.
+      escalated = hasDistinctModel;
+      const secondPass = await runPass({
         db,
         client: anthropicClient,
-        model: modelPass2,
+        model: hasDistinctModel ? modelPass2 : modelPass1,
         imageBytes,
         tool,
         receiptId,
         pass: 2,
-        escalated: true,
+        escalated,
         systemPrompt,
       });
+      console.log(
+        `[ledgerly] second opinion receipt=${receiptId} reason=${reason} ` +
+          `model=${hasDistinctModel ? modelPass2 : modelPass1}`,
+      );
+
+      // The date check falls out of having two readings, whatever the reason
+      // for the second one. Two independent reads landing on the same date is
+      // the evidence that makes a genuinely old receipt quiet; a disagreement
+      // is the flag.
+      const firstDate = normalizeDate(pass1.input.transaction_date);
+      const secondDate = normalizeDate(secondPass.input.transaction_date);
+      if (firstDate !== null && firstDate !== secondDate) {
+        dateUnconfirmed = true;
+        // A second read that lost the date entirely must not take the first
+        // read's answer with it — that would turn "unconfirmed" into
+        // "missing", which is strictly less information.
+        if (secondDate === null) {
+          secondPass.input.transaction_date = pass1.input.transaction_date;
+        }
+      }
+
+      finalPass = secondPass;
     } else {
       finalPass = pass1;
     }
@@ -568,9 +689,16 @@ export async function processReceiptExtraction(
   let transactionDate = normalizeDate(input.transaction_date);
   const transactionTime = normalizeTime(input.transaction_time);
   const subtotal = normalizeMoney(input.subtotal);
-  const salesTax = normalizeMoney(input.sales_tax);
   const tip = normalizeMoney(input.tip);
   const total = normalizeMoney(input.total);
+  const transactionDiscount = normalizeMoney(input.transaction_discount);
+  // D-47. A receipt whose printed prices already include tax — fuel, most
+  // often — has a sales tax of zero by construction, whatever the model
+  // returned in the field. Forcing it here rather than trusting the model to
+  // send "0.00" means a memo line reading "INCLUDES $2.14 TAX" cannot end up
+  // added on top of a price that already contains it.
+  const taxIncluded = input.tax_included_in_prices === true;
+  const salesTax = taxIncluded ? "0.00" : normalizeMoney(input.sales_tax);
   const cardLast4 = normalizeCardLast4(input.card_last4);
   const paymentMethod = input.payment_method ?? null;
   const confidence = normalizeConfidence(input.confidence);
@@ -586,6 +714,9 @@ export async function processReceiptExtraction(
     tip,
     total,
     transactionDate,
+    transactionDiscount,
+    taxIncluded,
+    dateUnconfirmed,
     items: items.map((item) => ({ lineTotal: item.lineTotal })),
   };
   // Unacknowledged flags, used below to decide whether a `date_too_old` should
@@ -610,7 +741,9 @@ export async function processReceiptExtraction(
   if (transactionDate === null) missingFields.push("transaction_date");
   if (transactionTime === null) missingFields.push("transaction_time");
   if (subtotal === null) missingFields.push("subtotal");
-  if (salesTax === null) missingFields.push("sales_tax");
+  // A tax-inclusive receipt has no separate tax to read, so a blank one is the
+  // right answer rather than a gap someone should go and fill in (D-47).
+  if (salesTax === null && !taxIncluded) missingFields.push("sales_tax");
   if (total === null) missingFields.push("total");
   if (cardLast4 === null) missingFields.push("card_last4");
   if (paymentMethod === null) missingFields.push("payment_method");
@@ -672,6 +805,9 @@ export async function processReceiptExtraction(
         salesTax,
         tip,
         total,
+        transactionDiscount,
+        taxIncluded,
+        dateUnconfirmed,
         cardLast4,
         paymentMethod,
         extractionStatus: effective.status,

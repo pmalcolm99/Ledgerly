@@ -68,17 +68,43 @@ describe("the extraction prompt's discount rules", () => {
   });
 
   it("distinguishes a discount already applied from a standalone discount line", () => {
-    // The case that was wrong: net price on the item line, sub-line explains it.
+    // The case that was wrong: net price on the item line, sub-line explains
+    // it. UNCHANGED by D-47 and must stay that way — it is the fix from
+    // 783a957 and the one the user explicitly asked not to regress.
     expect(prompt).toMatch(/MODIFIES THE LINE ABOVE/i);
     expect(prompt).toMatch(/Do NOT also emit/i);
-    // The case that was right, and must stay right.
+    // The case that changed: an order-level credit is no longer a negative
+    // line item, because putting it inside the item sum drops that sum below
+    // the printed subtotal and raises `arithmetic_mismatch_items` on a receipt
+    // that was read correctly (D-47).
     expect(prompt).toMatch(/ITS OWN LINE/i);
-    expect(prompt).toMatch(/NEGATIVE line_total/i);
+    expect(prompt).toMatch(/NOT a line item/i);
+    expect(prompt).toMatch(/transaction_discount/);
+    // The old rule must be gone, not merely contradicted somewhere else.
+    expect(prompt).not.toMatch(/NEGATIVE line_total/i);
   });
 
   it("gives the model the arithmetic test that settles which layout it is", () => {
     expect(prompt).toMatch(/must add up to the subtotal/i);
     expect(prompt).toMatch(/subtracted them twice/i);
+    // The clause that makes (a) and (b) separable: the sum is compared against
+    // the subtotal BEFORE an order-level credit, not after.
+    expect(prompt).toMatch(/BEFORE any order-level credit/i);
+  });
+
+  /** D-47. A pump price already contains the tax, and copying the memo line
+   *  into `sales_tax` adds it a second time. */
+  it("tells the model how to read a tax-inclusive receipt", () => {
+    expect(prompt).toMatch(/TAX INCLUDED IN THE PRICE/i);
+    expect(prompt).toMatch(/tax_included_in_prices/);
+    expect(prompt).toMatch(/fuel/i);
+  });
+
+  /** D-47. Dates have been misread several times, and a misread year is the
+   *  specific failure — a receipt from a previous year is rarer than a smudge. */
+  it("warns the model about misreading the year", () => {
+    expect(prompt).toMatch(/DATES\./);
+    expect(prompt).toMatch(/year/i);
   });
 
   it("warns that a TOTAL SAVINGS figure is not a line item", () => {

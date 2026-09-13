@@ -399,6 +399,11 @@ export const receiptsRouter = router({
         salesTax: moneyString.nullable().optional(),
         tip: moneyString.nullable().optional(),
         total: moneyString.nullable().optional(),
+        // D-47. Editable like any other money field, and — like `tip` — with
+        // no `missing_fields` token: most receipts carry no order-level
+        // credit, so a blank one is the normal case rather than a gap someone
+        // should be asked to fill in.
+        transactionDiscount: moneyString.nullable().optional(),
         cardLast4: cardLast4String.nullable().optional(),
         paymentMethod: nullableText(200).optional(),
         userNotes: nullableText(10_000).optional(),
@@ -432,7 +437,7 @@ export const receiptsRouter = router({
 
         for (const column of changed) {
           const token = MISSING_FIELD_BY_COLUMN[column as EditableReceiptColumn];
-          if (!token) continue; // tip and userNotes have no token
+          if (!token) continue; // tip, transactionDiscount and userNotes have no token
           const value = (patch as Record<string, unknown>)[column];
           if (value === null || value === undefined) {
             // Cleared. It is missing again — unless the user has said it is

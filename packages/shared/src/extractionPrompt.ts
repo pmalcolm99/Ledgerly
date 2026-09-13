@@ -51,13 +51,21 @@ DISCOUNTS. Getting these wrong is the single most common extraction error, becau
 
   Here 379.00 is the list price, 18.95 the discount, and 360.05 the price actually charged (379.00 - 18.95 = 360.05). Emit ONE line item with line_total 360.05. Do NOT also emit a -18.95 item: the discount is already inside 360.05, and adding it again subtracts it twice. Use unit_price for the pre-discount price when it is printed.
 
-(b) The discount is ITS OWN LINE, applied to the order rather than to one item — a whole-order coupon, a store credit, a loyalty award, usually near the totals. Emit it as a line item with a NEGATIVE line_total.
+(b) The discount is ITS OWN LINE, applied to the ORDER rather than to one item — a whole-order coupon, a store credit, a loyalty award, usually printed near the totals and often BELOW the subtotal. This is NOT a line item. Put its total in transaction_discount as a negative amount and leave it out of items entirely. If there are several, add them up and report the sum.
 
-THE TEST THAT SETTLES IT: the line_total values you return must add up to the subtotal. Sum them before you answer. If your sum is BELOW the printed subtotal by exactly the discounts you emitted, you are in case (a) and have subtracted them twice — drop those discount items and keep the net prices. Many receipts also print a "TOTAL SAVINGS" figure; that is a summary of discounts already taken, never a line item.
+THE TEST THAT SETTLES IT: the line_total values you return must add up to the subtotal — the subtotal as printed, BEFORE any order-level credit is applied. Sum them before you answer.
+- If your sum is BELOW the printed subtotal by exactly the discounts you emitted as items, you are in case (a) and have subtracted them twice — drop those discount items and keep the net prices.
+- If your sum matches the subtotal and the total is lower than subtotal + tax + tip, the difference is an order-level credit: case (b), and it belongs in transaction_discount.
+
+Many receipts also print a "TOTAL SAVINGS" figure; that is a summary of discounts already taken, never a line item and never a transaction_discount.
 
 Signs are written with a leading minus ("-4.50") whatever notation the receipt uses — some print the sign after the number ("4.50-"), some use parentheses ("(4.50)").
 
-Before calling the tool, check your own arithmetic: line items should sum to subtotal, and subtotal + tax + tip should equal total. If they do not, re-read the receipt rather than adjusting a number to make them fit.
+TAX INCLUDED IN THE PRICE. On some receipts — fuel is the usual case — the printed prices already contain sales tax, and the receipt states the tax as a memo rather than adding it on. Signs of this: a pump price per gallon that multiplies out to the total exactly, or a line reading something like "INCLUDES $2.14 FEDERAL AND STATE TAX". When that is what you are looking at, set tax_included_in_prices to true and sales_tax to "0.00" — do NOT copy the memo amount into sales_tax, because it is already inside the prices and adding it again overstates the total. For an ordinary receipt that adds tax to the subtotal, leave tax_included_in_prices false and read sales_tax as printed.
+
+DATES. Read the transaction date exactly as printed, and take care with the year — a faded or angled receipt makes a year easy to misread, and a receipt from a previous year is much rarer than a smudged digit. If the date is genuinely illegible, return null rather than a guess.
+
+Before calling the tool, check your own arithmetic: line items should sum to subtotal, and subtotal + transaction_discount + tax + tip should equal total. If they do not, re-read the receipt rather than adjusting a number to make them fit.
 
 Call record_receipt exactly once with your best extraction.`;
 

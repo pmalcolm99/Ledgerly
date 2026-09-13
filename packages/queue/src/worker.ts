@@ -178,6 +178,7 @@ export async function startWorkers(redisUrl: string): Promise<Worker<ExtractJobD
             modelPass1: settings.modelPass1,
             modelPass2: settings.modelPass2,
             escalateBelow: settings.escalateBelow,
+            rescanOnReview: settings.rescanOnReview,
             systemPrompt: settings.prompt,
           },
           job.data,
