@@ -49,6 +49,7 @@ export type SummaryTotals = {
   lineTotalCents: number;
   salesTaxCents: number;
   tipCents: number;
+  transactionDiscountCents: number;
   totalCents: number;
 };
 
@@ -99,6 +100,7 @@ export class SummaryAccumulator {
     lineTotalCents: 0,
     salesTaxCents: 0,
     tipCents: 0,
+    transactionDiscountCents: 0,
     totalCents: 0,
   };
 
@@ -110,6 +112,10 @@ export class SummaryAccumulator {
 
     this.totals.salesTaxCents = addCents(this.totals.salesTaxCents, cents(receipt.salesTax));
     this.totals.tipCents = addCents(this.totals.tipCents, cents(receipt.tip));
+    this.totals.transactionDiscountCents = addCents(
+      this.totals.transactionDiscountCents,
+      cents(receipt.transactionDiscount),
+    );
     this.totals.totalCents = addCents(this.totals.totalCents, cents(receipt.total));
 
     const month = receipt.transactionDate ? receipt.transactionDate.slice(0, 7) : UNDATED_MONTH;
@@ -155,10 +161,17 @@ export class SummaryAccumulator {
       byCategory,
       byMonth,
       totals: { ...this.totals },
+      // D-47: an order-level credit sits between the subtotal and the total,
+      // so it belongs in this sum. Stored negative, so it is added. Without
+      // it, one receipt carrying a -$10.00 coupon makes the workbook's
+      // "Difference" row read $10.00 on an export where every number is
+      // correct — on the sheet whose own text calls itself the export's claim
+      // to be arithmetically sound.
       reconciliationDeltaCents:
         this.totals.lineTotalCents +
         this.totals.salesTaxCents +
-        this.totals.tipCents -
+        this.totals.tipCents +
+        this.totals.transactionDiscountCents -
         this.totals.totalCents,
     };
   }

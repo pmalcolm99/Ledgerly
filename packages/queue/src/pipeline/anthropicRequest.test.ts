@@ -128,6 +128,12 @@ describe("arithmeticHint", () => {
     expect(hint).toContain("394.16");
     expect(hint).toContain("416.06");
     expect(hint).toContain("21.90");
+    // D-47: the hint used to name only case (a), so a model that had emitted a
+    // whole-order credit as a line item did what it was told — dropped the
+    // line — and the credit vanished from the receipt. Both resolutions now,
+    // and the (b) branch says explicitly not to discard it.
+    expect(hint).toMatch(/transaction_discount/);
+    expect(hint).toMatch(/do NOT discard it/i);
     // Names the likely cause rather than just asking it to try again.
     expect(hint).toMatch(/DISCOUNT EACH/i);
     // And does not invite it to fudge the numbers into agreement.

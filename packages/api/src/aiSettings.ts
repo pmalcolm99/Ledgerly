@@ -7,6 +7,8 @@ import {
   MAX_PROMPT_CHARS,
   MIN_PROMPT_CHARS,
 } from "@ledgerly/shared/extractionPrompt";
+import { DEFAULT_EMAIL_GATE, EMAIL_GATES } from "@ledgerly/shared/emailGate";
+import type { EmailGate } from "@ledgerly/shared/emailGate";
 
 import { SECRET_KEYS, SecretError, readSecret, readSecretMetadata } from "./secrets";
 
@@ -50,17 +52,10 @@ import { SECRET_KEYS, SecretError, readSecret, readSecretMetadata } from "./secr
  * for a post-commit effect it cannot guarantee.
  */
 
-/**
- * Which unresolved state blocks the automatic receipt email (D-47).
- *
- * `flags` — arithmetic, dates, the things that mean the receipt is probably
- * WRONG. A blank `card_last4` does not make a receipt incorrect.
- * `flags_and_missing` — nothing sends until every missing field is filled in or
- * dismissed too. The strictest reading of "static, complete and correct", at
- * the cost of receipts sitting unsent over a field nobody cares about.
- */
-export const EMAIL_GATES = ["flags", "flags_and_missing"] as const;
-export type EmailGate = (typeof EMAIL_GATES)[number];
+/** Re-exported so server callers have one import; DEFINED in
+ *  `packages/shared/src/emailGate.ts` beside the predicate that reads it, so
+ *  the send path and the release path cannot drift apart again. */
+export { DEFAULT_EMAIL_GATE, EMAIL_GATES, type EmailGate } from "@ledgerly/shared/emailGate";
 
 export const aiSettingsSchema = z.object({
   modelPass1: z.string().trim().min(1).max(200).optional(),
@@ -116,7 +111,7 @@ export type ResolvedAiSettings = {
 /** The defaults for settings with no environment variable behind them. Stated
  *  once so the resolve path and the admin screen cannot disagree. */
 const RESCAN_ON_REVIEW_DEFAULT = true;
-const EMAIL_GATE_DEFAULT: EmailGate = "flags";
+const EMAIL_GATE_DEFAULT: EmailGate = DEFAULT_EMAIL_GATE;
 
 function merge(stored: StoredAiSettings | null, env: AiSettingsEnvDefaults): AiSettings {
   const prompt = stored?.prompt ?? DEFAULT_EXTRACTION_PROMPT;

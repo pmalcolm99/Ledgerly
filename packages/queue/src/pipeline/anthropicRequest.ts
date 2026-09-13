@@ -75,7 +75,11 @@ export function arithmeticHint(params: {
 }): string {
   return `Your previous reading of this receipt does not reconcile: the line items you returned sum to ${params.itemsSum}, but you reported a subtotal of ${params.subtotal} — a difference of ${params.difference}.
 
-Re-read the receipt and work out why. The most common cause is a discount counted twice: a sub-line such as "379.00 DISCOUNT EACH -18.95" explains the net price printed on the item line above it, so emitting it as its own negative line item subtracts it a second time. If that is what happened, keep the net item prices and drop the separate discount lines.
+Re-read the receipt and work out which of these it is.
+
+(a) A discount counted twice. A sub-line such as "379.00 DISCOUNT EACH -18.95" explains the net price printed on the item line above it, so emitting it as its own negative line item subtracts it a second time. Keep the net item prices and drop the separate discount lines.
+
+(b) A whole-order credit emitted as a line item. A coupon, store credit or loyalty award applied below the subtotal is not an item, and including it drops your item sum below the printed subtotal. Drop it from items — but do NOT discard it: put its total in transaction_discount as a negative amount, or the credit disappears from the receipt entirely and the total stops adding up.
 
 If instead the receipt genuinely does not add up, return what is printed and lower your confidence — do not invent or adjust a value to force it to balance.`;
 }

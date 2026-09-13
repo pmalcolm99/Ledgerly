@@ -114,11 +114,12 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
     ? Object.keys(update.variables).find((key) => key !== "id")
     : undefined;
 
-  // `tip` is the one editable money column with no missing-field token, so
-  // the column type is the token map's keys plus it.
+  // `tip` and `transactionDiscount` are the editable money columns with no
+  // missing-field token — most receipts have neither, so the pipeline never
+  // reports them missing — hence the token map's keys plus those two.
   const field = (
     label: string,
-    column: EditableReceiptColumn | "tip",
+    column: EditableReceiptColumn | "tip" | "transactionDiscount",
     token: MissingFieldToken | null,
     type: "text" | "date" | "time" | "decimal" = "text",
   ) => (
@@ -194,8 +195,11 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
             {/* D-47. The email is held until this list is empty, and a
                 receipt sitting unsent with no explanation is exactly the
                 silent failure the Logs tab was built for — so say it here,
-                where the person who can clear it is already looking. */}
-            {receipt.receiptEmailSentAt === null ? (
+                where the person who can clear it is already looking.
+                Gated on the project's own setting: on an instance with
+                receipt emails turned off, "waiting to be sent" is simply
+                false. */}
+            {receipt.receiptEmailSentAt === null && project.emailReceipts ? (
               <p className="text-xs text-default-500">
                 The automatic email is waiting until these are resolved.
               </p>
@@ -260,6 +264,16 @@ export function ReceiptDetail({ receiptId }: { receiptId: string }) {
             {field("Tip", "tip", null, "decimal")}
             {field("Total", "total", "total", "decimal")}
           </div>
+          {/* D-47. Shown only when there is one: an order-level credit is
+              unusual, and an always-present empty field on every receipt would
+              be noise. When there IS one it must be visible, or the subtotal,
+              tax and total on this page visibly fail to add up with nothing to
+              explain the gap. */}
+          {receipt.transactionDiscount !== null ? (
+            <div className="grid grid-cols-2 gap-3">
+              {field("Discounts and credits", "transactionDiscount", null, "decimal")}
+            </div>
+          ) : null}
           <div className="grid grid-cols-2 gap-3">
             {field("Card last 4", "cardLast4", "card_last4")}
             {field("Payment method", "paymentMethod", "payment_method")}

@@ -5,6 +5,12 @@ import { TRPCError } from "@trpc/server";
 import { projectMembers, projects, receiptItems, receipts, users } from "@ledgerly/db/schema";
 import type { AuthUser } from "@ledgerly/auth/types";
 import { runSanityChecks } from "@ledgerly/shared/receiptValidation";
+import { DEFAULT_EMAIL_GATE, reviewJustFinished } from "@ledgerly/shared/emailGate";
+import type { EmailGate, ReviewState } from "@ledgerly/shared/emailGate";
+import { getEnv } from "@ledgerly/config/env";
+import type { Database } from "@ledgerly/db";
+
+import { resolveAiSettings } from "./aiSettings";
 
 import type { Tx } from "./audit";
 import { lockScopedProject, scopedProjects } from "./scope";
@@ -243,11 +249,20 @@ export type RecomputeResult = {
    *  it after the transaction, where the ids that were in scope inside it are
    *  not. */
   receiptId: string | null;
-  /** The receipt has just gone from having something outstanding to having
-   *  nothing outstanding. False when it was already clear — this is an EDGE,
-   *  not a level, so a second edit to an already-clear receipt does not
-   *  re-trigger anything. */
-  becameClear: boolean;
+  /**
+   * The review state before and after this recompute.
+   *
+   * The STATES, not a verdict. This used to return a `becameClear` boolean
+   * computed here from "no missing fields and no flags" — which is a third
+   * definition of "settled", agreeing with the one the send path actually
+   * gates on only under the stricter of the two email gates. Under the
+   * shipped default it meant a receipt with any unread field was held
+   * forever: clearing the last warning removed the hold but never fired the
+   * release. Returning the states and letting one shared predicate judge them
+   * is what stops that happening again.
+   */
+  before: ReviewState | null;
+  after: ReviewState;
 };
 
 export async function recomputeReceiptDerivedState(
@@ -280,15 +295,18 @@ export async function recomputeReceiptDerivedState(
       tip: receipt.tip,
       total: receipt.total,
       transactionDate: receipt.transactionDate,
-      // Passed THROUGH, not re-derived. `transactionDiscount` is an edited
-      // value like any other money field, but `taxIncluded` and
-      // `dateUnconfirmed` are facts about how the receipt was READ — whether
-      // two passes agreed on the date, whether the prices were tax-inclusive —
-      // and both readings are long gone by the time a user edits a field. A
-      // recompute that re-derived them would quietly clear a flag nobody
+      // `transactionDiscount` is an edited value like any other money field.
+      // `dateUnconfirmed` is passed THROUGH rather than re-derived: it is a
+      // fact about how the receipt was READ — whether two passes agreed — and
+      // both readings are long gone by the time a user edits a field, so a
+      // recompute that tried to re-derive it would quietly clear a flag nobody
       // resolved (D-47).
+      //
+      // `taxIncluded` is deliberately NOT here. It changes which fields are
+      // MISSING, not which checks fail, and the missing-field bookkeeping lives
+      // in `receipts.update`. Passing it to a function that does not read it
+      // would be a comment asserting behaviour that does not exist.
       transactionDiscount: receipt.transactionDiscount,
-      taxIncluded: receipt.taxIncluded,
       dateUnconfirmed: receipt.dateUnconfirmed,
       items,
       // Without this the recompute puts an acknowledged flag straight back,
@@ -301,10 +319,6 @@ export async function recomputeReceiptDerivedState(
 
   const nextMissing = [...missing];
   const isClear = nextMissing.length === 0 && validationFlags.length === 0;
-  // The BEFORE state, read from the row this function was handed at the top.
-  // An edge rather than a level: acting on `isClear` alone would re-fire on
-  // every subsequent edit of a receipt that was already settled.
-  const wasClear = receipt.missingFields.length === 0 && receipt.validationFlags.length === 0;
 
   await tx
     .update(receipts)
@@ -320,7 +334,16 @@ export async function recomputeReceiptDerivedState(
     })
     .where(eq(receipts.id, receiptId));
 
-  return { receiptId, becameClear: isClear && !wasClear };
+  return {
+    receiptId,
+    // Read from the row this function was handed at the top, before the update
+    // below rewrote it.
+    before: {
+      validationFlags: receipt.validationFlags,
+      missingFields: receipt.missingFields,
+    },
+    after: { validationFlags, missingFields: nextMissing },
+  };
 }
 
 /**
@@ -336,11 +359,39 @@ export async function recomputeReceiptDerivedState(
  * receipt will try again.
  */
 export async function releaseHeldEmail(
-  ctx: { enqueueAutoReceiptEmail?: (params: { receiptId: string }) => Promise<void> },
+  ctx: {
+    db: Database;
+    enqueueAutoReceiptEmail?: (params: { receiptId: string }) => Promise<void>;
+  },
   result: RecomputeResult,
 ): Promise<void> {
-  if (!result.becameClear || result.receiptId === null || !ctx.enqueueAutoReceiptEmail) return;
   const receiptId = result.receiptId;
+  if (receiptId === null || result.before === null || !ctx.enqueueAutoReceiptEmail) return;
+
+  // The gate is resolved HERE, so the release asks exactly the question the
+  // send path will ask — under the same setting, with the same predicate.
+  // Resolving it costs one indexed read on an edit that already wrote a row,
+  // and it is the whole point: a release computed from a different rule than
+  // the hold is a release that fires at the wrong time, or never.
+  let gate: EmailGate = DEFAULT_EMAIL_GATE;
+  try {
+    const env = getEnv();
+    const { settings } = await resolveAiSettings(ctx.db, env.MASTER_KEY, {
+      modelPass1: env.AI_MODEL_PASS1,
+      modelPass2: env.AI_MODEL_PASS2,
+      escalateBelow: env.AI_ESCALATE_BELOW,
+      concurrency: env.AI_CONCURRENCY,
+    });
+    gate = settings.emailGate;
+  } catch (error) {
+    // The default is the narrower gate, so falling back to it can only release
+    // EARLIER than configured, never later. A held email that never arrives is
+    // the failure this whole path exists to prevent.
+    console.error("[ledgerly] could not read the email gate, using the default:", error);
+  }
+
+  if (!reviewJustFinished(result.before, result.after, gate)) return;
+
   try {
     await ctx.enqueueAutoReceiptEmail({ receiptId });
   } catch (error) {

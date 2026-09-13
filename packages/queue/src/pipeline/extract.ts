@@ -19,7 +19,7 @@ import type { RecordReceiptInput, RecordReceiptItemInput } from "./schema";
 import { normalizeCardLast4, scrubLuhnSequences } from "./scrub";
 import { runSanityChecks } from "./validate";
 import { itemsReconcile } from "@ledgerly/shared/receiptValidation";
-import { formatMoney } from "@ledgerly/shared/money";
+import { formatMoney, parseMoney } from "@ledgerly/shared/money";
 import type { ValidationInput } from "./validate";
 
 /**
@@ -367,6 +367,13 @@ async function retryIfItemsDoNotReconcile(params: {
   }
 }
 
+/** At most zero — see the call site. `null` passes through as "no credit". */
+export function clampToCredit(value: string | null): string | null {
+  if (value === null) return null;
+  const cents = parseMoney(value);
+  return cents > 0 ? formatMoney(-cents) : value;
+}
+
 function shouldEscalate(input: RecordReceiptInput, escalateBelow: number): boolean {
   return (
     input.total === null ||
@@ -595,47 +602,97 @@ export async function processReceiptExtraction(
       now: now?.(),
     });
 
-    if (reason) {
-      // `escalated` is the ai_usage accounting flag and means "cost more than
-      // pass 1 would have", so it tracks the MODEL changing, not the fact of a
-      // second call. A same-model date confirmation is a second call at pass-1
-      // prices.
-      escalated = hasDistinctModel;
-      const secondPass = await runPass({
-        db,
-        client: anthropicClient,
-        model: hasDistinctModel ? modelPass2 : modelPass1,
-        imageBytes,
-        tool,
-        receiptId,
-        pass: 2,
-        escalated,
-        systemPrompt,
-      });
-      console.log(
-        `[ledgerly] second opinion receipt=${receiptId} reason=${reason} ` +
-          `model=${hasDistinctModel ? modelPass2 : modelPass1}`,
-      );
+    finalPass = pass1;
 
-      // The date check falls out of having two readings, whatever the reason
-      // for the second one. Two independent reads landing on the same date is
-      // the evidence that makes a genuinely old receipt quiet; a disagreement
-      // is the flag.
-      const firstDate = normalizeDate(pass1.input.transaction_date);
-      const secondDate = normalizeDate(secondPass.input.transaction_date);
-      if (firstDate !== null && firstDate !== secondDate) {
-        dateUnconfirmed = true;
-        // A second read that lost the date entirely must not take the first
-        // read's answer with it — that would turn "unconfirmed" into
-        // "missing", which is strictly less information.
-        if (secondDate === null) {
-          secondPass.input.transaction_date = pass1.input.transaction_date;
-        }
+    if (reason) {
+      const model = hasDistinctModel ? modelPass2 : modelPass1;
+      // When the trigger is "this does not add up", hand the model the actual
+      // discrepancy rather than asking it to read again blind. Without this a
+      // non-reconciling receipt costs three calls: pass 1, an uninformed
+      // second opinion, and then `retryIfItemsDoNotReconcile` with the hint.
+      // With it, the second opinion IS the informed read and the retry below
+      // short-circuits when it worked.
+      const reconcile =
+        reason === "review"
+          ? itemsReconcile({
+              subtotal: normalizeMoney(pass1.input.subtotal),
+              items: pricedItems(pass1.input),
+            })
+          : null;
+
+      let secondPass: PassResult | null = null;
+      try {
+        secondPass = await runPass({
+          db,
+          client: anthropicClient,
+          model,
+          imageBytes,
+          tool,
+          receiptId,
+          pass: 2,
+          // `escalated` is the ai_usage accounting flag and means "cost more
+          // than pass 1 would have", so it tracks the MODEL changing, not the
+          // fact of a second call. A same-model date confirmation is a second
+          // call at pass-1 prices.
+          escalated: hasDistinctModel,
+          systemPrompt,
+          ...(reconcile
+            ? {
+                hint: arithmeticHint({
+                  itemsSum: formatMoney(reconcile.itemsCents),
+                  subtotal: formatMoney(reconcile.subtotalCents),
+                  difference: formatMoney(Math.abs(reconcile.subtotalCents - reconcile.itemsCents)),
+                }),
+              }
+            : {}),
+        });
+      } catch (error) {
+        // A RECEIPT THAT EXTRACTED SUCCESSFULLY MUST NOT BE LOST TO A FAILURE
+        // IN AN OPTIONAL SECOND OPINION — the rule `retryIfItemsDoNotReconcile`
+        // states thirty lines above, and this call has to follow it too. It
+        // matters more here than there: the date trigger fires on ANY receipt
+        // older than a week, so uploading a shoebox of old receipts would
+        // otherwise put every one of them through a call that can fail the job,
+        // re-run a pass that has already been paid for, and end at
+        // `extraction_status='failed'` with no data at all.
+        console.error(`[ledgerly] second opinion failed receipt=${receiptId}:`, error);
       }
 
-      finalPass = secondPass;
-    } else {
-      finalPass = pass1;
+      if (secondPass) {
+        escalated = hasDistinctModel;
+        console.log(
+          `[ledgerly] second opinion receipt=${receiptId} reason=${reason} model=${model}`,
+        );
+
+        // The date check falls out of having two readings, whatever the reason
+        // for the second one. Two independent reads landing on the same date is
+        // the evidence that makes a genuinely old receipt quiet; a disagreement
+        // is the flag.
+        const firstDate = normalizeDate(pass1.input.transaction_date);
+        const secondDate = normalizeDate(secondPass.input.transaction_date);
+        dateUnconfirmed = firstDate !== null && firstDate !== secondDate;
+
+        // A same-model read taken ONLY to check the date answers one question,
+        // and must not silently replace a better reading of everything else:
+        // it is a second sample from the same model, so its merchant, items and
+        // confidence are no more authoritative than pass 1's. Taking it
+        // wholesale would make the outcome depend on which sample arrived last
+        // — the inverse of the rule `retryIfItemsDoNotReconcile` follows.
+        const dateCheckOnly = reason === "date" && !hasDistinctModel;
+        if (!dateCheckOnly) {
+          finalPass =
+            secondDate === null && firstDate !== null
+              ? // A second read that lost the date must not take the first
+                // read's answer with it — that turns "unconfirmed" into
+                // "missing", which is strictly less information. Copied into a
+                // new object rather than mutated: `runPass` returns the SAME
+                // reference as `rawScrubbed`, so mutating it would write a date
+                // the model never returned into `extraction_raw` — the audit
+                // trail you reach for when diagnosing exactly this flag.
+                { ...secondPass, input: { ...secondPass.input, transaction_date: firstDate } }
+              : secondPass;
+        }
+      }
     }
 
     // One corrective retry when the reading does not add up.
@@ -668,6 +725,13 @@ export async function processReceiptExtraction(
       escalated,
       systemPrompt,
     });
+
+    // The corrective re-read can replace the whole reading, including the date
+    // carried forward above. A `date_unconfirmed` flag on a receipt whose date
+    // is now null would say two readings disagreed about a date that is not
+    // there — noise on top of the `transaction_date` missing-field token that
+    // already covers it.
+    if (normalizeDate(finalPass.input.transaction_date) === null) dateUnconfirmed = false;
   }
 
   const input = finalPass.input;
@@ -691,7 +755,15 @@ export async function processReceiptExtraction(
   const subtotal = normalizeMoney(input.subtotal);
   const tip = normalizeMoney(input.tip);
   const total = normalizeMoney(input.total);
-  const transactionDiscount = normalizeMoney(input.transaction_discount);
+  // Clamped to at most zero. The prompt asks for a negative and the column,
+  // the sanity check and the project rollup all assume one, but nothing in
+  // `normalizeMoney` enforces a sign — it canonicalises notation, not meaning.
+  // A credit returned as "5.00" would make the receipt-level check overshoot by
+  // twice the credit (caught, as an arithmetic flag) AND make the project
+  // rollup understate unitemised spend by the same amount (not caught at all,
+  // because no per-project check exists). A positive "discount" is not a
+  // meaningful value here, so it is corrected rather than stored and flagged.
+  const transactionDiscount = clampToCredit(normalizeMoney(input.transaction_discount));
   // D-47. A receipt whose printed prices already include tax — fuel, most
   // often — has a sales tax of zero by construction, whatever the model
   // returned in the field. Forcing it here rather than trusting the model to
@@ -715,7 +787,6 @@ export async function processReceiptExtraction(
     total,
     transactionDate,
     transactionDiscount,
-    taxIncluded,
     dateUnconfirmed,
     items: items.map((item) => ({ lineTotal: item.lineTotal })),
   };

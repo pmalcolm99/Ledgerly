@@ -9,6 +9,8 @@ import {
   receipts,
   users,
 } from "@ledgerly/db/schema";
+import { DEFAULT_EMAIL_GATE, emailIsHeldForReview } from "@ledgerly/shared/emailGate";
+import type { EmailGate } from "@ledgerly/shared/emailGate";
 import type { Database } from "@ledgerly/db";
 import { displayNameOf } from "@ledgerly/shared/personName";
 
@@ -95,7 +97,7 @@ export type EmailDeps = {
    * `app_config` by the worker. Defaults to `flags` so a caller that has not
    * been updated gets the narrower, less surprising gate.
    */
-  emailGate?: "flags" | "flags_and_missing";
+  emailGate?: EmailGate;
 };
 
 /** Mirrors `ExtractError` (`pipeline/extract.ts`): a stable reason code, and
@@ -224,30 +226,6 @@ function formatFrom(from: { address: string; name: string }): string {
   return `"${name}" <${from.address}>`;
 }
 
-/**
- * Whether an automatic send waits for a human (D-47).
- *
- * Deliberately NOT `NEEDS_REVIEW_SQL`. That predicate includes
- * `extraction_status <> 'ok'`, which covers `pending` and `failed` — states
- * where there is nothing for a person to resolve and the email should simply
- * never come. This asks a narrower question: is there something outstanding
- * that a person is expected to act on.
- *
- * The two gates answer to the user's setting:
- *  - `flags` — warnings only. A receipt can be complete and correct with a
- *    field genuinely blank, so a missing `card_last4` does not hold up mail.
- *  - `flags_and_missing` — the strictest reading of "static, complete and
- *    correct", at the cost of receipts sitting unsent over a field nobody
- *    cares about.
- */
-export function emailIsHeldForReview(
-  receipt: { validationFlags: string[]; missingFields: string[] },
-  gate: "flags" | "flags_and_missing",
-): boolean {
-  if (receipt.validationFlags.length > 0) return true;
-  return gate === "flags_and_missing" && receipt.missingFields.length > 0;
-}
-
 export async function processReceiptEmail(
   deps: EmailDeps,
   data: EmailJobData,
@@ -270,7 +248,7 @@ export async function processReceiptEmail(
     // Checked at send time like everything else above, which is what makes the
     // waiting work without a scheduler: `recomputeReceiptDerivedState` re-adds
     // this same job when the last flag clears, and by then this test passes.
-    if (emailIsHeldForReview(loaded.receipt, deps.emailGate ?? "flags")) {
+    if (emailIsHeldForReview(loaded.receipt, deps.emailGate ?? DEFAULT_EMAIL_GATE)) {
       return { sent: false, skipped: "awaiting_review" };
     }
   }

@@ -53,6 +53,9 @@ export type ExportReceiptRow = {
   salesTax: string | null;
   tip: string | null;
   total: string | null;
+  /** D-47. Negative. Sits between the subtotal and the total, so it is part
+   *  of the reconciliation the summary sheet asserts. */
+  transactionDiscount: string | null;
   currency: string;
   cardLast4: string | null;
   paymentMethod: string | null;
@@ -203,6 +206,7 @@ export async function fetchReceiptPage(
       salesTax: receipts.salesTax,
       tip: receipts.tip,
       total: receipts.total,
+      transactionDiscount: receipts.transactionDiscount,
       currency: receipts.currency,
       cardLast4: receipts.cardLast4,
       paymentMethod: receipts.paymentMethod,

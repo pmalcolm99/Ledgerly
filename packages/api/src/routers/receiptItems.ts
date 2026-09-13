@@ -108,7 +108,11 @@ export const receiptItemsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.receiptId, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -209,7 +213,11 @@ export const receiptItemsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const receiptId = await receiptIdForItem(tx, id);
         const access = await loadEditableReceipt(tx, receiptId, ctx.user);
@@ -276,7 +284,11 @@ export const receiptItemsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const receiptId = await receiptIdForItem(tx, input.id);
         const access = await loadEditableReceipt(tx, receiptId, ctx.user);

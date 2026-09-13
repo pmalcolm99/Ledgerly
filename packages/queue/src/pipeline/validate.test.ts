@@ -83,7 +83,6 @@ describe("runSanityChecks — transaction-level credits (D-47)", () => {
     const withExplicitDefaults = baseInput({
       total: "20.00",
       transactionDiscount: null,
-      taxIncluded: false,
       dateUnconfirmed: false,
     });
     expect(runSanityChecks(legacy)).toEqual(runSanityChecks(withExplicitDefaults));

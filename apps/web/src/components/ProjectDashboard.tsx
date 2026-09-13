@@ -131,7 +131,12 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
           ) : (
             <SpendByCategory
               byCategory={stats.data.byCategory}
-              totalSpend={stats.data.project.totalSpend}
+              // The FILTERED total, not the project header's. `receiptRollups`
+              // has no date predicate, so on a filtered view the header figure
+              // covers the whole project while the bars cover the window —
+              // and the remainder between them would render as tens of
+              // thousands of pounds of "unitemised" (D-47).
+              totalSpend={stats.data.totals.total}
               totals={stats.data.totals}
             />
           )}

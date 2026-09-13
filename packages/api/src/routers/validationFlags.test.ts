@@ -301,6 +301,36 @@ describe("releasing the held email when review finishes", () => {
     };
   }
 
+  /**
+   * THE CASE THE FIRST VERSION MISSED, and the reason the hold and the release
+   * are now one predicate.
+   *
+   * `discountedReceipt` below has no missing fields, which is the ONLY shape
+   * where "no flags" and "no flags and no missing fields" agree — so the
+   * original tests passed against a release that could never fire under the
+   * shipped default. Most real receipts have at least one unread field.
+   */
+  it("releases under the default gate even with missing fields outstanding", async () => {
+    const { id, user } = await discountedReceipt();
+    await db
+      .update(receipts)
+      .set({ missingFields: ["merchant_phone", "card_last4"] })
+      .where(eq(receipts.id, id));
+
+    const enqueued: string[] = [];
+    const caller = appRouter.createCaller(trackingCtx(user, enqueued));
+
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_items" });
+    await caller.receipts.acknowledgeValidationFlag({ id, flag: "arithmetic_mismatch_total" });
+
+    const [row] = await db.select().from(receipts).where(eq(receipts.id, id));
+    // Still not "clear" by the old definition — the fields are genuinely
+    // unread — but nothing is holding the email under the `flags` gate.
+    expect(row?.missingFields.length).toBeGreaterThan(0);
+    expect(row?.validationFlags).toEqual([]);
+    expect(enqueued).toEqual([id]);
+  });
+
   it("enqueues the automatic email when the last flag is acknowledged", async () => {
     const { id, user } = await discountedReceipt();
     const enqueued: string[] = [];

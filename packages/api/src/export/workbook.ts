@@ -302,6 +302,11 @@ async function writeSummary(
   moneyRow("Sum of line_total (sheet 1)", null, totals.lineTotalCents);
   moneyRow("Sum of sales_tax", null, totals.salesTaxCents);
   moneyRow("Sum of tip", null, totals.tipCents);
+  // D-47. Shown as its own term because the Difference row below now includes
+  // it: an order-level credit is the one component of the reconciliation that
+  // SUBTRACTS, and a reader who cannot see it would read a correct export as
+  // short by the amount of the coupon.
+  moneyRow("Sum of transaction_discount", null, totals.transactionDiscountCents);
   moneyRow("Sum of total (sheet 2)", null, totals.totalCents);
   moneyRow("Difference", null, reconciliationDeltaCents);
   blank();

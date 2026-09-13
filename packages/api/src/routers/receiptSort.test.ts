@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -169,6 +170,45 @@ describe("receipts.list — ordering", () => {
     const paged = await walk(caller, projectId, sort, 2);
     expect(paged).toEqual(whole.items.map((i) => i.id));
   });
+
+  /**
+   * THE CASE THE FIRST FIXTURE COULD NOT EXPRESS.
+   *
+   * `seed()` above spaces `created_at` a whole second apart, which is exactly
+   * the spacing where truncating the cursor to the millisecond is a no-op — so
+   * the page walk passed against a cursor that dropped rows under `added_desc`
+   * and looped forever under `added_asc`. A batch upload writes rows
+   * microseconds apart, and `created_at` is a microsecond-precision
+   * `timestamptz`.
+   *
+   * Written as raw SQL because a JS `Date` cannot express a microsecond and so
+   * cannot set the case up — the same reason `logs.test.ts` does it this way.
+   */
+  async function seedMicroseconds(projectId: string, count: number): Promise<void> {
+    for (let i = 0; i < count; i += 1) {
+      await db.execute(sql`
+        INSERT INTO receipts (project_id, merchant_name, extraction_status, created_at)
+        VALUES (${projectId}::uuid, ${`Shop ${i}`}, 'ok',
+                ${`2026-01-01 00:00:00.${String(i * 200).padStart(6, "0")}+00`}::timestamptz)
+      `);
+    }
+  }
+
+  it.each(["added_desc", "added_asc"] as const)(
+    "pages through rows written within one millisecond: %s",
+    async (sort) => {
+      const { projectId, user } = await project();
+      await seedMicroseconds(projectId, 7);
+      const caller = appRouter.createCaller(ctxFor(user));
+
+      const seen = await walk(caller, projectId, sort, 2);
+      expect(seen).toHaveLength(7);
+      expect(new Set(seen).size).toBe(7);
+
+      const whole = await caller.receipts.list({ projectId, sort, limit: 100 });
+      expect(seen).toEqual(whole.items.map((i) => i.id));
+    },
+  );
 
   it("stops offering a cursor on the last page", async () => {
     const { projectId, user } = await project();

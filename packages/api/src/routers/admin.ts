@@ -1154,10 +1154,13 @@ export const adminRouter = router({
   /**
    * Refreshes the model catalogue from `GET /v1/models`, at most once a day.
    *
-   * Staleness is re-checked HERE rather than trusted from the client, so two
-   * admins (or two tabs, or a strict-mode double-render) opening the page at
-   * once make one API call between them. `force` is the manual refresh button,
-   * which is the one case where "I know, do it anyway" is the whole intent.
+   * Staleness is re-checked HERE rather than trusted from the client, which is
+   * what stops a client that has cached `catalogStale: true` from refetching on
+   * every mount. It is a check, NOT a lock: two admins opening the page in the
+   * same second both read a stale catalogue, both fetch, and both write. That
+   * is two requests to a free endpoint and a last-writer-wins on a cache, so a
+   * lock would cost more than the race does. `force` is the manual refresh
+   * button, the one case where "I know, do it anyway" is the whole intent.
    */
   refreshModelCatalog: ownerProcedure
     .input(z.object({ force: z.boolean().default(false) }))

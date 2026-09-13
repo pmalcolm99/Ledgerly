@@ -44,6 +44,9 @@ export function SpendByCategory({
     itemCount: number;
     spend: string;
   }>;
+  /** The total over the SAME receipts as `byCategory` — the filtered one, not
+   *  the project header's lifetime figure. They differ whenever a date filter
+   *  is applied, and the remainder below is the difference between them. */
   totalSpend: string;
   /** Server-side sums over the same receipts as `byCategory` (D-47). */
   totals?: { salesTax: string; tip: string; transactionDiscount: string };

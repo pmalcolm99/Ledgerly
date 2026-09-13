@@ -90,9 +90,6 @@ export type ValidationInput = {
    * before this existed keeps exactly the arithmetic it had.
    */
   transactionDiscount?: string | null;
-  /** The printed prices already include tax, so a zero `salesTax` is the right
-   *  answer rather than a gap. */
-  taxIncluded?: boolean;
   /** Set by the pipeline when a second read disagreed about the date. Passed
    *  through rather than re-derived — see `receipts.date_unconfirmed`. */
   dateUnconfirmed?: boolean;

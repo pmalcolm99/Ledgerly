@@ -104,9 +104,21 @@ type SortSpec = {
   keyOf: (row: {
     transactionDate: string | null;
     merchantName: string | null;
-    createdAt: Date;
+    createdAtText: string;
   }) => string | null;
+  /** Whether a cursor value is a shape this sort can compare against. */
+  keyIsValid: (key: string | null) => boolean;
 };
+
+/** `YYYY-MM-DD`, and a real calendar date. */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+/** What `createdAtText` emits, and nothing else. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+
+const isDateKey = (key: string | null) => key === null || ISO_DATE.test(key);
+const isInstantKey = (key: string | null) => key !== null && ISO_INSTANT.test(key);
+/** A merchant name is free text; any string is a legitimate cursor. */
+const isTextKey = () => true;
 
 const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
   date_desc: {
@@ -116,6 +128,7 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
     direction: "desc",
     nullable: true,
     keyOf: (row) => row.transactionDate,
+    keyIsValid: isDateKey,
   },
   date_asc: {
     orderBy: sql`${receipts.transactionDate} ASC NULLS LAST`,
@@ -124,6 +137,7 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
     direction: "asc",
     nullable: true,
     keyOf: (row) => row.transactionDate,
+    keyIsValid: isDateKey,
   },
   name_asc: {
     orderBy: sql`${receipts.merchantName} ASC NULLS LAST`,
@@ -132,6 +146,7 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
     direction: "asc",
     nullable: true,
     keyOf: (row) => row.merchantName,
+    keyIsValid: isTextKey,
   },
   name_desc: {
     orderBy: sql`${receipts.merchantName} DESC NULLS LAST`,
@@ -140,6 +155,7 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
     direction: "desc",
     nullable: true,
     keyOf: (row) => row.merchantName,
+    keyIsValid: isTextKey,
   },
   added_desc: {
     orderBy: desc(receipts.createdAt),
@@ -147,7 +163,8 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
     column: receipts.createdAt,
     direction: "desc",
     nullable: false,
-    keyOf: (row) => row.createdAt.toISOString(),
+    keyOf: (row) => row.createdAtText,
+    keyIsValid: isInstantKey,
   },
   added_asc: {
     orderBy: asc(receipts.createdAt),
@@ -155,7 +172,8 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
     column: receipts.createdAt,
     direction: "asc",
     nullable: false,
-    keyOf: (row) => row.createdAt.toISOString(),
+    keyOf: (row) => row.createdAtText,
+    keyIsValid: isInstantKey,
   },
 };
 
@@ -171,7 +189,9 @@ const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
  */
 function keysetCondition(sort: SortSpec, cursor: { key: string | null; id: string }): SQL {
   const after = sort.direction === "desc" ? lt : gt;
-  const value = sort.column === receipts.createdAt ? new Date(cursor.key ?? 0) : cursor.key;
+  // Bound as text and cast by postgres, never parsed into a `Date` — see
+  // `createdAtText` in the projection above for what that costs.
+  const value = sort.column === receipts.createdAt ? sql`${cursor.key}::timestamptz` : cursor.key;
 
   if (cursor.key === null) {
     // Already inside the trailing null block: `id` is all that is left to
@@ -299,6 +319,16 @@ export const receiptsRouter = router({
 
       const sort = SORT_SPECS[input.sort];
       if (input.cursor) {
+        // The cursor's `key` is a bare string — it has to be, since it carries
+        // a date, a merchant name or an instant depending on the sort — so
+        // nothing in the zod input can check its SHAPE. Unvalidated, a
+        // malformed one reaches a `::timestamptz` or `date` comparison and the
+        // cast error becomes a 500, which since D-46 also writes a
+        // `system.internal_error` row: a bad cursor would litter the very table
+        // it was reading.
+        if (!sort.keyIsValid(input.cursor.key)) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Invalid pagination cursor." });
+        }
         conditions.push(keysetCondition(sort, input.cursor));
       }
 
@@ -323,6 +353,21 @@ export const receiptsRouter = router({
           uploaderEmail: users.email,
           canEdit: canEditSql(ctx.user),
           createdAt: receipts.createdAt,
+          // The cursor's view of `created_at`, as TEXT and in UTC.
+          //
+          // `created_at` is a microsecond-precision `timestamptz`, and
+          // node-postgres parses it into a JS `Date`, which is millisecond
+          // precision. Deriving the cursor from that `Date` truncates it, and a
+          // truncated keyset boundary is not a rounding error: under `DESC` it
+          // silently drops every row sharing that millisecond, and under `ASC`
+          // the predicate is true of the cursor row itself, so the page repeats
+          // and the cursor never advances. Both were reproduced at a two-
+          // millisecond spread — which is simply what a batch upload produces.
+          //
+          // The same fix `admin.logs` carries (D-46's H-1), and the same
+          // reason: the value is carried verbatim from the row to the
+          // `::timestamptz` cast that reads it back, and is never parsed in JS.
+          createdAtText: sql<string>`to_char(${receipts.createdAt} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
         })
         .from(receipts)
         // LEFT, not INNER: receipts.uploaded_by is ON DELETE SET NULL, so a
@@ -355,6 +400,9 @@ export const receiptsRouter = router({
         projectId: projects.id,
         projectName: projects.name,
         projectStatus: projects.status,
+        /** So the detail page can tell "the email is waiting on you" from
+         *  "no automatic email was ever going to be sent" (D-47). */
+        projectEmailReceipts: projects.emailReceipts,
         uploaderDisplayName: users.displayName,
         uploaderFirstName: users.firstName,
         uploaderLastName: users.lastName,
@@ -408,7 +456,12 @@ export const receiptsRouter = router({
 
     return {
       receipt,
-      project: { id: row.projectId, name: row.projectName, status: row.projectStatus },
+      project: {
+        id: row.projectId,
+        name: row.projectName,
+        status: row.projectStatus,
+        emailReceipts: row.projectEmailReceipts,
+      },
       uploader: receipt.uploadedBy
         ? {
             id: receipt.uploadedBy,
@@ -556,7 +609,11 @@ export const receiptsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -577,6 +634,11 @@ export const receiptsRouter = router({
         for (const column of changed) {
           const token = MISSING_FIELD_BY_COLUMN[column as EditableReceiptColumn];
           if (!token) continue; // tip, transactionDiscount and userNotes have no token
+          // A tax-inclusive receipt has no separate tax to read, so clearing
+          // the field is the correct answer rather than a gap to chase — the
+          // same rule the extraction pipeline applies when it first writes the
+          // row (D-47).
+          if (token === "sales_tax" && receipt.taxIncluded) continue;
           const value = (patch as Record<string, unknown>)[column];
           if (value === null || value === undefined) {
             // Cleared. It is missing again — unless the user has said it is
@@ -652,7 +714,11 @@ export const receiptsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -719,7 +785,11 @@ export const receiptsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -764,7 +834,11 @@ export const receiptsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -803,7 +877,11 @@ export const receiptsRouter = router({
       // `recomputed` is read after the transaction commits, never inside it:
       // releasing a held email against a transaction that then rolls back is an
       // email nobody can recall (D-47).
-      let recomputed: RecomputeResult = { receiptId: null, becameClear: false };
+      let recomputed: RecomputeResult = {
+        receiptId: null,
+        before: null,
+        after: { validationFlags: [], missingFields: [] },
+      };
       const outcome = await ctx.db.transaction(async (tx) => {
         const access = await loadEditableReceipt(tx, input.id, ctx.user);
         assertMayEditReceipt(access, ctx.user.id);
@@ -1240,6 +1318,12 @@ async function selectEditableReceipt(tx: Tx, receiptId: string) {
       salesTax: receipts.salesTax,
       tip: receipts.tip,
       total: receipts.total,
+      // D-47. Write-only would be indefensible: it is money on a tax record,
+      // it feeds `arithmetic_mismatch_total`, and without it on the read path
+      // a user looking at a receipt sees a subtotal, a tax and a total that
+      // visibly do not add up with nothing on the page to explain the gap —
+      // and no field to correct if the model read the credit wrong.
+      transactionDiscount: receipts.transactionDiscount,
       currency: receipts.currency,
       cardLast4: receipts.cardLast4,
       paymentMethod: receipts.paymentMethod,
