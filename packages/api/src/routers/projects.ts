@@ -313,7 +313,45 @@ export const projectsRouter = router({
         .groupBy(categories.id, categories.name, categories.color)
         .orderBy(sql`sum(${receiptItems.lineTotal}) DESC NULLS LAST`);
 
-      return { project: header, byCategory };
+      /**
+       * The non-item money, split (D-47).
+       *
+       * `SpendByCategory` used to derive one "Tax, tip and unitemised" row
+       * client-side by subtracting the category totals from the project total.
+       * That number is the sum of at least four unrelated things — tax, tip,
+       * an order-level credit, and line items the model could not read — and
+       * lumping them together meant the one that actually needed attention
+       * (unitemised spend) was indistinguishable from the two that are simply
+       * facts about the receipt.
+       *
+       * Summed over the SAME receipt set as `byCategory`, so the arithmetic on
+       * screen closes. Separate query rather than more correlated subqueries on
+       * the header, because these share `itemConditions` with the category
+       * rollup and must move with it when a date filter is applied.
+       */
+      const [nonItemTotals] = await ctx.db
+        .select({
+          salesTax: sql<string>`coalesce(sum(${receipts.salesTax}), 0)::numeric(12,2)::text`,
+          tip: sql<string>`coalesce(sum(${receipts.tip}), 0)::numeric(12,2)::text`,
+          // Stored negative, and summed as stored — the UI renders the sign it
+          // is given rather than negating somewhere else and hoping the two
+          // conventions agree.
+          transactionDiscount: sql<string>`coalesce(sum(${receipts.transactionDiscount}), 0)::numeric(12,2)::text`,
+          total: sql<string>`coalesce(sum(${receipts.total}), 0)::numeric(12,2)::text`,
+        })
+        .from(receipts)
+        .where(and(...itemConditions));
+
+      return {
+        project: header,
+        byCategory,
+        totals: nonItemTotals ?? {
+          salesTax: "0.00",
+          tip: "0.00",
+          transactionDiscount: "0.00",
+          total: "0.00",
+        },
+      };
     }),
 
   /**

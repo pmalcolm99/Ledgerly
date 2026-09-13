@@ -1,6 +1,22 @@
 import "server-only";
 
-import { and, asc, desc, eq, exists, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  exists,
+  gt,
+  gte,
+  inArray,
+  isNull,
+  lt,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { getEnv } from "@ledgerly/config/env";
@@ -14,6 +30,8 @@ import {
 } from "@ledgerly/db/schema";
 import { displayNameOf } from "@ledgerly/shared/personName";
 import { scrubLuhnSequences } from "@ledgerly/shared/scrub";
+import { DEFAULT_RECEIPT_SORT, RECEIPT_SORTS } from "@ledgerly/shared/receiptSort";
+import type { ReceiptSort } from "@ledgerly/shared/receiptSort";
 import { VALIDATION_FLAGS } from "@ledgerly/shared/receiptValidation";
 
 import { recordAudit } from "../audit";
@@ -25,6 +43,7 @@ import {
   assertMayEditReceipt,
   canEditSql,
   loadEditableReceipt,
+  merchantMatchesSql,
   recomputeReceiptDerivedState,
 } from "../receiptAccess";
 import { checkEmailReceiptRateLimit, checkReextractRateLimit } from "../rateLimit";
@@ -55,6 +74,119 @@ import { protectedProcedure, router } from "../trpc";
 
 const idInput = z.object({ id: z.string().uuid() });
 
+/**
+ * The five orderings the project page offers, each as ONE object carrying its
+ * ORDER BY, its keyset predicate and the cursor value it produces.
+ *
+ * Kept together deliberately. The previous shape was a hand-written
+ * three-branch `OR` matched by eye to a single hard-coded `ORDER BY`, and that
+ * was already the subtlest code in this file with one ordering to maintain.
+ * Six orderings as three parallel switch statements would be six chances for a
+ * predicate to disagree with the sort it belongs to — and a keyset cursor that
+ * disagrees with its ordering does not error, it silently skips or repeats
+ * rows at a page boundary. (That is not hypothetical: it is exactly what D-46's
+ * review found in `admin.logs`.)
+ *
+ * `NULLS LAST` in both directions, so a receipt whose date or merchant could
+ * not be read sorts to the end rather than to the top of an ascending list —
+ * the unreadable ones are the least useful thing to lead with.
+ */
+type SortSpec = {
+  orderBy: SQL;
+  tiebreak: SQL;
+  column: AnyPgColumn;
+  direction: "asc" | "desc";
+  /** Whether the sort column can be null. `created_at` cannot, so its
+   *  predicate skips the null bucket entirely. */
+  nullable: boolean;
+  keyOf: (row: {
+    transactionDate: string | null;
+    merchantName: string | null;
+    createdAt: Date;
+  }) => string | null;
+};
+
+const SORT_SPECS: Record<ReceiptSort, SortSpec> = {
+  date_desc: {
+    orderBy: sql`${receipts.transactionDate} DESC NULLS LAST`,
+    tiebreak: desc(receipts.id),
+    column: receipts.transactionDate,
+    direction: "desc",
+    nullable: true,
+    keyOf: (row) => row.transactionDate,
+  },
+  date_asc: {
+    orderBy: sql`${receipts.transactionDate} ASC NULLS LAST`,
+    tiebreak: asc(receipts.id),
+    column: receipts.transactionDate,
+    direction: "asc",
+    nullable: true,
+    keyOf: (row) => row.transactionDate,
+  },
+  name_asc: {
+    orderBy: sql`${receipts.merchantName} ASC NULLS LAST`,
+    tiebreak: asc(receipts.id),
+    column: receipts.merchantName,
+    direction: "asc",
+    nullable: true,
+    keyOf: (row) => row.merchantName,
+  },
+  name_desc: {
+    orderBy: sql`${receipts.merchantName} DESC NULLS LAST`,
+    tiebreak: desc(receipts.id),
+    column: receipts.merchantName,
+    direction: "desc",
+    nullable: true,
+    keyOf: (row) => row.merchantName,
+  },
+  added_desc: {
+    orderBy: desc(receipts.createdAt),
+    tiebreak: desc(receipts.id),
+    column: receipts.createdAt,
+    direction: "desc",
+    nullable: false,
+    keyOf: (row) => row.createdAt.toISOString(),
+  },
+  added_asc: {
+    orderBy: asc(receipts.createdAt),
+    tiebreak: asc(receipts.id),
+    column: receipts.createdAt,
+    direction: "asc",
+    nullable: false,
+    keyOf: (row) => row.createdAt.toISOString(),
+  },
+};
+
+/**
+ * "Everything that sorts strictly after this row", for whichever ordering is
+ * in force.
+ *
+ * The `(key, id)` pair is a total order — `id` is a uuid primary key — so this
+ * neither skips nor repeats a row at a page boundary. The null bucket is the
+ * fiddly part and is why `nullable` exists: under `NULLS LAST` the nulls are
+ * one block at the very end, so a cursor sitting inside it can only advance by
+ * `id`, and a cursor outside it must still let the whole block through.
+ */
+function keysetCondition(sort: SortSpec, cursor: { key: string | null; id: string }): SQL {
+  const after = sort.direction === "desc" ? lt : gt;
+  const value = sort.column === receipts.createdAt ? new Date(cursor.key ?? 0) : cursor.key;
+
+  if (cursor.key === null) {
+    // Already inside the trailing null block: `id` is all that is left to
+    // order by.
+    return and(isNull(sort.column), after(receipts.id, cursor.id)) ?? sql`true`;
+  }
+  return (
+    or(
+      after(sort.column, value),
+      and(eq(sort.column, value), after(receipts.id, cursor.id)),
+      // NULLS LAST: the null block sorts after every real value, in both
+      // directions, so it is always still ahead of a non-null cursor.
+      sort.nullable ? isNull(sort.column) : undefined,
+    ) ?? sql`true`
+  );
+}
+
 export const receiptsRouter = router({
   /**
    * Project receipt list (task 7.3). Ordered by transaction date, newest
@@ -81,10 +213,24 @@ export const receiptsRouter = router({
           categoryId: z.string().uuid().optional(),
           needsReview: z.boolean().optional(),
           uploadedBy: z.string().uuid().optional(),
+          sort: z.enum(RECEIPT_SORTS).default(DEFAULT_RECEIPT_SORT),
+          /** Free-text match on the merchant name. Trimmed, and an empty
+           *  string is treated as absent so a cleared search box does not
+           *  become a filter that matches everything by accident. */
+          q: z.string().trim().max(200).optional(),
           limit: z.number().int().min(1).max(100).default(50),
+          /**
+           * Keyset cursor, generic over the sort.
+           *
+           * `key` is whichever column the chosen sort orders by, as a string —
+           * an ISO date, a merchant name, or an ISO instant. It used to be
+           * `transactionDate`, which only worked because there was one
+           * ordering; a per-sort cursor shape would mean five of these and five
+           * chances for one to disagree with its own ORDER BY.
+           */
           cursor: z
             .object({
-              transactionDate: z.string().date().nullable(),
+              key: z.string().nullable(),
               id: z.string().uuid(),
             })
             .nullish(),
@@ -119,6 +265,11 @@ export const receiptsRouter = router({
 
       if (input.from) conditions.push(gte(receipts.transactionDate, input.from));
       if (input.to) conditions.push(lte(receipts.transactionDate, input.to));
+      if (input.q) {
+        // Shared with the export so the two cannot drift — see
+        // `merchantMatchesSql`.
+        conditions.push(merchantMatchesSql(input.q));
+      }
       if (input.uploadedBy) conditions.push(eq(receipts.uploadedBy, input.uploadedBy));
       if (input.needsReview) conditions.push(NEEDS_REVIEW_SQL);
 
@@ -144,23 +295,9 @@ export const receiptsRouter = router({
         );
       }
 
+      const sort = SORT_SPECS[input.sort];
       if (input.cursor) {
-        const cursor = input.cursor;
-        if (cursor.transactionDate === null) {
-          // Already inside the trailing NULL-date bucket.
-          conditions.push(
-            and(isNull(receipts.transactionDate), lt(receipts.id, cursor.id)) ?? sql`true`,
-          );
-        } else {
-          conditions.push(
-            or(
-              lt(receipts.transactionDate, cursor.transactionDate),
-              and(eq(receipts.transactionDate, cursor.transactionDate), lt(receipts.id, cursor.id)),
-              // NULLS LAST: the whole null bucket sorts after any real date.
-              isNull(receipts.transactionDate),
-            ) ?? sql`true`,
-          );
-        }
+        conditions.push(keysetCondition(sort, input.cursor));
       }
 
       const rows = await ctx.db
@@ -190,18 +327,14 @@ export const receiptsRouter = router({
         // receipt can outlive its uploader.
         .leftJoin(users, eq(users.id, receipts.uploadedBy))
         .where(and(...conditions))
-        .orderBy(sql`${receipts.transactionDate} DESC NULLS LAST`, desc(receipts.id))
+        .orderBy(sort.orderBy, sort.tiebreak)
         .limit(input.limit);
 
+      const last = rows[rows.length - 1];
       return {
         items: rows.map(toListItem),
         nextCursor:
-          rows.length === input.limit && rows.length > 0
-            ? {
-                transactionDate: rows[rows.length - 1]!.transactionDate,
-                id: rows[rows.length - 1]!.id,
-              }
-            : null,
+          rows.length === input.limit && last ? { key: sort.keyOf(last), id: last.id } : null,
       };
     }),
 

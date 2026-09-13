@@ -19,6 +19,20 @@ export const users = pgTable(
     // migration 0004 changes the column default and deliberately does not
     // rewrite existing values.
     theme: text("theme").notNull().default("light"),
+
+    /**
+     * How this user wants a project's receipts ordered (D-47).
+     *
+     * The second per-user preference, and it follows `theme` exactly: a typed
+     * column with a default, a mutation on the `auth` router, and the value
+     * shipped down on `auth.me`. Free text at the database level for the same
+     * reason `theme` is — the valid set lives in
+     * `@ledgerly/shared/receiptSort`, so adding an ordering is not a migration.
+     *
+     * Defaults to what the project page already did, so nobody's list reorders
+     * itself the day this ships.
+     */
+    receiptSort: text("receipt_sort").notNull().default("date_desc"),
     onboardedAt: timestamp("onboarded_at", { withTimezone: true }),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

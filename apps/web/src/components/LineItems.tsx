@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Button, Chip, Input, Select, SelectItem } from "@heroui/react";
 import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
 import { formatQuantityDisplay } from "@ledgerly/shared/numeric";
-import { Plus, Sparkles, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus, Sparkles, Trash2 } from "lucide-react";
 
 import { trpc } from "../lib/trpc";
 import { useEditableDraft } from "../lib/useEditableDraft";
@@ -43,6 +43,19 @@ import { useEditableDraft } from "../lib/useEditableDraft";
  * missing UI. Editing commits on blur, and `recomputeReceiptDerivedState`
  * server-side means a corrected line total can clear an arithmetic warning on
  * the receipt, which is why every mutation invalidates `receipts.get`.
+ *
+ * ## Collapsed by default (D-47)
+ *
+ * A long receipt pushes everything below it — including the warnings that
+ * actually need attention — off the screen. The list starts closed.
+ *
+ * **The trigger carries the item count**, which is the one rule a disclosure in
+ * this app must follow (`Filters.tsx`'s docblock states it): a list that is
+ * silently hidden looks like a list that is empty, and "no items were read from
+ * this receipt" is a genuinely different and worse fact than "the items are
+ * collapsed". It opens automatically when there is nothing to hide but
+ * something to do — an empty receipt someone can add items to — because the
+ * only thing behind the toggle then is the Add button.
  */
 /**
  * One template, used by the header and every row, so the columns line up
@@ -75,6 +88,10 @@ export function LineItems({
   const utils = trpc.useUtils();
   const categories = trpc.categories.list.useQuery();
   const [isAdding, setAdding] = useState(false);
+  // Open when there is nothing to collapse: with no items the only content is
+  // the empty-state line and the Add button, and hiding those behind a toggle
+  // that says "0 items" helps nobody.
+  const [isOpen, setOpen] = useState(items.length === 0);
 
   const invalidate = () => utils.receipts.get.invalidate({ id: receiptId });
 
@@ -92,9 +109,28 @@ export function LineItems({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">Line items</h2>
-        {canEdit ? (
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          className="flex items-center gap-1.5 rounded text-lg font-semibold outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          aria-expanded={isOpen}
+          onClick={() => setOpen((open) => !open)}
+        >
+          {isOpen ? (
+            <ChevronDown className="h-4 w-4 text-default-500" aria-hidden />
+          ) : (
+            <ChevronRight className="h-4 w-4 text-default-500" aria-hidden />
+          )}
+          <h2>Line items</h2>
+          {/* The count is on the trigger, not only inside the panel — see the
+              header. Rendered even when open so the heading does not jump. */}
+          {items.length > 0 ? (
+            <Chip size="sm" variant="flat">
+              {items.length}
+            </Chip>
+          ) : null}
+        </button>
+        {canEdit && isOpen ? (
           <Button
             size="sm"
             variant="flat"
@@ -106,7 +142,15 @@ export function LineItems({
         ) : null}
       </div>
 
-      {items.length === 0 ? (
+      {!isOpen ? (
+        <button
+          type="button"
+          className="self-start text-sm text-primary underline-offset-2 hover:underline"
+          onClick={() => setOpen(true)}
+        >
+          Show items
+        </button>
+      ) : items.length === 0 ? (
         <p className="py-2 text-sm text-default-500">No line items were read from this receipt.</p>
       ) : (
         <div className="flex flex-col gap-2">

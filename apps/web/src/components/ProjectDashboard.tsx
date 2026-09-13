@@ -7,9 +7,12 @@ import { formatMoneyDisplay } from "@ledgerly/shared/moneyDisplay";
 import { trpc } from "../lib/trpc";
 import { extractionRefetchInterval } from "../lib/extractionPolling";
 import { hasAnyFilter, parseReceiptFilters } from "../lib/receiptFilters";
+import { DEFAULT_RECEIPT_SORT } from "@ledgerly/shared/receiptSort";
 import { Capture } from "./Capture";
 import { ExportButton } from "./ExportButton";
 import { Filters } from "./Filters";
+import { ReceiptSearch } from "./ReceiptSearch";
+import { SortSelect } from "./SortSelect";
 import { MemberManager } from "./MemberManager";
 import { ProjectEmailSettings } from "./ProjectEmailSettings";
 import { ReceiptRow } from "./ReceiptRow";
@@ -35,8 +38,14 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
   // as none is. This query is the one the list below renders, so unlike the
   // poll that used to live in Capture it can never refresh a different cache
   // entry than the one being displayed.
+  // The ordering is a PREFERENCE, not a filter: it rides on the user row and
+  // follows them between devices, where the filters beside it stay in the URL
+  // because a filtered view is something you share or export (D-47).
+  const me = trpc.auth.me.useQuery();
+  const sort = me.data?.receiptSort ?? DEFAULT_RECEIPT_SORT;
+
   const receipts = trpc.receipts.list.useQuery(
-    { projectId, ...filters, limit: 50 },
+    { projectId, ...filters, sort, limit: 50 },
     {
       refetchInterval: (q) =>
         extractionRefetchInterval((q.state.data?.items ?? []).map((r) => r.extractionStatus)),
@@ -123,6 +132,7 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
             <SpendByCategory
               byCategory={stats.data.byCategory}
               totalSpend={stats.data.project.totalSpend}
+              totals={stats.data.totals}
             />
           )}
         </CardBody>
@@ -130,7 +140,14 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
 
       <section className="flex flex-col gap-3">
         <h2 className="text-lg font-semibold">Receipts</h2>
-        <Filters projectId={projectId} />
+        {/* Search and sort sit OUTSIDE the filter popover, always visible.
+            A filter is something you set and forget; these two are things you
+            reach for repeatedly while looking at the list. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <ReceiptSearch />
+          <SortSelect />
+          <Filters projectId={projectId} />
+        </div>
 
         {receipts.isPending ? (
           <div className="flex flex-col gap-2" aria-busy>

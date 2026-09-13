@@ -5,7 +5,7 @@ import { categories, receiptItems, receipts, users } from "@ledgerly/db/schema";
 import type { AuthUser } from "@ledgerly/auth";
 import type { Database } from "@ledgerly/db";
 
-import { NEEDS_REVIEW_SQL, receiptIsReadable } from "../receiptAccess";
+import { NEEDS_REVIEW_SQL, merchantMatchesSql, receiptIsReadable } from "../receiptAccess";
 import type { ExportFilters } from "./filters";
 
 /**
@@ -94,6 +94,9 @@ function filterConditions(db: Database, user: AuthUser, projectId: string, filte
   if (filters.to) conditions.push(lte(receipts.transactionDate, filters.to));
   if (filters.uploadedBy) conditions.push(eq(receipts.uploadedBy, filters.uploadedBy));
   if (filters.needsReview) conditions.push(NEEDS_REVIEW_SQL);
+  // The same predicate `receipts.list` uses, not a second copy of it — this
+  // module's contract is that an export matches the list it was launched from.
+  if (filters.q) conditions.push(merchantMatchesSql(filters.q));
 
   if (filters.categoryId) {
     conditions.push(

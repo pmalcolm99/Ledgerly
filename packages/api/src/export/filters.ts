@@ -28,6 +28,8 @@ export type ExportFilters = {
   categoryId?: string;
   uploadedBy?: string;
   needsReview?: boolean;
+  /** D-47. Free-text match on the merchant name, mirroring `receipts.list`. */
+  q?: string;
 };
 
 /**
@@ -50,6 +52,7 @@ const querySchema = z
     category: z.string().uuid().optional(),
     uploadedBy: z.string().uuid().optional(),
     needsReview: z.string().optional(),
+    q: z.string().trim().max(200).optional(),
   })
   .refine((v) => !v.from || !v.to || v.to >= v.from, {
     message: "End date must be on or after the start date.",
@@ -86,6 +89,7 @@ export function parseExportQuery(search: URLSearchParams): ParsedExportQuery {
     category: search.get("category") || undefined,
     uploadedBy: search.get("uploadedBy") || undefined,
     needsReview: search.get("needsReview") || undefined,
+    q: search.get("q") || undefined,
   };
 
   const parsed = querySchema.safeParse(raw);
@@ -95,7 +99,7 @@ export function parseExportQuery(search: URLSearchParams): ParsedExportQuery {
     throw new ExportQueryError(`Invalid export parameter: ${field}.`);
   }
 
-  const { format, from, to, category, uploadedBy, needsReview } = parsed.data;
+  const { format, from, to, category, uploadedBy, needsReview, q } = parsed.data;
   // Mirrors the client's `value === "1"` exactly.
   const wantsReview = needsReview === "1";
   return {
@@ -106,6 +110,7 @@ export function parseExportQuery(search: URLSearchParams): ParsedExportQuery {
       ...(category ? { categoryId: category } : {}),
       ...(uploadedBy ? { uploadedBy } : {}),
       ...(wantsReview ? { needsReview: true } : {}),
+      ...(q ? { q } : {}),
     },
   };
 }
@@ -140,6 +145,9 @@ export function describeFilters(filters: ExportFilters, labels: FilterLabels = {
     parts.push(`uploaded by ${labels.uploaderName ?? "(unknown)"} [${filters.uploadedBy}]`);
   }
   if (filters.needsReview) parts.push("needs review only");
+  // Quoted, because a search for "needs review" would otherwise be
+  // indistinguishable from the clause above it in the rendered line.
+  if (filters.q) parts.push(`merchant matching "${filters.q}"`);
 
   return parts.length === 0 ? "none" : parts.join("; ");
 }

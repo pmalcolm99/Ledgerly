@@ -12,10 +12,16 @@ import { parseMoney } from "@ledgerly/shared/money";
  *
  * THE TWO TOTALS DO NOT RECONCILE, AND THIS COMPONENT SAYS SO. The header
  * total is `sum(receipts.total)`; these bars are `sum(receipt_items
- * .line_total)`. They differ by sales tax, tip, and every receipt whose line
- * items were never extracted. Showing them side by side as though they were
- * the same number would be quietly wrong on a tax record, so the remainder is
- * drawn as its own labelled row rather than left for the user to notice.
+ * .line_total)`. They differ by sales tax, tip, order-level credits, and every
+ * receipt whose line items were never extracted. Showing them side by side as
+ * though they were the same number would be quietly wrong on a tax record.
+ *
+ * D-47: that gap used to be ONE row labelled "Tax, tip and unitemised", which
+ * was four unrelated things added together. Tax and tip are facts about a
+ * receipt; a discount is a credit; unitemised spend is the only one of the
+ * four that means something went unread and might want attention. Summing them
+ * made the one actionable number the hardest to see. They are now separate
+ * rows, and "unitemised" is what is left after the other three are named.
  */
 
 /** Deterministic fallback hue for a category with no colour set, so the same
@@ -29,6 +35,7 @@ function hueFor(seed: string): string {
 export function SpendByCategory({
   byCategory,
   totalSpend,
+  totals,
 }: {
   byCategory: Array<{
     categoryId: string | null;
@@ -38,10 +45,19 @@ export function SpendByCategory({
     spend: string;
   }>;
   totalSpend: string;
+  /** Server-side sums over the same receipts as `byCategory` (D-47). */
+  totals?: { salesTax: string; tip: string; transactionDiscount: string };
 }) {
   const itemsCents = byCategory.reduce((sum, row) => sum + safeCents(row.spend), 0);
   const totalCents = safeCents(totalSpend);
-  const remainderCents = totalCents - itemsCents;
+  const taxCents = safeCents(totals?.salesTax);
+  const tipCents = safeCents(totals?.tip);
+  // Stored negative, so this ADDS to the accounted-for side.
+  const discountCents = safeCents(totals?.transactionDiscount);
+  // What is left once every named component is subtracted: line items the
+  // model never read. The honest remainder, and the only one of these four
+  // that is a prompt to go and look at something.
+  const unitemisedCents = totalCents - itemsCents - taxCents - tipCents - discountCents;
 
   if (byCategory.length === 0) {
     return (
@@ -51,9 +67,16 @@ export function SpendByCategory({
     );
   }
 
-  // Scale bars against whichever is larger, so the remainder row cannot
-  // overflow the track when line items exceed the receipt totals.
-  const scale = Math.max(itemsCents + Math.max(remainderCents, 0), 1);
+  // Scale bars against whichever is larger, so a remainder row cannot overflow
+  // the track when line items exceed the receipt totals.
+  const scale = Math.max(itemsCents + Math.max(unitemisedCents, 0) + taxCents + tipCents, 1);
+
+  const extraRows: { label: string; cents: number }[] = [
+    { label: "Sales tax", cents: taxCents },
+    { label: "Tip", cents: tipCents },
+    { label: "Discounts and credits", cents: discountCents },
+    { label: "Unitemised", cents: unitemisedCents },
+  ].filter((row) => row.cents !== 0);
 
   return (
     <div className="flex flex-col gap-2">
@@ -85,17 +108,24 @@ export function SpendByCategory({
         );
       })}
 
-      {remainderCents !== 0 ? (
+      {extraRows.length > 0 ? (
         <div className="mt-1 flex flex-col gap-1 border-t border-divider pt-2">
-          <div className="flex items-baseline justify-between gap-3 text-sm text-default-500">
-            <span>
-              {remainderCents > 0 ? "Tax, tip and unitemised" : "Line items exceed receipt totals"}
-            </span>
-            <span className="shrink-0 tabular-nums">
-              {formatMoneyDisplay(centsToNumeric(Math.abs(remainderCents)))}
-            </span>
-          </div>
-          {remainderCents < 0 ? (
+          {extraRows.map((row) => (
+            <div
+              key={row.label}
+              className="flex items-baseline justify-between gap-3 text-sm text-default-500"
+            >
+              <span>{row.label}</span>
+              <span className="shrink-0 tabular-nums">
+                {formatMoneyDisplay(centsToNumeric(row.cents))}
+              </span>
+            </div>
+          ))}
+          {/* A NEGATIVE unitemised remainder means the line items add up to
+              more than the receipts claim — which is the aggregate face of
+              `arithmetic_mismatch_items`, and worth saying rather than
+              rendering as a quietly negative row. */}
+          {unitemisedCents < 0 ? (
             <p className="text-xs text-warning">
               Some receipts&apos; line items add up to more than their stated total. Worth checking.
             </p>

@@ -1,6 +1,6 @@
 import "server-only";
 
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, ilike, inArray, isNull, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { projectMembers, projects, receiptItems, receipts, users } from "@ledgerly/db/schema";
 import type { AuthUser } from "@ledgerly/auth/types";
@@ -37,6 +37,24 @@ import { lockScopedProject, scopedProjects } from "./scope";
  * Five call sites share it: `receipts.reviewQueue`, `receipts.list`'s
  * `needsReview` filter, `projects.list`, `projects.stats`, `admin.overview`.
  */
+/**
+ * The merchant-name search, as ONE predicate shared by `receipts.list` and the
+ * export (D-47).
+ *
+ * Shared for the same reason `NEEDS_REVIEW_SQL` is: `export/filters.ts` states
+ * the invariant that an export's filter semantics mirror the list's exactly,
+ * and two copies of a LIKE pattern is precisely how that stops being true —
+ * quietly, in whichever one was not updated.
+ *
+ * `%` and `_` are escaped because a person typing either into a search box
+ * means the character, not the operator: unescaped, a search for "50%" matches
+ * every receipt in the project.
+ */
+export function merchantMatchesSql(query: string) {
+  const escaped = query.replace(/[\\%_]/g, (match) => `\\${match}`);
+  return ilike(receipts.merchantName, `%${escaped}%`);
+}
+
 export const NEEDS_REVIEW_SQL = sql`(${receipts.missingFields} <> '{}' OR ${receipts.extractionStatus} <> 'ok')`;
 
 /**

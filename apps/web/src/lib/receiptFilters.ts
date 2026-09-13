@@ -1,7 +1,7 @@
 /**
  * apps/web/src/lib/receiptFilters.ts — the one URL-to-filter mapping.
  *
- * The dashboard reads these five parameters, `Filters.tsx` writes them, and
+ * The dashboard reads these six parameters, `Filters.tsx` writes them, and
  * Phase 8's export button forwards them. That is three call sites for one
  * mapping, and the mapping has a trap in it: the URL says `category` while
  * `receipts.list` says `categoryId`. A third open-coded copy of that
@@ -16,7 +16,17 @@
 
 /** The parameters an export forwards, in a fixed order so a generated URL is
  *  stable. Anything else in the address bar is deliberately dropped. */
-export const FILTER_PARAMS = ["from", "to", "category", "uploadedBy", "needsReview"] as const;
+export const FILTER_PARAMS = [
+  "from",
+  "to",
+  "category",
+  "uploadedBy",
+  "needsReview",
+  // D-47. A search is a filter, so it belongs in the URL beside the others and
+  // is forwarded to an export — what leaves has to match what is on screen,
+  // which is the invariant this whole module exists to hold.
+  "q",
+] as const;
 
 export type ReceiptFilters = {
   from: string | undefined;
@@ -24,6 +34,7 @@ export type ReceiptFilters = {
   categoryId: string | undefined;
   uploadedBy: string | undefined;
   needsReview: true | undefined;
+  q: string | undefined;
 };
 
 type SearchLike = string | URLSearchParams | { get(key: string): string | null };
@@ -43,6 +54,7 @@ export function parseReceiptFilters(search: SearchLike): ReceiptFilters {
     categoryId: params.get("category") || undefined,
     uploadedBy: params.get("uploadedBy") || undefined,
     needsReview: params.get("needsReview") === "1" ? true : undefined,
+    q: params.get("q")?.trim() || undefined,
   };
 }
 
@@ -54,7 +66,7 @@ export function hasAnyFilter(filters: ReceiptFilters): boolean {
 
 /**
  * The query string for an export download, built from the live URL. Only the
- * five known parameters are forwarded, so a stray `utm_source` never reaches
+ * six known parameters are forwarded, so a stray `utm_source` never reaches
  * the server or the audit log, and the order is fixed so the same filter
  * always produces the same URL.
  */

@@ -6,6 +6,8 @@ import { users } from "@ledgerly/db/schema";
 import { isOnboarded } from "@ledgerly/auth";
 
 import { THEMES } from "@ledgerly/shared/themes";
+import { DEFAULT_RECEIPT_SORT, RECEIPT_SORTS, isReceiptSort } from "@ledgerly/shared/receiptSort";
+import type { ReceiptSort } from "@ledgerly/shared/receiptSort";
 
 import { onboardingProcedure, protectedProcedure, router } from "../trpc";
 
@@ -43,6 +45,7 @@ export const authRouter = router({
     displayName: ctx.user.displayName,
     role: ctx.user.role,
     theme: ctx.user.theme,
+    receiptSort: normalizeReceiptSort(ctx.user.receiptSort),
     onboarded: isOnboarded(ctx.user),
   })),
 
@@ -89,4 +92,32 @@ export const authRouter = router({
         .where(eq(users.id, ctx.user.id));
       return { theme: input.theme };
     }),
+
+  /**
+   * Receipt ordering preference (D-47), following `setTheme` exactly.
+   *
+   * A preference rather than a URL parameter, because the user asked for a
+   * choice that persists until they change it. The filters beside it stay in
+   * the URL on purpose — a filtered view is something you share or export, an
+   * ordering is something you just prefer.
+   */
+  setReceiptSort: protectedProcedure
+    .input(z.object({ sort: z.enum(RECEIPT_SORTS) }))
+    .mutation(async ({ ctx, input }) => {
+      await ctx.db
+        .update(users)
+        .set({ receiptSort: input.sort, updatedAt: new Date() })
+        .where(eq(users.id, ctx.user.id));
+      return { sort: input.sort };
+    }),
 });
+
+/**
+ * The column is free text, so a value written by a version of this app that
+ * knew about an ordering this one does not must not crash the page — it falls
+ * back to the default, the same way `isValidationFlag` narrows a flag it does
+ * not recognise.
+ */
+function normalizeReceiptSort(value: string): ReceiptSort {
+  return isReceiptSort(value) ? value : DEFAULT_RECEIPT_SORT;
+}

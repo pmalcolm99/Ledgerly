@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "receipt_sort" text DEFAULT 'date_desc' NOT NULL;
