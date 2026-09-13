@@ -1930,7 +1930,38 @@ silent failure on a download is indistinguishable from a slow one. The export
 handler already answers a rate limit as prose written for a person; that text is
 now shown rather than discarded.
 
-**What this does not do.** It is not verified on a real device from here — the
-detection is feature-based (`display-mode: standalone`, `navigator.standalone`)
-and the routing is unit-tested, but "the share sheet appears and saves a working
-file" needs the phone. Recorded as untested rather than implied to be confirmed.
+### Amendment (same day): fetching an attachment is itself the problem
+
+The first version of this fix was tested on a device and **still failed** — now
+with a visible error: _"Could not reach the server."_ Desktop and Safari-as-a-
+browser were fine, which was the clue: both of those take the anchor path, so
+the `fetch` had never actually run anywhere until it ran on the phone.
+
+The service worker was the obvious suspect and is innocent — `/api/*` falls
+through its handler without `respondWith`, so the browser handles the request
+natively. The real cause is a level down: **WebKit routes a
+`Content-Disposition: attachment` response into its download machinery before
+the JavaScript that requested it can read the body.** In a standalone app there
+is no download UI to route it to, so the request is diverted and the `fetch`
+rejects with a network error. The bytes were reaching the device the whole time.
+
+So the client that intends to save the file itself now sends
+`x-ledgerly-inline: 1`, and the handler answers `inline; filename="..."` instead
+of `attachment`. The filename still travels, so the two dispositions cannot
+disagree about it, and every other caller is untouched.
+
+**A request header, not a query parameter.** The export query is the FILTER set:
+it is validated by `parseExportQuery`, mirrored by `describeFilters` into the
+file's own header block, and it ends up in URLs people share. How the bytes are
+delivered is a property of one client, not of the export.
+
+**Consequence.** The error message now names the underlying exception. The
+original said only "check your connection", which was a guess dressed as a
+diagnosis — the connection was fine and the response was being diverted after it
+arrived. That wording cost a round trip, and a failure that names itself is the
+difference between one and three.
+
+**What this still does not do.** Not verified on a device from here. The
+mechanism is understood and both halves are tested — the client sends the
+header, the handler honours it and stays `attachment` for everyone else — but
+"the share sheet appears and saves a working file" needs the phone.

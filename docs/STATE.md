@@ -47,9 +47,30 @@ The button also gained a busy state and an error line. The bug was **silent** �
 a blank view is indistinguishable from a slow one — and the handler already
 answers a rate limit as prose written for a person, which was being thrown away.
 
-**Not verified on a device from here.** The detection is feature-based and the
-routing is unit-tested (an installed app must never be sent to a browser view; a
-tab must never buffer); the share sheet itself needs the phone.
+**The first fix was not enough, and the second attempt is the interesting one.**
+On the device it still failed — but now with a visible error, which is what the
+error line was added for. Desktop and Safari-as-a-browser were fine, and that
+was the clue: both take the anchor path, so the `fetch` had never actually run
+anywhere until it ran on the phone.
+
+The service worker was the obvious suspect and is innocent: `/api/*` falls
+through without `respondWith`. The real cause is a level down — **WebKit routes
+a `Content-Disposition: attachment` response into its download machinery before
+the JavaScript that asked for it can read the body**, and a standalone app has
+no download UI to route it to, so the fetch rejects. The bytes were reaching the
+device all along.
+
+The client that intends to save the file itself now sends `x-ledgerly-inline: 1`
+and the handler answers `inline; filename="..."`. A request header rather than a
+query parameter, because the export query is the filter set — validated, mirrored
+into the file's own header block, and present in URLs people share. How the bytes
+are delivered is a property of one client, not of the export.
+
+The error message now names the underlying exception. "Could not reach the
+server" was a guess dressed as a diagnosis, and it cost a round trip.
+
+**Still not verified on a device from here** — the mechanism is understood and
+both halves are tested, but the share sheet needs the phone.
 
 ## A verbose log level, and the bug it was reported alongside (D-48)
 

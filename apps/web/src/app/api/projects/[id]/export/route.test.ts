@@ -62,8 +62,9 @@ afterAll(async () => {
   await getCleanPool().end();
 });
 
-function requestWith(sub: string | null, search = ""): Request {
+function requestWith(sub: string | null, search = "", extra?: Record<string, string>): Request {
   const headers = sub ? new Headers({ "cf-access-jwt-assertion": sub }) : new Headers();
+  for (const [key, value] of Object.entries(extra ?? {})) headers.set(key, value);
   return new Request(`http://localhost/api/projects/x/export${search}`, { headers });
 }
 
@@ -222,6 +223,53 @@ describe("GET /api/projects/[id]/export", () => {
     expect(response.headers.get("content-type")).toBe("text/csv; charset=utf-8");
     expect(response.headers.get("content-disposition")).toContain(".csv");
     expect(await response.text()).toContain("line_total");
+  });
+
+  /**
+   * D-49. WebKit routes an `attachment` response into its download machinery
+   * before the JavaScript that requested it can read the body — and an
+   * installed PWA has no download UI to route it to, so the `fetch` rejects
+   * and nothing arrives. A client that is going to save the bytes itself asks
+   * for `inline`.
+   */
+  it("answers inline when the client says it will save the file itself", async () => {
+    const { project } = await fixture();
+    const response = await handleExportGet(
+      requestWith("sub-owner1", "?format=csv", { "x-ledgerly-inline": "1" }),
+      project.id,
+      { db },
+    );
+
+    expect(response.status).toBe(200);
+    // Inline, but the filename still travels — the client does not have to
+    // invent one, and the two dispositions cannot disagree about it.
+    expect(response.headers.get("content-disposition")).toMatch(
+      /^inline; filename="kitchen-remodel_\d{4}-\d{2}-\d{2}\.csv"$/,
+    );
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    await response.arrayBuffer();
+  });
+
+  /** Anything other than the exact opt-in stays an attachment — a browser
+   *  rendering a CSV as text is not a useful outcome for the default path. */
+  it("stays an attachment without the header, or with any other value", async () => {
+    const { project } = await fixture();
+    for (const headers of [
+      undefined,
+      { "x-ledgerly-inline": "0" },
+      { "x-ledgerly-inline": "yes" },
+    ]) {
+      const response = await handleExportGet(
+        requestWith("sub-owner1", "?format=csv", headers),
+        project.id,
+        { db },
+      );
+      expect(response.headers.get("content-disposition")).toMatch(/^attachment; /);
+      // Drained before the next iteration. The writer runs detached and feeds
+      // the stream from an open snapshot, so leaving three bodies unread holds
+      // three of them open at once and the next request deadlocks against them.
+      await response.arrayBuffer();
+    }
   });
 
   /**

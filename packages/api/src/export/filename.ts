@@ -33,9 +33,25 @@ export function exportFilename(projectName: string, format: ExportFormat, at: Da
   return `${slug}_${date}.${format}`;
 }
 
-/** `Content-Disposition` for a download. Always `attachment`: a browser
- *  rendering a CSV inline is not a useful outcome for a file someone is
- *  about to open in Excel. */
-export function contentDisposition(filename: string): string {
-  return `attachment; filename="${filename}"`;
+/**
+ * `Content-Disposition` for a download.
+ *
+ * `attachment` by default: a browser rendering a CSV inline is not a useful
+ * outcome for a file someone is about to open in Excel.
+ *
+ * `inline` exists for exactly one caller — an installed PWA that is going to
+ * read the bytes itself and hand them to the OS (D-49). WebKit routes an
+ * `attachment` response into its download machinery before the JavaScript that
+ * asked for it can see it, so in a standalone app, where there is no download
+ * UI to route it to, the `fetch` rejects outright. Asking for `inline` keeps
+ * the response in the page, where the caller wanted it all along.
+ *
+ * The filename travels either way, so the client does not have to invent one
+ * and the two dispositions cannot disagree about it.
+ */
+export function contentDisposition(
+  filename: string,
+  kind: "attachment" | "inline" = "attachment",
+): string {
+  return `${kind}; filename="${filename}"`;
 }

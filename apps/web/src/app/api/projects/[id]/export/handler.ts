@@ -5,6 +5,7 @@ import { buildAccessDeniedResponse } from "@ledgerly/auth/response";
 import {
   ExportError,
   ExportQueryError,
+  contentDisposition,
   parseExportQuery,
   startProjectExport,
 } from "@ledgerly/api/export";
@@ -120,6 +121,18 @@ export async function handleExportGet(
     throw error;
   }
 
+  // D-49. An installed PWA reads the bytes itself and hands them to the OS
+  // share sheet, so it asks for `inline`. WebKit diverts an `attachment`
+  // response into its download machinery before the JavaScript that requested
+  // it can see it — and in a standalone app there is no download UI to divert
+  // it to, so the `fetch` rejects with a network error and nothing arrives.
+  //
+  // A request HEADER rather than a query parameter, deliberately: the export
+  // query is the filter set, it is mirrored by `describeFilters` into the
+  // file's own header block, and it ends up in URLs people share. How the
+  // bytes are delivered is a property of THIS client, not of the export.
+  const wantsInline = request.headers.get("x-ledgerly-inline") === "1";
+
   // No `content-length`: the workbook is generated as it is sent and its size
   // is genuinely unknown until the last byte. A wrong length would be worse
   // than none — the browser would truncate the file at it.
@@ -127,7 +140,9 @@ export async function handleExportGet(
     status: 200,
     headers: {
       "content-type": started.contentType,
-      "content-disposition": started.contentDisposition,
+      "content-disposition": wantsInline
+        ? contentDisposition(started.filename, "inline")
+        : started.contentDisposition,
       // The filename is a slug and a date by construction
       // (`packages/shared/src/slug.ts`), so no project name can break out of
       // the quoted header value.

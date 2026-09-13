@@ -105,7 +105,31 @@ describe("saveExport — an installed app", () => {
     await saveExport("/api/projects/p/export", "x.csv", d);
     expect(d.fetchImpl).toHaveBeenCalledWith("/api/projects/p/export", {
       credentials: "same-origin",
+      headers: { "x-ledgerly-inline": "1" },
     });
+  });
+
+  /**
+   * THE SECOND HALF OF THE iOS FIX. WebKit hands an `attachment` response to
+   * its download machinery before the JavaScript that requested it sees the
+   * body — and an installed app has no download UI to hand it to, so the fetch
+   * rejects outright. This request is going to save the file itself, so it asks
+   * for the bytes rather than a download.
+   */
+  it("asks the server not to mark the response an attachment", async () => {
+    const d = deps();
+    await saveExport("/api/projects/p/export", "x.csv", d);
+    const init = (d.fetchImpl as unknown as { mock: { calls: [string, RequestInit][] } }).mock
+      .calls[0]![1];
+    expect((init.headers as Record<string, string>)["x-ledgerly-inline"]).toBe("1");
+  });
+
+  /** The browser-tab path must NOT ask for inline — there the browser is doing
+   *  the saving, and an inline CSV would render as text instead. */
+  it("does not ask for inline on the tab path", async () => {
+    const d = deps({ installed: false });
+    await saveExport("/api/projects/p/export", "x.csv", d);
+    expect(d.fetchImpl).not.toHaveBeenCalled();
   });
 
   /** Dismissing the sheet is a completed interaction. Falling through to a
@@ -165,12 +189,21 @@ describe("saveExport — an installed app", () => {
     expect(result).toEqual({ ok: false, message: "The export failed (500)." });
   });
 
-  /** A silent failure is the one kind this bug was. */
-  it("reports a network failure rather than resolving quietly", async () => {
+  /**
+   * A silent failure is the one kind this bug was — and a failure that names
+   * itself is the difference between one round trip and three. The first
+   * version said only "check your connection", which was a guess dressed as a
+   * diagnosis: the request was reaching the server perfectly well.
+   */
+  it("reports the underlying error rather than guessing at the cause", async () => {
     const d = deps({
-      fetchImpl: (() => Promise.reject(new Error("offline"))) as unknown as typeof fetch,
+      fetchImpl: (() => Promise.reject(new TypeError("Load failed"))) as unknown as typeof fetch,
     });
     const result = await saveExport("/api/projects/p/export", "x.csv", d);
+
     expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain("TypeError");
+    expect(result.message).toContain("Load failed");
   });
 });

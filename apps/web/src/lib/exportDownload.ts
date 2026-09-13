@@ -119,12 +119,27 @@ export async function saveExport(
 
   let response: Response;
   try {
-    // `same-origin` credentials so the Cloudflare Access cookie rides along —
-    // the same property the anchor had for free, and the one thing a `fetch`
-    // rewrite could plausibly have broken.
-    response = await deps.fetchImpl(url, { credentials: "same-origin" });
-  } catch {
-    return { ok: false, message: "Could not reach the server. Check your connection." };
+    response = await deps.fetchImpl(url, {
+      // `same-origin` credentials so the Cloudflare Access cookie rides along —
+      // the same property the anchor had for free, and the one thing a `fetch`
+      // rewrite could plausibly have broken.
+      credentials: "same-origin",
+      // Ask the server NOT to mark this an attachment. WebKit hands an
+      // attachment response to its download machinery before the JavaScript
+      // that asked for it can see the body, and an installed app has no
+      // download UI to hand it to — so the fetch rejects and nothing arrives.
+      // This is the request that is going to save the file itself, so it wants
+      // the bytes, not a download (D-49).
+      headers: { "x-ledgerly-inline": "1" },
+    });
+  } catch (error) {
+    // The underlying reason is included. The first version of this said only
+    // "check your connection", which was a guess dressed as a diagnosis — the
+    // request was reaching the server perfectly well and being diverted after
+    // it arrived. A failure that names itself is the difference between one
+    // round trip and three.
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    return { ok: false, message: `The export could not be downloaded (${detail}).` };
   }
 
   if (!response.ok) {
