@@ -126,6 +126,174 @@ describe("scrubLuhnSequences", () => {
   });
 });
 
+/**
+ * Phase 10a finding F-23. The candidate-region pattern was `[\d\s-]` --
+ * digits, whitespace and ASCII hyphen only -- so a PAN written with any
+ * other separator split into four four-digit runs, every one of them below
+ * the 13-digit floor, and the sliding Luhn window never looked at it. Each
+ * case below was confirmed to LEAK on the previous implementation.
+ *
+ * These are regression tests in the strict sense: they fail on the code as
+ * it shipped through Phase 9.
+ */
+describe("scrubLuhnSequences: separator and numeral coverage (F-23)", () => {
+  const SEPARATED: ReadonlyArray<[string, string]> = [
+    ["full stop", "4111.1111.1111.1111"],
+    ["solidus", "4111/1111/1111/1111"],
+    ["reverse solidus", "4111\\1111\\1111\\1111"],
+    ["asterisk", "4111*1111*1111*1111"],
+    ["underscore", "4111_1111_1111_1111"],
+    ["vertical bar", "4111|1111|1111|1111"],
+    ["hyphen U+2010", "4111\u20101111\u20101111\u20101111"],
+    ["non-breaking hyphen U+2011", "4111\u20111111\u20111111\u20111111"],
+    ["figure dash U+2012", "4111\u20121111\u20121111\u20121111"],
+    ["en dash U+2013", "4111\u20131111\u20131111\u20131111"],
+    ["em dash U+2014", "4111\u20141111\u20141111\u20141111"],
+    ["horizontal bar U+2015", "4111\u20151111\u20151111\u20151111"],
+    ["minus sign U+2212", "4111\u22121111\u22121111\u22121111"],
+    ["middle dot U+00B7", "4111\u00b71111\u00b71111\u00b71111"],
+    ["bullet U+2022", "4111\u20221111\u20221111\u20221111"],
+    ["hyphenation point U+2027", "4111\u20271111\u20271111\u20271111"],
+    ["no-break space U+00A0", "4111\u00a01111\u00a01111\u00a01111"],
+    ["narrow no-break space U+202F", "4111\u202f1111\u202f1111\u202f1111"],
+    ["thin space U+2009", "4111\u20091111\u20091111\u20091111"],
+    ["newline (a line wrap)", "4111\n1111\n1111\n1111"],
+    ["mixed separators", "4111-1111.1111 1111"],
+  ];
+
+  it.each(SEPARATED)("redacts a PAN separated by %s", (_label, written) => {
+    const { scrubbed, redactions } = scrubLuhnSequences({ user_notes: written });
+    expect(redactions).toBe(1);
+    expect((scrubbed as { user_notes: string }).user_notes).toBe("[REDACTED-CARD-NUMBER]");
+  });
+
+  // NFKC folds fullwidth digits to ASCII but does nothing for these, so the
+  // old implementation never saw them as digits at all.
+  const NUMERALS: ReadonlyArray<[string, string]> = [
+    [
+      "Arabic-Indic",
+      "\u0664\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661\u0661",
+    ],
+    [
+      "Extended Arabic-Indic",
+      "\u06f4\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1\u06f1",
+    ],
+    [
+      "Devanagari",
+      "\u096a\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967\u0967",
+    ],
+    [
+      "Bengali",
+      "\u09ea\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7\u09e7",
+    ],
+    [
+      "Thai",
+      "\u0e54\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51\u0e51",
+    ],
+    [
+      "fullwidth",
+      "\uff14\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11",
+    ],
+  ];
+
+  it.each(NUMERALS)("redacts a PAN written in %s numerals", (_label, written) => {
+    const { redactions } = scrubLuhnSequences({ merchant_address: written });
+    expect(redactions).toBe(1);
+  });
+
+  it("redacts a 15-digit Amex in its conventional 4-6-5 grouping", () => {
+    const { scrubbed, redactions } = scrubLuhnSequences("3782 822463 10005");
+    expect(redactions).toBe(1);
+    expect(scrubbed).toBe("[REDACTED-CARD-NUMBER]");
+  });
+
+  // The other half of the trade. Widening the separator class lets the
+  // window join up more digits, so the characters that most often group
+  // NON-card numbers are deliberately excluded -- see the note beside the
+  // separator tiers. Without that exclusion a comma list or a timestamp
+  // becomes a redaction.
+  // The regression the FIRST attempt at F-23 introduced, which matters more
+  // than the leak it closed. Admitting "." as a separator unconditionally
+  // made a whitespace-separated price list ONE contiguous digit region, and
+  // a sliding Luhn window over ~18 digits finds a "valid" span with
+  // probability near 1. A user typing prices into a receipt note watched
+  // them become [REDACTED-CARD-NUMBER] -- silently, and with no undo.
+  //
+  // Every case here was measured MANGLED by that attempt.
+  const PRICE_LISTS: ReadonlyArray<[string, string]> = [
+    ["space-separated prices", "Items: 12.99 4.50 3.25 8.75 1.99 6.20"],
+    ["round amounts", "prices 10.00 20.00 30.00 40.00 5.99"],
+    ["one per line", "split across lines:\n12.50\n33.10\n44.20\n9.99\n1.25"],
+    ["a running tally", "8.99 + 12.00 + 3.50 + 44.25 + 1.75 + 6.00"],
+    ["quantities and prices", "2 x 3.99  1 x 12.50  4 x 0.99  3 x 22.10"],
+  ];
+
+  it.each(PRICE_LISTS)("leaves %s alone", (_label, written) => {
+    const { scrubbed, redactions } = scrubLuhnSequences({ user_notes: written });
+    expect(redactions).toBe(0);
+    expect((scrubbed as { user_notes: string }).user_notes).toBe(written);
+  });
+
+  // Judging plausibility per REGION rather than per candidate span would
+  // miss this: the region carries a 2-digit group that has nothing to do
+  // with the card.
+  it("still finds a separated PAN that follows an unrelated short number", () => {
+    const { scrubbed, redactions } = scrubLuhnSequences("order 12 card 4111.1111.1111.1111");
+    expect(redactions).toBe(1);
+    expect(scrubbed).toBe("order 12 card [REDACTED-CARD-NUMBER]");
+  });
+
+  // Card lengths that are not a multiple of four end in a short remainder
+  // when written in the usual groups of four. Requiring EVERY group to meet
+  // the floor rejected all of these outright, so a Luhn-valid PAN reached
+  // extraction_raw, user_notes, the export and the backup archive in
+  // cleartext. Only the final group is exempt -- a price list puts its
+  // 2-digit cents group in the middle of the span too, so it still fails.
+  const SHORT_FINAL_GROUP: ReadonlyArray<[string, string]> = [
+    ["13-digit, full stops", "4307.4185.2963.7"],
+    ["14-digit Diners shape, full stops", "3056.3074.1852.90"],
+    ["17-digit, solidus", "4307/4185/2963/0741/6"],
+    ["18-digit Maestro shape, asterisk", "4307*4185*2963*0741*89"],
+  ];
+
+  it.each(SHORT_FINAL_GROUP)("redacts a %s PAN", (_label, written) => {
+    const { redactions } = scrubLuhnSequences({ user_notes: written });
+    expect(redactions).toBe(1);
+  });
+
+  const MUST_SURVIVE: ReadonlyArray<[string, string]> = [
+    ["a money amount", "Total 1,234.56 plus tax 98.76"],
+    ["a timestamp", "12:34:56 on 2026-09-13"],
+    ["a comma-separated reference list", "refs 1234, 5678, 9012, 3456"],
+    ["a phone number", "+1 555 010 4477"],
+    ["a short order number", "order 12345"],
+    ["a non-Luhn 16-digit run", NON_LUHN_16_DIGITS],
+  ];
+
+  it.each(MUST_SURVIVE)("leaves %s untouched", (_label, written) => {
+    const { scrubbed, redactions } = scrubLuhnSequences(written);
+    expect(redactions).toBe(0);
+    expect(scrubbed).toBe(written);
+  });
+
+  it("emits non-redacted text verbatim, including non-ASCII digits", () => {
+    // Scanning transliterates, but output must not: a Devanagari invoice
+    // number that is not a card has to come back exactly as it went in.
+    const written = "invoice \u0967\u0968\u0969 for \u20b91,200";
+    const { scrubbed, redactions } = scrubLuhnSequences(written);
+    expect(redactions).toBe(0);
+    expect(scrubbed).toBe(written);
+  });
+
+  it("redacts each of two PANs in one string independently", () => {
+    const { scrubbed, redactions } = scrubLuhnSequences(
+      "old 4111.1111.1111.1111 new 5555-5555-5555-4444",
+    );
+    expect(redactions).toBe(2);
+    expect(scrubbed).toBe("old [REDACTED-CARD-NUMBER] new [REDACTED-CARD-NUMBER]");
+  });
+});
+
 describe("normalizeCardLast4", () => {
   it("accepts exactly 4 digits", () => {
     expect(normalizeCardLast4("1234")).toBe("1234");

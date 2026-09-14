@@ -47,14 +47,23 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    # No `user:` override here — the container starts as root, and
-    # entrypoint.sh chowns the volumes then drops to `node` via su-exec,
-    # but only after checking `id -u` (Forkd took a production 502 on
-    # exactly this — docker/entrypoint.sh, task 2.10). Both this default
-    # path and an explicit `user: "1000:1000"` override are tested.
+    # No `user:` override here — the image itself declares `USER node`
+    # (F-31), so the container starts unprivileged and entrypoint.sh takes
+    # its already-non-root branch and execs straight through. That branch
+    # exists because Forkd took a production 502 calling su-exec
+    # unconditionally (docker/entrypoint.sh, task 2.10); both it and the
+    # root-start path are still tested.
+    #
+    # F-31: defence in depth around that. `no-new-privileges` stops any
+    # setuid binary in the image from regaining root, and the app needs no
+    # Linux capabilities at all — it binds 3000, not a privileged port.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:7456ef82e5f5bc43d997f4781bbd7c0d6389bff397564649a356e206ba473aee
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -69,7 +78,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:8-alpine
+    image: redis:8-alpine@sha256:9c3ecc609a8087c0f11c494fefaf37a8f7bf9a967631d4a0da8967a9810be354
     restart: unless-stopped
     volumes:
       - redis_data:/data

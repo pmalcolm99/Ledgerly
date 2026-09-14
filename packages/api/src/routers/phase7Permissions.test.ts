@@ -522,27 +522,74 @@ describe("categories", () => {
   });
 });
 
-describe("users.list", () => {
-  it("is refused to members who cannot manage anyone", async () => {
+/**
+ * Phase 10a finding F-15. These used to assert a `manage`-or-owner gate.
+ * The gate was real code but not a real control: `projects.create` is an
+ * ungated `protectedProcedure` and a project's owner qualifies for
+ * `manage` on it, so a `read` member could self-grant in one extra call.
+ * The old "is refused to members who cannot manage anyone" test passed
+ * only because it never made that second call.
+ *
+ * The gate is now gone and the disclosure is documented instead (D-33).
+ * The test that matters is the one that would have caught the original
+ * defect: proving the escalation sequence is a no-op because there is
+ * nothing left to escalate to.
+ */
+/**
+ * The capability probe `MemberManager` renders its controls from. It exists
+ * because the component used to infer the answer from `users.list` returning
+ * FORBIDDEN, and F-15 removed that gate -- leaving every read-only member
+ * looking at member-management controls the server would refuse on click.
+ *
+ * Untested, this would regress to exactly that symptom with nothing to catch
+ * it, so the levels are asserted explicitly.
+ */
+describe("members.canManage", () => {
+  it("is false for members below `full`", async () => {
     for (const actor of [actors.read, actors.readAdd]) {
-      await expect(callerFor(actor).users.list()).rejects.toMatchObject({ code: "FORBIDDEN" });
+      await expect(callerFor(actor).members.canManage({ projectId })).resolves.toBe(false);
     }
   });
 
-  it("is allowed to full members and the project owner", async () => {
-    for (const actor of [actors.full, actors.projectOwner]) {
+  it("is true for `full` members, the project owner and the instance owner", async () => {
+    for (const actor of [actors.full, actors.projectOwner, actors.instanceOwner]) {
+      await expect(callerFor(actor).members.canManage({ projectId })).resolves.toBe(true);
+    }
+  });
+
+  it("is false, not an error, for a project the caller cannot see at all", async () => {
+    const outsider = await callerFor(actors.instanceOwner).projects.create({
+      name: "somewhere else",
+    });
+    await expect(
+      callerFor(actors.read).members.canManage({ projectId: outsider.id }),
+    ).resolves.toBe(false);
+  });
+
+  it("agrees with what members.add actually allows", async () => {
+    // The point of the probe: it must not drift from the mutation it gates.
+    for (const actor of [actors.read, actors.readAdd, actors.full]) {
+      const allowed = await callerFor(actor).members.canManage({ projectId });
+      const attempt = callerFor(actor).members.add({
+        projectId,
+        userId: actors.instanceOwner.id,
+        permission: "read",
+      });
+      if (allowed) await expect(attempt).resolves.toBeDefined();
+      else await expect(attempt).rejects.toMatchObject({ code: expect.any(String) });
+    }
+  });
+});
+
+describe("users.list", () => {
+  it("is allowed to every onboarded member, at any permission level", async () => {
+    for (const actor of [actors.read, actors.readAdd, actors.full, actors.projectOwner]) {
       await expect(callerFor(actor).users.list()).resolves.toEqual(
         expect.arrayContaining([expect.objectContaining({ id: actors.read.id })]),
       );
     }
   });
 
-  /**
-   * The trap the `role = 'owner'` disjunct exists for: scopedProjects
-   * short-circuits the instance owner to every live project, but on a fresh
-   * instance there are none, so a pure "do you manage anything" gate would
-   * hand the owner an empty picker exactly when they are setting things up.
-   */
   it("is allowed to the instance owner even with no projects at all", async () => {
     await db.delete(receipts);
     await db.delete(schema.projectMembers);
@@ -550,6 +597,20 @@ describe("users.list", () => {
     await expect(callerFor(actors.instanceOwner).users.list()).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ id: actors.read.id })]),
     );
+  });
+
+  /**
+   * The regression guard for F-15 itself. Creating a project must not
+   * change what the directory returns -- if it ever does again, a gate has
+   * been reintroduced that a caller can satisfy on demand.
+   */
+  it("returns the same rows before and after the caller creates a project", async () => {
+    const caller = callerFor(actors.read);
+    const before = await caller.users.list();
+    const created = await caller.projects.create({ name: "self-grant probe" });
+    const after = await caller.users.list();
+    expect(after).toEqual(before);
+    await caller.projects.delete({ id: created.id });
   });
 
   it("never returns role or other admin-surface fields", async () => {

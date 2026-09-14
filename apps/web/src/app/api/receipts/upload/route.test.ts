@@ -329,6 +329,94 @@ describe("POST /api/receipts/upload -- request-size guards (H-1)", () => {
     expect(response.status).toBe(413);
   });
 
+  /**
+   * Phase 10a finding F-7. The header check above was the ONLY guard that
+   * ran before `formData()`, and it read
+   * `Number(request.headers.get("content-length") ?? "")`. With no such
+   * header that is `Number("")` -- zero -- which is finite and below any
+   * ceiling, so the request went straight through and the whole body was
+   * buffered. A chunked upload therefore had no size bound at all.
+   *
+   * This is the case the old test could not see, because it always set the
+   * header.
+   */
+  it("bounds a body that declares no Content-Length at all", async () => {
+    const { project } = await createTestProjectWithMembers(db, {
+      ownerKey: "owner-f7a",
+      members: [],
+    });
+
+    // A streamed body with no Content-Length -- exactly what
+    // `Transfer-Encoding: chunked` produces. It is larger than the ceiling
+    // the tiny MAX_UPLOAD_BYTES below implies.
+    const oversized = new Uint8Array(256 * 1024).fill(65);
+    const boundary = "----ledgerlyF7";
+    const head = new TextEncoder().encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="projectId"\r\n\r\n${project.id}\r\n` +
+        `--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="big.jpg"\r\n` +
+        `Content-Type: image/jpeg\r\n\r\n`,
+    );
+    const tail = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(head);
+        controller.enqueue(oversized);
+        controller.enqueue(tail);
+        controller.close();
+      },
+    });
+
+    const request = new Request("http://localhost/api/receipts/upload", {
+      method: "POST",
+      headers: new Headers({
+        "cf-access-jwt-assertion": "sub-owner-f7a",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      }),
+      body: stream,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+
+    expect(request.headers.get("content-length")).toBeNull();
+
+    const response = await handleUpload(request, {
+      db,
+      // Ceiling = 100 * 60 + 64 KiB framing allowance, well under the
+      // 256 KiB this request actually sends.
+      env: { ...testEnv(), MAX_UPLOAD_BYTES: 100 },
+    });
+    expect(response.status).toBe(413);
+
+    const rows = await db.select().from(receipts).where(eq(receipts.projectId, project.id));
+    expect(rows).toHaveLength(0);
+  });
+
+  it("still accepts a normal chunked body that is within the ceiling", async () => {
+    const { project } = await createTestProjectWithMembers(db, {
+      ownerKey: "owner-f7b",
+      members: [],
+    });
+    const formData = new FormData();
+    formData.set("projectId", project.id);
+    formData.append("files", await jpegFile("ok.jpg"));
+    // Round-tripping through Request.body strips Content-Length, giving a
+    // genuinely chunked request that must still succeed.
+    const framed = new Request("http://localhost/x", { method: "POST", body: formData });
+    const request = new Request("http://localhost/api/receipts/upload", {
+      method: "POST",
+      headers: new Headers({
+        "cf-access-jwt-assertion": "sub-owner-f7b",
+        "content-type": framed.headers.get("content-type") ?? "",
+      }),
+      body: framed.body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+
+    const response = await handleUpload(request, { db, env: testEnv() });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { results: Array<{ ok: boolean }> };
+    expect(body.results[0]?.ok).toBe(true);
+  });
+
   it("returns 413 for more files than MAX_FILES_PER_BATCH", async () => {
     const { project } = await createTestProjectWithMembers(db, {
       ownerKey: "owner12",

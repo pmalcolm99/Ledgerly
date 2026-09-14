@@ -186,6 +186,30 @@ if (!toolsPresent) {
   );
 }
 
+/**
+ * Phase 10a finding F-30: leave PROOF that the drill ran.
+ *
+ * A warning on stderr was an improvement on a silent skip, but it was still
+ * only a warning -- and the CI step that installs the PostgreSQL client is
+ * `continue-on-error: true` (deliberately: a PGDG outage should not take the
+ * whole pipeline down). Put together, an apt failure, a runner image change
+ * or a key rotation would stop the one check that proves a backup can
+ * actually be restored, and `pnpm test` would still read green. That is the
+ * precise failure mode Phase 9 exists to prevent, reappearing one level up.
+ *
+ * So the drill now writes a marker when it genuinely executes, and CI fails
+ * the job if the marker is absent. The test suite stays runnable on a laptop
+ * without libpq -- it skips, as before -- but CI can no longer skip it
+ * quietly.
+ */
+const DRILL_MARKER_PATH = process.env.RESTORE_DRILL_MARKER ?? null;
+
+async function recordDrillRan(detail: string): Promise<void> {
+  if (DRILL_MARKER_PATH === null) return;
+  await fs.mkdir(path.dirname(DRILL_MARKER_PATH), { recursive: true });
+  await fs.appendFile(DRILL_MARKER_PATH, `${new Date().toISOString()} ${detail}\n`, "utf8");
+}
+
 describe.skipIf(!toolsPresent)("backup → restore round trip", () => {
   let versionsCompatible = true;
 
@@ -235,6 +259,14 @@ describe.skipIf(!toolsPresent)("backup → restore round trip", () => {
   });
 
   it("restores into a scratch database with row counts matching the manifest", async (ctx) => {
+    // The drill marker is written at the END of this test, not here. Placing
+    // it after the version skip was necessary but not sufficient: written at
+    // the top it would mean "the drill started", while the comment on it --
+    // and the CI step that trusts it -- claim "a dump was taken, restored,
+    // and its row counts checked". Only the last line can honestly say that.
+    //
+    // It is written by THIS test specifically; the two negative tests below
+    // prove the guard rails, not that a restore works.
     if (!versionsCompatible) return ctx.skip();
     // Data with enough shape that a restore losing one table would be visible:
     // two projects, a member, receipts across statuses, and line items.
@@ -378,6 +410,12 @@ describe.skipIf(!toolsPresent)("backup → restore round trip", () => {
       } finally {
         await fs.rm(restoredUploads, { recursive: true, force: true });
       }
+
+      // LAST. Every assertion above has now passed, so the marker means what
+      // the CI step reads it as: a dump was taken, restored, and its row
+      // counts and contents checked. Written at the top of the test it would
+      // have meant only "the drill started".
+      await recordDrillRan("backup-round-trip restored into a scratch database");
     } finally {
       await fs.rm(extracted, { recursive: true, force: true });
     }

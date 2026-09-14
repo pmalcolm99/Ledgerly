@@ -4,22 +4,347 @@ Updated at the end of every phase. Read this first in any new session.
 
 ## Current phase
 
-**Phase 9 — Backup and restore. Complete, reviewed, and GATED.** The gate is
-"the restore drill succeeds on a scratch database", and it did — the numbers are
-below and in `docs/private/PHASE9_RESTORE_DRILL.md` (gitignored).
+**Phase 10 — Security review, documentation, and v1.0.0. Complete.**
 
-Since then, outside the phase sequence: the automatic receipt email (D-44
-follow-up), two rounds on discount receipts, the admin Logs tab plus a build
-version (D-46), a nine-part batch covering editable AI settings, three misread
-receipt shapes, the project page, and holding the automatic email until a
-receipt has been reviewed (D-47), a verbose log level (D-48), and the iOS
-export download (D-49). All committed; all described below, newest
-first.
+Phase 10a audited the whole codebase against a 24-item checklist, using five
+`reviewer` subagents on clean contexts (authentication, authorization, upload
+handling, AI integration, export/backup), plus a secret scan over the entire
+git history rather than just the working tree.
+
+**Result: 43 findings — 1 HIGH, 10 MEDIUM, 21 LOW, 11 INFO. Checklist 15 PASS /
+8 PARTIAL / 1 FAIL.** Phase 10b fixed the HIGH and all ten MEDIUMs; the LOW and
+INFO tiers are listed below, undecided, for the next session.
+
+**Git history is clean.** All 43 commits and 688 text blobs swept for provider
+tokens, JWTs, private keys, AUD-shaped hex, hostnames, credentials and
+addresses. Every hit was a test fixture, an all-zeros placeholder, or the CI
+throwaway `ledgerly:ledgerly`. `docs/private/` has never been tracked at any
+point (`git log --all --full-history` returns nothing), and `.env`, `/data/`,
+`/backups/` and `docs/private/` were all in the first commit's `.gitignore`.
 
 Phase 8's gate stays half-closed on the Excel half, Phase 7's on the on-device
 check, and Phase 6's on the two live-API tasks (6.3, 6.12) that need a real
-`ANTHROPIC_API_KEY`; D-12 stays Provisional. All three are unchanged by this
-phase and still listed under "Blocked / open questions".
+`ANTHROPIC_API_KEY`; D-12 stays Provisional. Phase 10 did not change any of
+them; they remain under "Blocked / open questions".
+
+## Phase 10b — what was fixed
+
+**F-23 (HIGH) — the Luhn scrub was bypassable with any separator but space or
+ASCII hyphen.** `DIGIT_RUN_PATTERN` was `/\d(?:[\d\s-]*\d)?/g`, so
+`4111.1111.1111.1111` split into four four-digit runs, each below the 13-digit
+floor, and the sliding window never examined it. Dot, slash, asterisk, en
+dash, em dash, middot and underscore all leaked; so did every non-ASCII
+numeral system, because `normalize("NFKC")` folds fullwidth digits but not
+Arabic-Indic.
+
+This mattered more than "the model might transcribe a PAN oddly": the scrub is
+also the **only** guard on free text a person types (`receipts.update` runs it
+over `userNotes`), and `user_notes` flows into the CSV/XLSX export and the
+backup archive. It was a direct violation of CLAUDE.md's hard rule.
+
+Rewritten to walk code points with a parallel classification — an explicit
+Unicode decade table for digit values, a defined separator set — rather than a
+regex over the raw string. Output outside a redacted span is emitted verbatim,
+so a Devanagari invoice number that is not a card comes back untouched. `,` and
+`:` are deliberately **excluded** from the separator set: both are far more
+common as ordinary group separators (thousands, times) than as card
+separators, and admitting them would join unrelated numbers in a comma list.
+
+Verified by executing the real module, not a reimplementation. 51 tests.
+
+**F-7 (MEDIUM) — the upload body guard was a no-op without `Content-Length`.**
+It read `Number(headers.get("content-length") ?? "")`; with the header absent
+that is `Number("")`, i.e. `0`, which is finite and below any ceiling, so a
+chunked body went straight through to `formData()` unbounded. The ceiling it
+did enforce was ~3 GB, and the `MAX_FILES_PER_BATCH` check its own comment
+claimed ran "before `formData()`" in fact ran fourteen lines after it.
+
+The cap is now enforced on the **stream**, via a counting `TransformStream`
+piped into a reconstructed `Request`. A `MULTIPART_FRAMING_ALLOWANCE` was
+needed because the ceiling derives from the per-file cap and a multipart body
+is always larger than the sum of its files — without it, a small
+`MAX_UPLOAD_BYTES` produced a ceiling below the framing of a single part.
+
+**F-8 (MEDIUM) — a failed ingest leaked the raw upload forever.**
+`staging.bin` is the upload exactly as it arrived, EXIF and GPS included. It
+was consumed only on the success path; the `failed` handler left it, and
+nothing ever came back — `reconcilePendingReceipts` only revisits `pending`
+rows. The file was immortal and `BACKUP_INCLUDE_IMAGES` carried it into every
+archive. Now discarded on terminal failure, with a log line saying so.
+
+**F-9 (MEDIUM) — uploads hung forever when Redis was down.**
+`maxRetriesPerRequest: null` plus ioredis's default offline queue means `eval`
+neither resolves nor rejects. Fail-closed was right; failing closed _slowly_
+was not. Bounded at 3s, mapped to a 503.
+
+**F-10 (MEDIUM) — retained originals kept their GPS tag.** The retain path was
+a bare `rename`, so `original.<ext>` carried the full EXIF block and was
+servable to any project member with `manage`. New
+`pipeline/stripMetadata.ts`: lossless container surgery for JPEG (APP1/APP2),
+PNG (`eXIf`) and WebP (RIFF `EXIF`), so the pixel data stays **bit-identical**
+and D-09's fidelity intent survives; sharp re-encode for TIFF/HEIC; PDF
+passthrough. A HEIC that cannot round-trip as HEIF becomes a quality-100 JPEG
+and `original_key` records `jpg` — the extension must never disagree with the
+contents. D-09 amended.
+
+**F-15 (MEDIUM) — the `users.list` gate was self-grantable.** It required
+`manage` on some project, but `scopedProjects(user,"manage")` qualifies a
+project's **owner** at every level and `projects.create` is an ungated
+`protectedProcedure`. Any caller could satisfy it in one extra call. The
+permission test asserted the refusal and never made that second call, so it
+passed for all of Phases 7–9 while the control did not hold.
+
+Per an explicit user decision, the gate was **removed** rather than patched: no
+gate here can be meaningful while project creation is unrestricted, and a
+control anyone can satisfy is worse than none because it stops the next
+reviewer looking. D-33 amended to describe the disclosure accurately. The
+replacement test asserts the directory is identical before and after the caller
+creates a project.
+
+**F-24 (MEDIUM) — a non-string model field threw after a billed call.** The
+normalizers declared `string | null | undefined` — a promise the compiler kept
+and the model did not. `normalizeMoney(12.34)` threw `raw.replace is not a
+function`, BullMQ retried twice, and the receipt terminated `failed` with zero
+extracted data after three paid calls: exactly what ARCHITECTURE.md §6.3
+forbids. This is the same class of hole as 70feaed's `undefined` bug, one rung
+up. Normalizers now take `unknown` and funnel through `asModelString`;
+`extract.ts` gained `asModelText` for the four passthrough text fields the item
+mapper already guarded and the receipt level did not.
+
+**F-30 (MEDIUM) — CI could skip the restore drill and still go green.** The
+skip was announced on stderr, which was better than silence but was still a
+skip, and the PGDG install step is `continue-on-error` on purpose. The drill
+now writes a marker when it genuinely runs — placed **after** the
+`versionsCompatible` skip, since a drill that bailed on a version mismatch has
+proved nothing — and CI fails the job if the marker is absent.
+
+**F-31 (MEDIUM) — no `USER` directive.** The privilege drop in `entrypoint.sh`
+was correct for the `CMD` path, but the image's declared user was root, so
+`docker compose exec`, the healthcheck and `docker run --entrypoint` all ran as
+uid 0 on a root-writable `/app`. Added `USER node`, plus
+`no-new-privileges:true` and `cap_drop: ALL` in compose.
+
+**F-32 (MEDIUM) — everything was a floating tag.** Base images now pinned by
+`@sha256:` index digest; CI publishes `:${github.sha}` alongside `:latest`, so
+rollback finally has a target. `GIT_SHA` was already threaded through the build
+for the in-app version stamp — it just was not used as a tag.
+
+**F-33 (MEDIUM) — archives were more permissive than their own manifest.**
+`manifest.json` was written `0600` while the `.tgz` containing it inherited the
+umask, typically `0644`. Both the archive and its `.sha256` sidecar are now
+`0600`. Encryption was deliberately **not** added: it needs a key distinct from
+`MASTER_KEY` and a restore path that can find it, which is an operator
+decision. `DEPLOYMENT.md` states the position plainly rather than implying more
+safety than exists.
+
+## Phase 10b — the fixes were reviewed, and three of them were wrong
+
+CLAUDE.md mandates a `reviewer` pass over any auth, upload or AI-integration
+diff before committing. This diff was all three, and the pass earned its keep:
+it returned **3 HIGH and 5 MEDIUM defects in the fixes themselves**. Worth
+recording in full, because two of them were worse than the findings they were
+meant to close.
+
+**The F-23 scrub fix destroyed ordinary receipt text.** Admitting `.` as a
+separator unconditionally made a whitespace-separated price list ONE
+contiguous digit region, and a sliding Luhn window over ~18 digits finds a
+"valid" span with probability near 1. Measured:
+
+```
+"Items: 12.99 4.50 3.25 8.75 1.99 6.20"  ->  "Items: 1[REDACTED-CARD-NUMBER].20"
+"prices 10.00 20.00 30.00 40.00 5.99"    ->  "prices [REDACTED-CARD-NUMBER]9"
+```
+
+A user typing prices into a receipt note would have watched them vanish,
+silently and with no undo, and the same applies to `merchant_address` and item
+descriptions coming back from the model. The original comment called this
+trade "a data-quality annoyance" — reasoning that had been done about
+_unrelated long digit strings_, and was simply carried over to the ordinary
+price lists that are this app's entire domain.
+
+Separators are now two-tier. BASIC (whitespace, dashes) join as they always
+have. EXTENDED (`.` `/` `\` `*` `_` `|` and the dot-like marks) require the
+span to also LOOK like a card: exactly one distinct extended separator
+character, and every digit group at least three long. Cards group in 4s, or
+4-6-5 for Amex; money always ends in a 2-digit cents group, so a price list
+fails on the cents.
+
+Critically the check runs **per candidate span inside the window loop**, not
+per region. Judging a whole region would have missed the card in `order 12
+card 4111.1111.1111.1111`, where the region carries a 2-digit group that has
+nothing to do with the number. Measured linear: 20 000 digits in ~7 ms.
+
+**The F-10 JPEG strip left GPS in the file it stored.** It treated
+Start-of-Scan as "everything from here to EOF is image data" and copied it
+verbatim. A modern phone JPEG does not end at its first EOI: Apple appends an
+MPF gain-map JPEG and Samsung a motion-photo MP4, and an appended JPEG carries
+its OWN complete APP1 — a second EXIF block, GPS included. So for exactly the
+file the finding was about, the function reported `method: "lossless"` and
+stored the coordinates. Verified by building a JPEG with an appended
+GPS-bearing JPEG: the marker string survived.
+
+The scan is now walked to the marker that terminates it — skipping `FF00`
+stuffing, `FFD0`–`FFD7` restarts and `FFFF` fill — which also handles a
+progressive JPEG's multiple scans. Everything after the terminating EOI is
+dropped, and the method says `lossless-trailer-dropped` rather than claiming a
+byte-identity it no longer has.
+
+The same review found all three walkers would happily emit a structurally
+empty file and call it `lossless`: a 2-byte "JPEG" (SOI only), an 8-byte
+"PNG", a 12-byte "WebP" — written to disk by `ingest.ts` and served with a
+real `Content-Type`. Each walker now asserts a structural minimum and returns
+`null` so the sharp fallback runs. And the WebP path cleared the EXIF chunk
+while leaving the VP8X `E` flag set, describing a chunk that was no longer
+there.
+
+**F-24 was incomplete, in the same file it had just fixed.** `pricedItems`
+still did `item.line_total ?? null` five lines from a `mapItems` that already
+guarded it, feeding `parseMoney` → `.trim()`. A numeric `line_total` is the
+single most likely non-string the model emits, and the throw landed OUTSIDE
+`retryIfItemsDoNotReconcile`'s try block — in a function whose docblock says
+"Never throws." Both `subtotal ?? null` sites had the same shape.
+`normalizeCardLast4` was also still accepting non-strings, because
+`RegExp.test` stringifies its argument: `/^\d{4}$/.test(["1234"])` is `true`,
+and the array was returned as if it were a string.
+
+**And removing the `users.list` gate broke a UI that used it as a capability
+probe.** `MemberManager` asked "can I manage members?" by calling `users.list`
+and reading a FORBIDDEN as "no" — the directory and the mutations happened to
+sit behind the same gate. With the gate gone the probe said yes to everyone,
+so a read-only member saw permission dropdowns, remove buttons and a picker
+listing every user on the instance. Not privilege escalation — the mutations
+still refused — but a broken UI, and it turned an API-level disclosure into
+something rendered in front of every member. There is now a `members.canManage`
+procedure that composes the same scope the mutations gate on, so the answer
+cannot drift from what they allow.
+
+Also corrected: the upload body ceiling was ~3 GB and `formData()` buffers the
+whole body before the rate limit is consulted (now hard-capped at 512 MiB);
+the F-8 staging cleanup was conditional on the status UPDATE succeeding, so a
+connection blip still leaked the file forever (the projectId is now read
+separately); the restore-drill marker was written at the TOP of the test, so
+it meant "the drill started" rather than what CI reads it as (moved to the
+last line, after every assertion); and `USER node` removed the entrypoint's
+self-healing `mkdir` for bind mounts.
+
+**The lesson worth keeping.** Both HIGH defects were comment-vs-code drift of
+the same kind the audit itself found twice — a comment asserting a property
+the code did not have, written by someone who had reasoned carefully about a
+_different_ case. A fix is a change like any other, and "it closes the
+finding" is not the same as "it is correct".
+
+## Phase 10b — and the corrections were reviewed too, which also paid
+
+A second `reviewer` pass over the corrections found three more MEDIUMs. The
+most useful thing it caught was not a logic error at all:
+
+**One correction had never been applied.** The claim was that F-8's staging
+cleanup no longer depended on the status UPDATE succeeding, because the
+`projectId` was read in its own `SELECT` first. It was not — the patch had
+been in a script that aborted on an earlier assertion, so it never wrote, and
+the failure was reported as a success. The reviewer read the tree rather than
+the claim. (Partial mitigation nobody had noticed either way: a failed UPDATE
+leaves the row `pending`, so `reconcilePendingReceipts` re-enqueues it and the
+file is usually reclaimed on the next worker start.)
+
+**The WebP walker had the same trailer defect the JPEG walker had just been
+fixed for.** Its chunk loop was bounded by the buffer rather than by the RIFF
+size at offset 4, so an appended WebP was parsed as further top-level chunks,
+kept, and then _covered_ by the rewritten size field — a second file's entire
+EXIF block preserved and reported as a lossless strip. Fixing one walker and
+not looking at its two siblings is exactly the kind of thing a second pass is
+for.
+
+**And the plausibility rule leaked a whole class of card.** Requiring _every_
+digit group to be at least three digits rejected any card whose length is not
+a multiple of four when written in the usual groups of four: 13-digit Visa
+(`4307.4185.2963.7`), 14-digit Diners, 17- and 18-digit Maestro. Only the
+FINAL group is exempt now — which keeps price lists out regardless, because
+money puts a 2-digit cents group in the middle of the span as well as at the
+end.
+
+Also closed: PNG trailers were dropped while reporting `droppedTrailer:
+false`; an animated WebP failed validation and fell through to a sharp
+re-encode that flattened it to one still frame; `members.canManage` had no
+test at all, which would have let F-15's symptom regress silently; and four
+more comment-vs-code drifts, including an orphaned docblock in the scrub still
+asserting that over-redaction "is a data-quality annoyance" directly above the
+tier system written to reverse exactly that.
+
+**Two reviews, two rounds of real defects, both in the fixes rather than the
+original code.** The pattern across all of them is the same: a change that
+closes the finding it was aimed at, while carrying an assumption that was only
+ever true of the case in front of the author.
+
+## Phase 10b — documentation
+
+`SETUP.md` rewritten for someone who has never used Cloudflare Tunnel, Access
+or the Anthropic API: twelve numbered sections, every step followed by what the
+reader should see. It also corrects a procedure that could not work — the old
+§4 told the operator to set `DEV_AUTH_BYPASS=true` and run `docker compose up`,
+which crash-loops under `restart: always`, because the standalone server forces
+`NODE_ENV=production` and the D-05 guard then refuses to boot.
+
+`DEPLOYMENT.md` is new: deploy, upgrade, rollback, backup/restore operations,
+log locations, and a troubleshooting section drawn from this build's own
+failures — the buildx cache-export fault that could only ever fail on main, the
+three-round `pg_wrapper`/PATH restore-drill saga, the Chrome apt repo that
+broke a WebKit-only job, the unanchored `backups/` gitignore that swallowed a
+whole route, the pnpm-workspace `serverExternalPackages` tracing problem, the
+BullMQ colon that meant the automatic email had never once worked, and the
+three iOS PWA export bugs including the `fetch` receiver binding that made the
+request never leave the device.
+
+`README.md` is new.
+
+## Phase 10 — LOW and INFO findings, undecided
+
+Not fixed. Listed for a decision next session.
+
+**LOW (21).** Auth: `NODE_ENV` equality guard enforced only by build artifacts
+(F-1); SETUP.md's unworkable bypass procedure (F-2, since fixed as part of the
+rewrite); `ACCESS_ALLOW_SUB_RELINK` making email a join key (F-3);
+`/api/v1/health` matcher-exempt and touching PG+Redis (F-4). Upload:
+unvalidated PDF parsed by poppler in the web process rather than the worker
+(F-11); filename unescaped into logs, so log forging (F-12); megapixel guard
+sees only frame 0 (F-13). Authorization: unscoped category usage count leaking
+cross-project activity (F-16); `members.ts` reading a stale role from
+`ctx.user` (F-17); export resolving an arbitrary user UUID to a name (F-18);
+categories breaking the 404-not-403 discipline (F-19). AI: the scrub mangling
+legitimate tracking numbers, contradicting its own docblock (F-25) — **note
+this one got slightly worse with F-23's widened separator class, deliberately**;
+no request timeout, so a hung provider blocks the queue for up to 30 minutes
+(F-26); no cumulative spend ceiling (F-27). Backup: `restore.sh` interpolating
+unverified manifest table names into `psql -c`, and the manifest is the one
+member the checksum loop can never cover (F-34); SW cache name hardcoded so
+precached assets never update (F-35); `audit_log` time-pruned despite an
+append-only comment (F-36); `audit_log.ip` declared and never written (F-37);
+deleting a user anonymising their whole audit trail (F-38); receipt images
+cached 24h per browser profile rather than per identity (F-39);
+`BACKUP_INCLUDE_IMAGES` defaulting false (F-40).
+
+**INFO (11).** F-5 JWKS non-200 logged as `bad_signature`; F-6 first-owner
+audit written post-commit; F-14 ~1.2 GB peak decode memory with no compose
+limit; **F-20 — structural: nothing forces a new query to compose
+`scopedProjects`**, no ESLint rule and no meta-test, so correctness is
+re-established by human review on every addition; F-21 dead
+`assertNotAboveOwnLevel`; F-22 `full` member blast radius; F-28
+`extraction.failed` metadata inheriting F-23's gap (fixed with it); F-29 model
+id unvalidated against the catalogue; F-41 real export artifacts sitting in
+`docs/private/`; F-42 export is a `GET` so an audit row proves a request not an
+intent; F-43 AI cost totals summed as floats.
+
+## Phase 10 — two things worth verifying before the next triage
+
+- **Whether `vips` actually has HEIF compiled in.** If it does not, every HEIC
+  upload fails at ingest — and before F-8 that meant its raw GPS-bearing
+  `staging.bin` was retained permanently. F-8 closes the leak either way, but
+  the failure itself would still be worth knowing about.
+- **Whether the restore drill has been re-run since D-47.**
+  `docs/private/PHASE9_RESTORE_DRILL.md` has an mtime of 2026-09-10 and
+  STATE.md calls the Phase 9 gate closed on its strength. The commits since
+  touch the export client and email gating rather than backup or schema, so its
+  conclusions are very likely current — but that was not verified.
 
 ## The iOS export downloaded nothing (D-49)
 

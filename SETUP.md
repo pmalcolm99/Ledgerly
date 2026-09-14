@@ -1,471 +1,905 @@
 # Setting up Ledgerly
 
-This guide takes a machine with nothing on it to a working Ledgerly instance
-reachable from your phone. It assumes no prior familiarity with the codebase.
+This guide takes you from nothing to a working, private, internet-reachable
+Ledgerly instance. It assumes you are comfortable in a terminal and with
+editing a config file, but it assumes **no prior experience** with Cloudflare
+Tunnel, Cloudflare Access, or the Anthropic API. Those three are explained
+where they first matter.
 
-Each step says what you should see when it worked. If you see something else,
-check [Troubleshooting](#troubleshooting) at the bottom — it covers the three
-failures this deployment actually hit.
+Every step is numbered, and every step is followed by a **✅ You should see**
+line. If you do not see it, stop there — each step depends on the one before,
+and a problem is much cheaper to find at the step that caused it than three
+steps later. `DEPLOYMENT.md` has a troubleshooting section for the failures
+that are known to bite.
 
-Rough timings: 20 minutes for steps 1–4 (a working app on `localhost`), another
-20 for steps 5–7 (reachable from the internet, behind authentication).
+Budget about an hour for a first run, most of it waiting for Docker.
+
+> **A note on the screenshots you won't find here.** Cloudflare reorganises the
+> Zero Trust dashboard regularly — sections get renamed, moved between menus,
+> and occasionally split in two. Anthropic's console changes less often but
+> does change. So this guide tells you **what you are looking for** and what it
+> is called, not only where it sat when this was written. If a menu path below
+> does not match what you see, search the dashboard for the feature name; the
+> concepts and the values you need have been stable even while the navigation
+> has not.
 
 ---
 
 ## What you are building
 
-Ledgerly runs as four containers on one machine:
+```
+        your phone / laptop
+                │
+                │  https://receipts.<your-domain>
+                ▼
+    ┌───────────────────────────┐
+    │  Cloudflare edge          │
+    │  ├─ Access: who are you?  │  ← identity check happens HERE
+    │  └─ Tunnel: route it      │
+    └───────────┬───────────────┘
+                │  outbound-only connection
+                ▼
+    ┌───────────────────────────┐
+    │  your machine             │
+    │  ├─ cloudflared           │
+    │  └─ docker compose        │
+    │     ├─ webapp :3000       │  ← binds to 127.0.0.1 only
+    │     ├─ postgres           │
+    │     └─ redis              │
+    └───────────────────────────┘
+```
 
-| Container     | What it is                                                       |
-| ------------- | ---------------------------------------------------------------- |
-| `webapp`      | The Next.js app and the background workers, in one image         |
-| `db`          | PostgreSQL 17 — receipts, projects, users                        |
-| `redis`       | The job queue that renders images and calls the extraction model |
-| `cloudflared` | The tunnel (installed separately, in step 5)                     |
+Two things are worth understanding before you start, because they are what
+make this design safe:
 
-Only `webapp` listens on a port, and only on `127.0.0.1`. Nothing is exposed to
-your LAN or to the internet directly. Every request from the outside arrives
-through the Cloudflare Tunnel, and Cloudflare Access authenticates it before it
-reaches the tunnel. **There is no login page in this app** — Cloudflare is the
-login, and the app trusts the signed token it forwards.
-
-That is why steps 5 and 6 are not optional extras. Until Access is in front of
-it, anything that can reach the tunnel hostname can read every receipt.
+- **Nothing inbound is ever opened.** `cloudflared` dials _out_ to Cloudflare
+  and holds the connection open. There is no port forwarding, no firewall
+  hole, and your home IP address is never published.
+- **Cloudflare Access authenticates people before traffic reaches you.** By
+  the time a request arrives at your machine it already carries a signed JWT
+  naming who sent it. Ledgerly verifies that signature itself rather than
+  trusting the header — but the first line of defence is at the edge.
 
 ---
 
 ## 1. Prerequisites
 
-- A machine that stays on: a NAS, a home server, a small VPS. Linux or macOS.
-- **Docker** with the Compose plugin. `docker compose version` should print
-  `v2.x` or later. (`docker-compose` with a hyphen is the old one; if that is
-  what you have, install the plugin.)
-- **A Cloudflare account** and **a domain on it**. Free tier is fine for both.
-  The domain has to have its nameservers pointed at Cloudflare — the tunnel
-  cannot create a hostname on a domain Cloudflare does not control.
-- **An Anthropic API key**, from <https://console.anthropic.com>. Optional at
-  this stage; the app boots without one and you can add it from the admin
-  screen later.
+### 1.1 Install Docker
 
-You do **not** need Node, pnpm, or Postgres installed. They are all inside the
-image.
-
-Clone the repository, then stay in that directory for everything below:
+Install Docker Desktop (macOS/Windows) or Docker Engine with the Compose
+plugin (Linux). Then:
 
 ```bash
-git clone https://github.com/pmalcolm99/ledgerly.git
-cd ledgerly
+docker --version
+docker compose version
 ```
+
+✅ **You should see** two version lines, for example `Docker version 27.x` and
+`Docker Compose version v2.x`. If `docker compose` reports "is not a docker
+command", you have the old standalone `docker-compose` binary; install the
+Compose plugin, because this project's commands assume the modern form.
+
+### 1.2 Have a domain on Cloudflare
+
+You need a domain whose **nameservers point at Cloudflare**. Buying a domain
+elsewhere and merely pointing a record at Cloudflare is not enough — Cloudflare
+has to be running DNS for the zone, because the tunnel creates DNS records for
+you.
+
+If you do not have one yet: add the domain at <https://dash.cloudflare.com>,
+choose the free plan, and follow its instructions to change the nameservers at
+your registrar. Propagation usually takes minutes but can take hours.
+
+✅ **You should see** your domain listed in the Cloudflare dashboard with
+status **Active**. "Pending nameserver update" means it is not ready and the
+tunnel steps will fail.
+
+A free Cloudflare plan is sufficient for everything in this guide, including
+Access.
+
+### 1.3 Have a GitHub account
+
+Only needed to clone the repository. If the repository is private, set up
+either an SSH key or a personal access token first.
+
+✅ **You should see** `ssh -T git@github.com` reply with
+`Hi <username>! You've successfully authenticated`, or be able to log in at
+github.com if you plan to clone over HTTPS.
+
+### 1.4 Decide your hostname
+
+Pick the hostname Ledgerly will live at — something like
+`receipts.<your-domain>`. Write it down; you will type it three times, and
+they must match exactly.
+
+Throughout this guide, replace:
+
+| Placeholder        | With                                    |
+| ------------------ | --------------------------------------- |
+| `<your-domain>`    | your actual domain, e.g. `example.com`  |
+| `<your-team-name>` | your Cloudflare Zero Trust team name    |
+| `<your-email>`     | the email address you will sign in with |
 
 ---
 
-## 2. Write the `.env` file
+## 2. Clone the repository
+
+### 2.1 Clone it
+
+```bash
+git clone git@github.com:<your-github-username>/ledgerly.git
+cd ledgerly
+```
+
+✅ **You should see** the repository contents — `docker-compose.yml`,
+`ARCHITECTURE.md`, `packages/`, `apps/`.
+
+### 2.2 Confirm you are on `main`
+
+```bash
+git status
+```
+
+✅ **You should see** `On branch main` and `nothing to commit, working tree
+clean`.
+
+### 2.3 Do not install Node dependencies
+
+You do not need Node, pnpm, or `pnpm install` to _run_ Ledgerly. Everything is
+built inside the container. They are only needed if you intend to develop.
+
+---
+
+## 3. Create the Cloudflare Tunnel
+
+A **tunnel** is a persistent outbound connection from your machine to
+Cloudflare's edge. You create it once; it gets a permanent ID and a credentials
+file that proves your machine is allowed to serve that tunnel.
+
+### 3.1 Install `cloudflared`
+
+```bash
+# macOS
+brew install cloudflared
+
+# Debian/Ubuntu — see Cloudflare's downloads page for the current .deb
+# and for other platforms; the package name and URL change over time.
+
+cloudflared --version
+```
+
+✅ **You should see** a version string, e.g. `cloudflared version 2024.x.x`.
+
+### 3.2 Authenticate `cloudflared` with your Cloudflare account
+
+```bash
+cloudflared tunnel login
+```
+
+A browser window opens. Choose the domain you set up in step 1.2.
+
+✅ **You should see** the browser say the certificate was downloaded, and the
+terminal print a path ending in `cert.pem` (normally
+`~/.cloudflared/cert.pem`). That certificate is what authorises you to create
+tunnels for this zone.
+
+### 3.3 Create the tunnel
+
+```bash
+cloudflared tunnel create ledgerly
+```
+
+✅ **You should see** `Created tunnel ledgerly with id <a long UUID>` and a
+line naming a credentials JSON file, normally
+`~/.cloudflared/<tunnel-id>.json`.
+
+> 🔒 That JSON file is a **secret**. Anyone holding it can serve traffic for
+> your hostname. It lives in `~/.cloudflared/`, outside the repository, and
+> `.gitignore` already excludes `.cloudflared/` and `tunnel-*.json` so it
+> cannot be committed by accident. Never paste its contents anywhere.
+
+### 3.4 Route your hostname to the tunnel
+
+```bash
+cloudflared tunnel route dns ledgerly receipts.<your-domain>
+```
+
+✅ **You should see** confirmation that a CNAME record was added for
+`receipts.<your-domain>`. In the Cloudflare dashboard, under **DNS → Records**,
+you should now find a proxied (orange cloud) CNAME pointing at
+`<tunnel-id>.cfargotunnel.com`.
+
+### 3.5 Write the `cloudflared` config
+
+Create `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <tunnel-id>
+credentials-file: /Users/<you>/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: receipts.<your-domain>
+    service: http://localhost:3000
+  - service: http_status:404
+```
+
+If you changed `APP_PORT` from 3000, this port must match it. The final
+catch-all `service:` entry is required — `cloudflared` refuses to start
+without one.
+
+✅ **You should see** `cloudflared tunnel ingress validate` print
+`Validating rules against the ingress rules` followed by **OK**.
+
+### 3.6 Do not start the tunnel yet
+
+There is nothing listening on port 3000 until step 8. Leave it for now; you
+will start it in step 8.4.
+
+---
+
+## 4. Create the Access application and its policy
+
+**Cloudflare Access** is the identity layer. Without it, anyone who guessed
+your hostname would reach Ledgerly directly. With it, Cloudflare demands a
+login first and only then forwards the request — carrying a signed token that
+says who the visitor is.
+
+Access lives in the **Zero Trust** dashboard, which is a separate area from the
+main Cloudflare dashboard: <https://one.dash.cloudflare.com>.
+
+> This is the part of the guide most likely to have drifted. Cloudflare has
+> moved Access applications between menus more than once, and has renamed
+> "Zero Trust" itself in the past. You are looking for the section that lets
+> you **protect a self-hosted application behind a login policy** — historically
+> **Access → Applications**, more recently sometimes nested under a
+> "Networks" or "Secure" grouping. If the menu names below do not match,
+> search the Zero Trust dashboard for **Applications**.
+
+### 4.1 Choose your team name
+
+The first time you open Zero Trust it asks you to pick a **team name**. This
+becomes `<your-team-name>.cloudflareaccess.com` and it is permanent and
+awkward to change, so choose something you will not mind typing.
+
+✅ **You should see** the Zero Trust overview page, and your team domain shown
+somewhere in **Settings** as `<your-team-name>.cloudflareaccess.com`.
+
+### 4.2 Add a login method
+
+Under **Settings → Authentication** (sometimes **Authentication** at the top
+level), add at least one identity provider.
+
+The simplest is **One-time PIN**, which needs no configuration: Cloudflare
+emails a code to the address the visitor types. Google, GitHub and others are
+also fine, and are nicer day to day.
+
+✅ **You should see** your chosen method listed under login methods. If you
+picked One-time PIN there is nothing to configure — it is available by
+default on most accounts.
+
+### 4.3 Create a self-hosted application
+
+**Access → Applications → Add an application → Self-hosted.**
+
+Fill in:
+
+| Field            | Value                                           |
+| ---------------- | ----------------------------------------------- |
+| Application name | `Ledgerly`                                      |
+| Session duration | `1 month` is reasonable for a personal instance |
+| Subdomain        | `receipts`                                      |
+| Domain           | `<your-domain>`                                 |
+
+Leave the path empty so the whole host is protected.
+
+✅ **You should see** the application's public hostname shown as
+`receipts.<your-domain>` before you continue to the policy step.
+
+### 4.4 Add an allow policy
+
+Still in the application setup, add a policy:
+
+| Field       | Value                |
+| ----------- | -------------------- |
+| Policy name | `Allow me`           |
+| Action      | **Allow**            |
+| Rule type   | Include → **Emails** |
+| Value       | `<your-email>`       |
+
+You can add more email addresses now or later — each one becomes a Ledgerly
+user the first time they sign in.
+
+> Prefer **Emails** over **Everyone**. An `Everyone` policy with a login method
+> attached means _anyone on the internet with any email address_ can
+> authenticate and reach your receipts.
+
+✅ **You should see** the policy listed with action **Allow** and your email in
+its include rule. Save the application.
+
+### 4.5 Confirm the application is live
+
+Visit `https://receipts.<your-domain>` in a private browser window.
+
+✅ **You should see** a Cloudflare Access login page asking for your email.
+A `502` or `1033` error _after_ the login page is expected and correct at this
+stage — Access is working, and there is simply nothing behind the tunnel yet.
+
+If you see your registrar's parking page or a DNS error instead, the tunnel
+route from step 3.4 did not take effect.
+
+---
+
+## 5. Find the AUD tag and the team domain
+
+These two values are the ones people most often get wrong, so they get their
+own section. Ledgerly refuses to start if either is malformed, which is
+deliberate — a bad value here should fail at boot, not silently let everyone
+in.
+
+### 5.1 What they are
+
+| Value           | What it is                                                                                                                                                                                         | Shape                                   |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| **AUD tag**     | The _Application Audience_ tag. A unique id for **one Access application**. Ledgerly checks that every token it receives was issued for _this_ application and not some other app in your account. | Exactly **64 lowercase hex characters** |
+| **Team domain** | Your Zero Trust team's hostname. Ledgerly fetches Cloudflare's public signing keys from it to verify token signatures.                                                                             | `<your-team-name>.cloudflareaccess.com` |
+
+### 5.2 Find the AUD tag
+
+It belongs to the **application**, not to your account, and it is not on the
+main Cloudflare dashboard at all.
+
+1. Zero Trust dashboard → **Access → Applications**
+2. Click the **Ledgerly** application
+3. Open its **Overview** tab (on some versions it is the first thing shown when
+   you click **Edit**)
+4. Find the field labelled **Application Audience (AUD) Tag** and copy it
+
+✅ **You should see** a 64-character string of lowercase letters `a`–`f` and
+digits. Check the length:
+
+```bash
+echo -n '<paste-it-here>' | wc -c
+```
+
+✅ **You should see** exactly `64`. If you get 32, or a value containing `-`,
+you have copied something else — most likely the application _UUID_, which
+looks similar and is not what Ledgerly wants.
+
+> **The single most common mistake.** Each Access application has its own AUD
+> tag. If you later delete and recreate the application — which is easy to do
+> while experimenting — **the AUD tag changes** and Ledgerly will reject every
+> token until you update `.env` and restart. If sign-in breaks right after you
+> touched the Access config, check this first.
+
+### 5.3 Find the team domain
+
+Zero Trust dashboard → **Settings → Custom Pages**, or **Settings → General**,
+depending on version. It is displayed as your **team domain**.
+
+✅ **You should see** `<your-team-name>.cloudflareaccess.com`.
+
+Then confirm it actually serves keys:
+
+```bash
+curl -s https://<your-team-name>.cloudflareaccess.com/cdn-cgi/access/certs | head -c 200
+```
+
+✅ **You should see** JSON beginning `{"keys":[{` . That is the JWKS endpoint
+Ledgerly reads. If you get a 404 or an HTML error page, the team name is wrong.
+
+> Enter the team domain **without** `https://` and **without** a trailing
+> slash. Ledgerly builds the certs URL itself.
+
+---
+
+## 6. Get an Anthropic API key and set a spend limit
+
+Ledgerly sends each receipt image to Claude to extract the merchant, date,
+total and line items. That is a paid API, billed per request, separate from any
+Claude.ai subscription you may already have.
+
+### 6.1 Create an account
+
+Go to <https://console.anthropic.com> and sign up or sign in.
+
+✅ **You should see** the Anthropic Console dashboard.
+
+### 6.2 Add credit
+
+Find **Billing** (usually under **Settings**) and add a payment method, then
+buy a small amount of credit — $5 is plenty to start.
+
+✅ **You should see** a positive credit balance. A brand-new account with no
+credit will return HTTP 400 errors on every extraction, which surfaces in
+Ledgerly as receipts stuck in the review queue with an error.
+
+### 6.3 Set a spend limit — do this _before_ creating the key
+
+Still under **Billing**, find **Limits** (sometimes **Usage limits** or
+**Spend limits**). Set a **monthly spend limit** you are comfortable with. $10
+is generous for personal use: extraction costs roughly a cent or two per
+receipt at current Sonnet pricing.
+
+Set an email notification threshold below the hard limit if the option is
+offered.
+
+✅ **You should see** the limit shown on the billing page.
+
+> Ledgerly has per-minute rate limits, but **it has no spend ceiling of its
+> own** — a runaway loop or an enthusiastic bulk import is bounded by
+> Anthropic's limit and nothing else. This is the only backstop, which is why
+> it comes before the key.
+
+### 6.4 Create the API key
+
+**Settings → API keys → Create key**. Name it `ledgerly`.
+
+✅ **You should see** the key exactly once, beginning `sk-ant-`. Copy it now —
+the console will not show it again.
+
+> 🔒 This key is a **secret** and a **billable credential**. It is server-side
+> only: it never reaches the browser, and it is never written to a log. Do not
+> paste it into a chat, an issue, or a commit.
+
+### 6.5 Decide where to put it
+
+You have two options, and you do not have to choose now:
+
+- **Leave it out of `.env` entirely** and paste it into the admin UI after
+  first sign-in (step 9.4). It is then stored encrypted in the database.
+- **Put it in `.env`** to seed the instance without visiting the admin screen.
+
+The admin-UI value wins if both are set. If neither is set the app still
+starts, warns at boot, and leaves uploaded receipts in the review queue
+un-extracted — nothing is lost, and you can add the key later.
+
+---
+
+## 7. Fill in `.env`, variable by variable
+
+### 7.1 Copy the example
 
 ```bash
 cp .env.example .env
 ```
 
-`.env.example` documents every variable. Most have working defaults. These are
-the ones you must decide:
+✅ **You should see** a new `.env`. It is already in `.gitignore` and has been
+since the first commit — it cannot be committed by accident.
 
-### Required, always
-
-| Variable            | What to put                                          |
-| ------------------- | ---------------------------------------------------- |
-| `POSTGRES_PASSWORD` | Any long random string. It never leaves the machine. |
-| `DATABASE_URL`      | Must contain the same password. See the note below.  |
-| `MASTER_KEY`        | Generate it — see below.                             |
-
-`DATABASE_URL` appears in `.env` for the benefit of running the app _outside_
-Docker. Under `docker compose` the value is composed for you from the
-`POSTGRES_*` variables, so the one in `.env` is ignored — but keep them
-consistent anyway, so the file does not lie to the next person who reads it.
-
-Generate `MASTER_KEY`:
+### 7.2 Generate `MASTER_KEY`
 
 ```bash
 openssl rand -base64 32
 ```
 
-> **Back `MASTER_KEY` up somewhere outside this machine, now.**
->
-> It encrypts the `app_config` table — the Claude API key and, from Phase 9, the
-> SMTP password. It is deliberately never written into a backup archive, so a
-> backup **cannot be decrypted without it**. Losing it does not lose your
-> receipts, but it does lose every stored secret, permanently, with no recovery
-> path. A password manager entry is enough.
+✅ **You should see** a 44-character string ending in `=`. Put it in `.env` as
+`MASTER_KEY=`.
 
-### Required once you go to production
+> 🔒 **Back this up somewhere outside this machine, now.** `MASTER_KEY`
+> encrypts the Claude API key and the SMTP password in the database. It is
+> deliberately **not** included in backup archives — a backup that carried its
+> own decryption key would not be much of a safeguard. Lose the machine and
+> this key, and a restored backup comes back with those two credentials
+> unreadable. Everything else restores fine, and you can re-enter them.
 
-Leave these blank for now; step 6 fills them in.
+### 7.3 Set a database password
 
-| Variable                | What to put                                                  |
-| ----------------------- | ------------------------------------------------------------ |
-| `CF_ACCESS_ENABLED`     | `true` once Access is actually in front of the app           |
-| `CF_ACCESS_AUD`         | The Application Audience tag — **exactly 64 hex characters** |
-| `CF_ACCESS_TEAM_DOMAIN` | `yourteam.cloudflareaccess.com`                              |
+```bash
+openssl rand -base64 24
+```
 
-`packages/config` refuses to boot with `NODE_ENV=production` unless all three
-are set and well-formed. That is deliberate: a misconfigured Access check that
-fails _open_ is indistinguishable from no authentication at all, so it fails at
-startup instead, loudly, before serving a single request.
+Put it in **both** places it appears — `POSTGRES_PASSWORD` and the password
+inside `DATABASE_URL`. They must match.
 
-### Worth setting
+✅ **You should see** no remaining occurrence of `change-me-before-first-run`:
 
-| Variable            | Note                                                                                   |
-| ------------------- | -------------------------------------------------------------------------------------- |
-| `APP_HOSTNAME`      | The public hostname you will create in step 5, e.g. `receipts.example.com`.            |
-| `APP_PORT`          | Change it only if 3000 is taken. See the D-16 warning in Troubleshooting.              |
-| `ANTHROPIC_API_KEY` | Optional. You can set the key from the admin UI instead, where it is stored encrypted. |
-| `NODE_ENV`          | `development` while you work through steps 3–4; `production` from step 6 on.           |
+```bash
+grep -n 'change-me-before-first-run' .env || echo "none left — good"
+```
 
-`DEV_AUTH_BYPASS` deserves its own line. It injects a fixed development
-identity and skips JWT verification entirely, so anyone who reaches the app is
-signed in as the owner. It defaults to `false` and the app **refuses to boot**
-if it is `true` while `NODE_ENV=production`. Leave it alone.
+### 7.4 Fill in the rest
+
+Work down the file. Here is what each variable does:
+
+**Runtime**
+
+| Variable   | What it does                                                                                                                                                                                         |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV` | `development` while you work through steps 7–8; **`production`** from step 8.5 onward. In production the app requires the Cloudflare Access settings to be present and refuses to boot without them. |
+
+**App**
+
+| Variable       | What it does                                                                                                                 |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `APP_PORT`     | Container port. Leave at `3000` unless something else has it. If you change it, change `~/.cloudflared/config.yml` to match. |
+| `APP_HOSTNAME` | `receipts.<your-domain>`. Used to build absolute URLs, e.g. in receipt emails.                                               |
+
+**Postgres**
+
+| Variable                        | What it does                                                          |
+| ------------------------------- | --------------------------------------------------------------------- |
+| `POSTGRES_USER` / `POSTGRES_DB` | Leave as `ledgerly` unless you have a reason.                         |
+| `POSTGRES_PASSWORD`             | From 7.3.                                                             |
+| `DATABASE_URL`                  | Composed for you by Compose; the password must match 7.3.             |
+| `TEST_DATABASE_URL`             | Only used when running the test suite. Ignore for a plain deployment. |
+
+**Redis** — `REDIS_URL` stays `redis://redis:6379`. That is the service name
+inside the Compose network, not your machine.
+
+**Secrets**
+
+| Variable     | What it does                                           |
+| ------------ | ------------------------------------------------------ |
+| `MASTER_KEY` | From 7.2. Encrypts credentials stored in the database. |
+
+**Filesystem** — `UPLOADS_DIR` and `BACKUPS_DIR` are paths _inside_ the
+container, backed by named Docker volumes. Leave them alone.
+
+**Cloudflare Access**
+
+| Variable                | What it does                                                                    |
+| ----------------------- | ------------------------------------------------------------------------------- |
+| `CF_ACCESS_ENABLED`     | `false` for now; **`true`** from step 8.5.                                      |
+| `CF_ACCESS_AUD`         | The 64-hex AUD tag from 5.2.                                                    |
+| `CF_ACCESS_TEAM_DOMAIN` | `<your-team-name>.cloudflareaccess.com` from 5.3, no scheme, no trailing slash. |
+| `CF_ACCESS_JWKS_TTL_MS` | How long Cloudflare's signing keys are cached. The 1-hour default is fine.      |
+
+**Dev / recovery flags**
+
+| Variable                  | What it does                                                                                                   |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `DEV_AUTH_BYPASS`         | Skips JWT verification and injects a fixed development identity. **Leave it `false`.** See the warning in 8.3. |
+| `ACCESS_ALLOW_SUB_RELINK` | Off except during a deliberate identity-provider migration. See `DEPLOYMENT.md`.                               |
+
+**AI extraction**
+
+| Variable                            | What it does                                                                                       |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`                 | From 6.4, or leave blank and use the admin UI (6.5).                                               |
+| `AI_MODEL_PASS1` / `AI_MODEL_PASS2` | Bootstrap defaults; the admin screen overrides them. Leave as shipped.                             |
+| `AI_ESCALATE_BELOW`                 | Confidence below which a second opinion is requested.                                              |
+| `AI_CONCURRENCY`                    | Parallel extractions. `3` is fine. The only one of these four that needs a restart to take effect. |
+
+**Uploads**
+
+| Variable                    | What it does                                                                                                             |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `MAX_UPLOAD_BYTES`          | Per-file cap, default 50 MB.                                                                                             |
+| `RETAIN_ORIGINALS`          | Keep the uploaded file as well as the renders. ~10× storage. EXIF including GPS is stripped either way. Default `false`. |
+| `MAX_UPLOAD_MEGAPIXELS`     | Decompression-bomb guard, checked before any decode.                                                                     |
+| `UPLOAD_RATE_LIMIT_PER_MIN` | Per user, whole-batch atomic.                                                                                            |
+| `INGEST_CONCURRENCY`        | Image-processing workers. Distinct from `AI_CONCURRENCY`.                                                                |
+
+**Misc** — `DEFAULT_CURRENCY`, `BACKUP_RETENTION_DAYS`,
+`BACKUP_INCLUDE_IMAGES`, `LOG_RETENTION_DAYS` are documented inline in the
+file. See step 11 before changing the backup ones.
+
+### 7.5 Check it over
+
+```bash
+grep -c '=' .env
+grep -E '^(MASTER_KEY|CF_ACCESS_AUD|CF_ACCESS_TEAM_DOMAIN|APP_HOSTNAME)=' .env
+```
+
+✅ **You should see** `MASTER_KEY`, `APP_HOSTNAME` and
+`CF_ACCESS_TEAM_DOMAIN` with values, and `CF_ACCESS_AUD` with its 64-hex
+value.
 
 ---
 
-## 3. First boot
+## 8. First run
+
+### 8.1 Build and start
 
 ```bash
-docker compose up -d --build
+docker compose up --build
 ```
 
-The first build takes several minutes. When it finishes:
+The first build takes several minutes. Leave it in the foreground so you can
+read the logs.
+
+✅ **You should see**, in order: images building; `db` reporting
+`database system is ready to accept connections`; the webapp applying
+migrations; and finally a line showing Next.js ready on port 3000. No
+container should be restarting.
+
+### 8.2 Check health
+
+In a second terminal:
 
 ```bash
-docker compose ps
+curl -s localhost:3000/api/v1/health
 ```
 
-**You should see** the three services — `webapp`, `db`, `redis` — with `webapp`
-eventually reaching `healthy`. It takes up to a minute; the health check has a
-60-second grace period while migrations run.
+✅ **You should see** a JSON response reporting healthy status. If it hangs or
+refuses the connection, go back to the logs in 8.1.
 
-```bash
-curl -s http://localhost:3000/api/v1/health
-```
-
-**You should see** a JSON body reporting `ok`, with the database and Redis
-both up. If `webapp` is restarting in a loop instead, go to Troubleshooting —
-that is almost always a `.env` validation failure, and the reason is in
-`docker compose logs webapp`.
-
-Migrations run automatically on every start, before the server accepts
-connections. You never run them by hand.
-
----
-
-## 4. Look at it locally
+### 8.3 Look at it locally (optional)
 
 Open <http://localhost:3000>.
 
-With `NODE_ENV=development` and `CF_ACCESS_ENABLED=false`, the app has no way to
-identify you, so it will not let you in — which is correct, and is the point. To
-see the UI before Cloudflare is set up, set `DEV_AUTH_BYPASS=true` in `.env`,
-run `docker compose up -d`, and you are signed in as a fixed development
-identity.
+✅ **You should see** the app refuse to identify you. That is correct: with
+`CF_ACCESS_ENABLED=false` and no Access token, there is no identity to
+establish, and the app fails closed rather than open.
 
-**Set it back to `false` before step 6.** The app will refuse to boot in
-production with it on, so you cannot ship it by accident, but you can waste
-twenty minutes wondering why.
+> **Do not try to use `DEV_AUTH_BYPASS` to look around here.** It only works
+> under `pnpm dev` on a development machine. The production container is built
+> with `NODE_ENV=production` baked into the server bundle, and the app
+> **refuses to boot** when the bypass is on in production. Setting it `true` in
+> `.env` and running `docker compose up` gets you a container that exits
+> immediately and — because `restart: always` is set — crash-loops. That is
+> the guard working as designed, not a bug. The way to see the UI is to finish
+> steps 8.4–8.6, which takes about five minutes.
 
----
+### 8.4 Start the tunnel
 
-## 5. The Cloudflare Tunnel
+```bash
+cloudflared tunnel run ledgerly
+```
 
-The tunnel makes an _outbound_ connection from your machine to Cloudflare, and
-Cloudflare routes your hostname down it. Nothing inbound; no port forwarding;
-no firewall rules.
+✅ **You should see** `Registered tunnel connection` four times (Cloudflare
+opens several for redundancy). Leave it running.
 
-1. In the Cloudflare dashboard: **Zero Trust → Networks → Tunnels → Create a
-   tunnel**. Pick **Cloudflared**, name it (`ledgerly` is fine), and save.
-2. Cloudflare shows you an install command containing a long token. Run it on
-   the machine — it installs `cloudflared` and registers it as a service.
-3. Back in the dashboard, on the tunnel's **Public Hostname** tab, add a
-   hostname:
-   - **Subdomain**: `receipts` (or whatever you set in `APP_HOSTNAME`)
-   - **Domain**: your domain
-   - **Service type**: `HTTP`
-   - **URL**: `localhost:3000` — this must match `APP_PORT`
+### 8.5 Turn on Access enforcement
 
-**You should see** the tunnel listed as **HEALTHY** within a few seconds, and
-`https://receipts.example.com` should now load the app.
+Stop the stack (`Ctrl-C`), then edit `.env`:
 
-At this moment your receipts are on the public internet with no authentication.
-Do step 6 now, not later.
-
----
-
-## 6. Cloudflare Access
-
-Access sits in front of the hostname and authenticates every request before it
-reaches the tunnel.
-
-1. **Zero Trust → Access → Applications → Add an application → Self-hosted.**
-2. **Application name**: Ledgerly. **Session duration**: whatever you like — a
-   month is reasonable for a personal instance.
-3. **Application domain**: the same hostname from step 5.
-4. Add a **policy**:
-   - **Name**: Owner
-   - **Action**: Allow
-   - **Include** → **Emails** → your email address.
-
-   Use `Emails`, not `Everyone`, and not `Emails ending in` unless you really
-   do mean everyone at that domain.
-
-5. Pick a login method. One-time PIN by email works with no further setup.
-6. Save, then open the application's **Overview** tab and copy the
-   **Application Audience (AUD) Tag**.
-
-Now finish `.env`:
-
-```dotenv
+```
 NODE_ENV=production
 CF_ACCESS_ENABLED=true
-CF_ACCESS_AUD=<the 64-character tag you just copied>
-CF_ACCESS_TEAM_DOMAIN=yourteam.cloudflareaccess.com
-DEV_AUTH_BYPASS=false
 ```
 
-`CF_ACCESS_TEAM_DOMAIN` is the hostname only — no `https://`, no trailing
-slash. You will find it under **Zero Trust → Settings → Custom Pages**, or in
-the URL of the login page Access shows you.
+and start it again:
 
 ```bash
-docker compose up -d
-```
-
-**You should see** Cloudflare's login page when you open the hostname in a
-private window, and the app only after you authenticate.
-
----
-
-## 7. First sign-in, and the API key
-
-Open the hostname and sign in through Access.
-
-**The first account to sign in becomes the instance owner.** There is no
-separate bootstrap step and no default password to change. Every later sign-in
-creates an ordinary user account.
-
-You will be asked for your name and offered a theme; that screen is shown once.
-
-Then, as owner:
-
-1. **Admin → Claude API key.** Paste your Anthropic key and save. It is
-   encrypted with `MASTER_KEY` before it is stored, and it takes precedence
-   over the `ANTHROPIC_API_KEY` environment variable.
-2. Press **Test**. **You should see** a success message. That button makes one
-   real, minimal call to the Anthropic API, which is the only thing that
-   distinguishes a valid key from a well-formed invalid one.
-3. Create a project, upload a receipt, and watch the fields fill in on their
-   own within a few seconds.
-
-You are done.
-
----
-
-## 8. Optional: receipt emails
-
-Ledgerly can email you each receipt once it has been scanned, with the image
-attached. It is off by default and needs two things switched on.
-
-### The relay
-
-**Admin → Email (SMTP).** Any relay works — smtp2go, Postmark, SES. You need:
-
-| Field               | Note                                                                                                                                               |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Host / Port         | `587` with implicit TLS **off** is the common case. Turn implicit TLS on only for port `465`.                                                      |
-| Username / Password | Stored encrypted with `MASTER_KEY`, like the Claude key. The password is write-only: once saved you see its last four characters and nothing else. |
-| From address        | Must be an address the relay is willing to send as. This is the field that most often causes a rejection.                                          |
-
-Press **Send test email**. It sends a real message to your own address using
-the **saved** settings — so save your changes first. **You should see** a
-success line, and the message in your inbox within a minute.
-
-Editing settings later: leave the password box blank to keep the stored one.
-Only fill it in when you actually want to change it.
-
-### Per project
-
-On a project's page, **Receipt emails → Email me each receipt**. Each new
-receipt then emails the project owner once, after extraction finishes — so the
-email contains the extracted fields rather than an empty shell. A re-extract
-does not send a second copy.
-
-Regardless of that setting, any receipt can be emailed on demand from its own
-page, to any member of that project. There is no free-text address field: to
-send a receipt to someone, add them to the project first.
-
----
-
-## Troubleshooting
-
-### `webapp` restarts in a loop
-
-Almost always a `.env` validation failure. The reason is printed:
-
-```bash
-docker compose logs webapp | tail -30
-```
-
-The message names the variable. Config validation runs before anything else
-starts, on purpose — a bad value fails at boot rather than halfway through
-someone's upload.
-
-### "CF_ACCESS_AUD must be 64 hex characters"
-
-The AUD tag is exactly 64 lowercase hex characters. A copy that picked up a
-stray character — a trailing space, a newline, a smart quote from a notes app —
-is 65, and is rejected at startup.
-
-Count it:
-
-```bash
-grep '^CF_ACCESS_AUD=' .env | cut -d= -f2 | tr -d '\n' | wc -c
-```
-
-**You should see** `64`. Anything else, re-copy the tag straight from the
-Cloudflare dashboard into the file.
-
-This is checked at boot rather than at verification time deliberately: a
-truncated AUD would otherwise fail every request with an opaque 403, which
-looks like a Cloudflare problem rather than a typo in your `.env`.
-
-### Changing `APP_PORT` breaks the tunnel
-
-`APP_PORT` lives in **two** places and they must agree:
-
-1. `APP_PORT` in `.env`
-2. The **URL** field on the tunnel's Public Hostname (`localhost:<port>`)
-
-Changing one and not the other gives you a healthy container, a healthy tunnel,
-and a 502 — because `cloudflared` is connecting to a port nothing is listening
-on. The app never hardcodes the port; if it does not match, this is why.
-
-### A receipt uploads but no fields appear
-
-Extraction is asynchronous and never fails an upload — an image that cannot be
-read still saves, with the unreadable fields left for you to fill in. Open the
-receipt: it carries a status and a reason code.
-
-- `ANTHROPIC_KEY_NOT_CONFIGURED` — no key. Admin → Claude API key.
-- An authentication or permission reason — the key is wrong, revoked, or has no
-  credit. Press **Test** on the admin card; it reports the provider's own
-  message rather than a generic failure.
-- Anything else — `docker compose logs webapp` has the provider's response.
-
-The image is never lost. Fix the cause and press **Re-extract** on the receipt.
-
-### Rotating an identity provider locked everyone out
-
-If you change how Access authenticates you, Cloudflare issues a new subject id
-and the app sees a brand-new person — including for the owner account.
-
-`ACCESS_ALLOW_SUB_RELINK=true` is the recovery path: a new subject whose email
-matches exactly one existing user is reassigned onto that user's row instead of
-creating a duplicate. Every reassignment is audited, and the app warns at every
-boot while it is on, specifically so it does not get left on.
-
-Turn it on, sign in once as each affected user, turn it off, restart.
-
----
-
-## Routine operations
-
-```bash
-# Update to the latest code
-git pull && docker compose up -d --build
-
-# Logs
+docker compose up -d --build
 docker compose logs -f webapp
-
-# A psql shell
-docker compose exec db psql -U ledgerly -d ledgerly
-
-# Stop everything (data survives — it is in named volumes)
-docker compose down
 ```
 
-`docker compose down -v` deletes the volumes, and with them every receipt and
-image. There is no undo.
+✅ **You should see** the app start cleanly with no configuration errors. If it
+exits complaining about `CF_ACCESS_AUD` or `CF_ACCESS_TEAM_DOMAIN`, revisit
+section 5 — the validation runs at boot precisely so this fails here rather
+than at someone's first sign-in.
+
+### 8.6 Visit the real hostname
+
+Open `https://receipts.<your-domain>`.
+
+✅ **You should see** the Cloudflare Access login page, then — after you
+authenticate with the email from 4.4 — Ledgerly's own welcome screen. That
+round trip proves the whole chain: DNS → Access → tunnel → container → JWT
+verification.
 
 ---
 
-## Backups
+## 9. Claim the owner account
 
-The admin screen has a **Backups** card. Two things to do there, once:
+Ledgerly has exactly one **instance owner**, and it is claimed by whoever
+signs in **first**. There is no separate admin bootstrap, no default password,
+and no way to be handed ownership later without a manual database change.
 
-1. Press **Back up now**. A row appears, goes from `running` to `complete`, and
-   the archive downloads. That proves the whole path works before you need it.
-2. Set a **schedule** — `0 3 * * *` is nightly at 3am. Five cron fields, in the
-   container's timezone, which is UTC unless you set `TZ`. It takes effect
-   immediately; no restart.
+### 9.1 Be first
 
-If the card says **"No scheduled backups"**, nothing is being backed up unless
-someone presses the button. That warning is there because a backup system that
-fails quietly is worse than none.
+If you have added other people to the Access policy already, sign in before
+they do.
 
-Archives land in the `app_backups` volume (`/app/backups` in the container) and
-are pruned after `BACKUP_RETENTION_DAYS` (default 30). They contain the database
-always, and the uploaded images only if you set `BACKUP_INCLUDE_IMAGES=true` —
-off by default, because it is the difference between an archive of kilobytes and
-one of gigabytes.
+### 9.2 Complete the welcome form
 
-**The volume is on this host.** If the disk dies, so do the backups. Copy them
-somewhere else — a cron job on the host doing `rsync` or `tar` of
-`/var/lib/docker/volumes/ledgerly_app_backups/_data/` to another machine or to
-object storage. Ledgerly does not do that for you.
+Enter your name when prompted.
 
-### `MASTER_KEY` is not in the archive
+✅ **You should see** the main Ledgerly screen, with an empty project list.
 
-**Back it up separately — a password manager, an encrypted note, anywhere that
-is not this machine.**
+### 9.3 Confirm you are the owner
 
-An archive contains the `app_config` table with its values still encrypted, and
-nothing that can decrypt them. That is deliberate: a stolen archive yields
-ciphertext. The cost is that restoring onto an instance with a different
-`MASTER_KEY` means the Claude API key and the SMTP password must be entered
-again by hand from the admin screen. Everything else — every receipt, every
-line item, every image — restores regardless.
+✅ **You should see** an **Admin** entry in the navigation. Only the instance
+owner sees it. If it is absent, someone else signed in first — see
+`DEPLOYMENT.md`, "Recovering the owner account".
 
-### Restoring
+### 9.4 Add the Claude API key (if you did not put it in `.env`)
 
-`scripts/restore.sh`, from a checkout of this repository on the host. It is a
-script rather than a paragraph here because a restore procedure that only exists
-as prose is a procedure nobody has ever run.
+**Admin → Claude API key**, paste the key from 6.4, save. Use the **Test key**
+button.
+
+✅ **You should see** the test report success, and the key thereafter displayed
+only as a hint like `…abcd (108 characters)`. It is stored encrypted under
+`MASTER_KEY` and is never shown in full again — not even to you.
+
+---
+
+## 10. Create a project and upload a test receipt
+
+### 10.1 Create a project
+
+From the main screen, create a project — `Test` will do, or a real one like
+`Kitchen remodel`.
+
+✅ **You should see** the project open with no receipts.
+
+### 10.2 Upload a receipt
+
+Use the capture button. On a phone this offers the camera or the photo
+library; on a laptop it is a file picker. Any real receipt photo works; a
+clear, flat, well-lit one works best.
+
+✅ **You should see** the receipt appear immediately with a "processing"
+indicator. The upload and the extraction are deliberately separate: the image
+is safely stored before Claude is ever called.
+
+### 10.3 Wait for extraction
+
+Ten to thirty seconds, depending on the model and the image.
+
+✅ **You should see** the merchant, date and total populate on their own. Any
+field Claude could not read is listed for your review rather than guessed —
+extraction never fails an upload.
+
+### 10.4 Check the fields
+
+Open the receipt.
+
+✅ **You should see** the extracted fields, editable, with line items if the
+receipt had them. If a card number appeared on the receipt, you should see at
+most the **last four digits** — full card numbers are stripped before anything
+is written to the database.
+
+### 10.5 Install it on your phone (optional)
+
+Open `https://receipts.<your-domain>` in Safari on iOS, then **Share → Add to
+Home Screen**.
+
+✅ **You should see** a Ledgerly icon on your home screen that opens
+full-screen with no browser chrome.
+
+---
+
+## 11. Configure backups
+
+Nothing is backed up until you say so. The admin screen says as much, rather
+than implying a safety net that does not exist.
+
+### 11.1 Open the backups screen
+
+**Admin → Backups.**
+
+✅ **You should see** an empty backup list and a note that no schedule is set.
+
+### 11.2 Take one by hand first
+
+Press **Back up now**.
+
+✅ **You should see** a new archive appear with status **complete**, a size, and
+a timestamp. A few hundred KB is normal for a near-empty instance.
+
+### 11.3 Set a schedule
+
+Set a nightly cron — `0 3 * * *` runs at 3am. It is stored in the database and
+takes effect without a restart.
+
+✅ **You should see** the schedule displayed, with the next run time.
+
+### 11.4 Decide about images
+
+`BACKUP_INCLUDE_IMAGES` defaults to `false`, so **archives contain the
+database but not the receipt photographs**. Your figures restore; your images
+do not.
+
+For a receipt-capture app that is a significant choice. If you have the disk
+space, set `BACKUP_INCLUDE_IMAGES=true` in `.env` and restart. If you leave it
+off, make sure you know what your recovery actually gets you.
+
+✅ **You should see**, after a subsequent backup, the archive size jump
+substantially if you enabled images.
+
+### 11.5 Copy an archive off this machine
+
+A backup on the same disk as the database is not a backup. Archives live in
+the `app_backups` Docker volume and can be downloaded from the admin screen.
+Copy them somewhere else — another disk, another machine, cloud storage.
+
+> 🔒 Archives are **not encrypted**. They are `chmod 0600` on disk, but once
+> you copy one elsewhere that protection does not travel with it. An archive
+> is the whole instance in cleartext: every user, every email address, every
+> receipt. Treat it accordingly, and see `DEPLOYMENT.md` for the detail.
+
+✅ **You should see** the downloaded `.tgz` on your local machine.
+
+---
+
+## 12. Run a restore drill
+
+A backup you have never restored is a hypothesis. Do this once, now, while
+nothing is at stake — not in six months when something is.
+
+### 12.1 Confirm the tooling
 
 ```bash
-# Into the running compose stack. This is the deployment case.
-./scripts/restore.sh ledgerly-backup-20260909T030000Z.tgz
-
-# Anywhere else — a scratch database, to rehearse without touching production.
-./scripts/restore.sh ledgerly-backup-20260909T030000Z.tgz     --database-url postgres://user:pass@localhost:5432/scratch     --uploads-dir ./scratch-uploads
+docker compose exec webapp pg_restore --version
 ```
 
-What it does, in order, and what it refuses:
+✅ **You should see** a version line. It is in the image already.
 
-1. Extracts to a temp directory and **verifies every file against the archive's
-   own `manifest.json` checksums**. A mismatch refuses outright —
-   `--ignore-checksum` exists for the disaster where a damaged archive is all
-   you have, and it warns loudly.
-2. **Refuses a non-empty target** unless you pass `--force`, and prints what it
-   found first (how many tables, how many receipts, how many users) so you can
-   see what you are about to overwrite.
-3. `pg_restore --clean --if-exists`. A non-zero exit here is common and usually
-   benign — `--clean` warns for every object it could not drop because it did
-   not exist. The row counts at the end are what decide it.
-4. **Handles a backup older than the code**: says so plainly and runs migrations
-   forward. A backup _newer_ than your checkout is refused — migrations are
-   forward-only, so check out the matching version and try again.
-5. Replaces the images, or says clearly that the archive has none.
-6. **Verifies row counts and the image count against the manifest**, table by
-   table, and fails if any disagree.
+### 12.2 Read the script's help
 
-Flags: `--force`, `--ignore-checksum`, `--skip-uploads`, `--yes` (no prompt),
-`--database-url`, `--uploads-dir`. `./scripts/restore.sh --help` prints them.
+```bash
+./scripts/restore.sh --help
+```
 
-**Rehearse it once, now, on a scratch database.** A backup that has never been
-restored is a hypothesis, not a backup.
+✅ **You should see** usage text explaining the target options.
+
+### 12.3 Restore into a scratch database
+
+**Restore to a scratch database, not over your live one.** The script takes
+the archive as a positional argument and restores into the running Compose
+stack by default — which is the real-disaster case, not the rehearsal. For a
+drill, point it somewhere else with `--database-url` and `--uploads-dir`:
+
+```bash
+# Create a scratch database next to the real one.
+docker compose exec db psql -U ledgerly -d ledgerly \
+  -c 'CREATE DATABASE ledgerly_drill;'
+
+mkdir -p /tmp/ledgerly-drill-uploads
+
+./scripts/restore.sh /path/to/your-backup.tgz \
+  --database-url postgres://ledgerly:<your-password>@localhost:5432/ledgerly_drill \
+  --uploads-dir /tmp/ledgerly-drill-uploads
+```
+
+The other options are worth knowing before you need them:
+
+| Option              | What it does                                                                                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--force`           | Proceed even though the target database is not empty. Without it, a non-empty target is **refused** — which is what stops a rehearsal becoming an accident. |
+| `--skip-uploads`    | Database only, leaving images untouched.                                                                                                                    |
+| `--ignore-checksum` | Proceed despite a member failing its SHA-256. For the disaster where a damaged archive is all you have. Never routine.                                      |
+| `--yes`             | Skip the confirmation prompt.                                                                                                                               |
+
+✅ **You should see** the script verify the archive checksum, verify each
+member against the manifest, restore, and then print a **row-count comparison**
+per table — manifest versus restored — ending in success.
+
+### 12.4 Understand what did _not_ come back
+
+✅ **You should see** the closing note that `MASTER_KEY` is not in the archive.
+This is the drill's real lesson: on a machine without the same `MASTER_KEY`,
+the Claude API key and SMTP password restore as undecryptable ciphertext and
+must be re-entered. Everything else comes back.
+
+### 12.5 Write down what you learned
+
+Record the date, the archive, the row counts and how long it took. When you
+need this for real you will be stressed and it will be 2am.
+
+✅ **You should see** your own note somewhere you will find it again. Keep it
+out of the repository — `docs/private/` is gitignored for exactly this.
+
+---
+
+## You are done
+
+You now have:
+
+- a private instance reachable only through Cloudflare Access
+- no inbound ports and no published home IP
+- AI extraction with a spend limit above it
+- scheduled backups, and a restore you have actually performed
+
+From here:
+
+- **`DEPLOYMENT.md`** — upgrades, rollback, log locations, backup and restore
+  operations, and a troubleshooting section covering the failures this project
+  actually hit.
+- **`README.md`** — what Ledgerly is and how the pieces fit.
+- **`ARCHITECTURE.md`**, **`docs/SCHEMA.md`**, **`DECISIONS.md`** — the design
+  and the reasoning behind it.
+
+### Add other people
+
+Add their email to the Access policy from 4.4. They sign in, complete the
+welcome form, and become ordinary users — not owners. Add them to a project
+from the project's member list, at `read`, `read_add` or `full`.
+
+> Note that **every signed-in user can see the member directory** — the names
+> and email addresses of everyone on the instance. This is deliberate and
+> documented (D-33): a member picker needs a directory, and everyone here is
+> someone you deliberately admitted through Access.

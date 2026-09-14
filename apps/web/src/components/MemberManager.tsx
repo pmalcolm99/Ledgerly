@@ -11,10 +11,19 @@ import { trpc } from "../lib/trpc";
  * for owners and full-access users".
  *
  * The whole section is hidden when the caller cannot manage members, and it
- * decides that by ASKING THE SERVER, not by inspecting a role client-side:
- * `users.list` is the same gate the mutations sit behind, so a FORBIDDEN from
- * it is exactly the population that would be refused anyway. Hiding a control
- * is a courtesy; the API refusing it is the security.
+ * decides that by ASKING THE SERVER, not by inspecting a role client-side.
+ *
+ * It used to ask by calling `users.list` and reading a FORBIDDEN as "no" --
+ * the directory and the member mutations sat behind the same gate, so the
+ * borrowed error code happened to be right. Phase 10a finding F-15 removed
+ * that gate, because any caller could satisfy it by creating a throwaway
+ * project, and the probe then said "yes" to everyone: a read-only member saw
+ * the permission dropdowns, the remove buttons and a picker listing every
+ * user on the instance, all of which the server refused on click.
+ *
+ * `members.canManage` composes the same `scopedProjects(user, "manage")` the
+ * mutations gate on, so the answer cannot drift from what they allow. Hiding
+ * a control is a courtesy; the API refusing it is the security.
  */
 
 const PERMISSION_LABELS = {
@@ -27,10 +36,17 @@ export function MemberManager({ projectId }: { projectId: string }) {
   const utils = trpc.useUtils();
   const members = trpc.members.list.useQuery({ projectId });
 
-  // The manage gate, asked of the server. `retry: false` so a legitimate
-  // FORBIDDEN is not retried as though it were a blip.
-  const directory = trpc.users.list.useQuery(undefined, { retry: false });
-  const canManage = directory.isSuccess;
+  // The manage gate, asked of the server as its own question.
+  const manage = trpc.members.canManage.useQuery({ projectId }, { retry: false });
+  const canManage = manage.data === true;
+
+  // The member picker's directory. Only fetched once the caller is known to
+  // be able to manage members -- there is no reason to pull every user on
+  // the instance into a read-only member's browser.
+  const directory = trpc.users.list.useQuery(undefined, {
+    retry: false,
+    enabled: canManage,
+  });
 
   const [selectedUser, setSelectedUser] = useState<string>("");
   const [permission, setPermission] = useState<"read" | "read_add" | "full">("read_add");

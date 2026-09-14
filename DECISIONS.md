@@ -250,6 +250,61 @@ documents the storage cost of `true` so the choice is informed rather than
 default-accepted. The `receipts.original_key` column exists either way, so
 enabling it later requires no migration — only new uploads gain originals.
 
+**AMENDED, Phase 10a (finding F-10).** "Original" now means the original
+**pixels**, not the original **bytes**.
+
+The retain path was a plain `rename` of `staging.bin`, chosen so that a
+retained original really was the untouched upload. What that actually stored
+was the phone's full EXIF block, GPS tag included — for a receipt photo,
+usually the user's home or workplace — and served it from
+`GET /api/images/<id>/original` to any project member holding `manage`. The
+flag's own documentation described its cost as "~10x storage" and said
+nothing about that, so an operator enabling it could not have known what they
+were turning on. The derivative renders were never affected: they go through
+sharp, which drops metadata unless `.withMetadata()` is called.
+
+Metadata is now removed before the file is stored
+(`packages/queue/src/pipeline/stripMetadata.ts`). For a JPEG, PNG or WebP
+whose container parses, the metadata blocks are excised and every other byte
+is copied through, so the image data is **bit-identical** to the upload —
+D-09's fidelity intent survives for the formats a phone actually produces.
+TIFF falls back to a same-format sharp round trip. HEIC usually cannot be
+re-encoded as HEIF (libvips ships HEIF decode far more often than encode), so
+it is stored as a quality-100 JPEG and `original_key` records `jpg`
+accordingly — the extension must never disagree with the contents, or the
+image route serves the wrong `Content-Type`.
+
+Two qualifications on "bit-identical", both of which the function reports in
+its `method` so no caller has to guess:
+
+- A **trailer is dropped.** A modern phone JPEG does not end at its first
+  EOI — Apple appends an MPF gain map and Samsung a motion-photo MP4, and an
+  appended JPEG carries its own complete APP1 with its own GPS. The first
+  implementation of this treated Start-of-Scan as "image data to EOF" and
+  copied the trailer verbatim, so it reported a successful lossless strip
+  while storing the coordinates. The scan is now walked to its terminating
+  marker and anything after it is discarded: the primary image stays
+  bit-identical, the trailer does not survive, and `method` says
+  `lossless-trailer-dropped` rather than `lossless`.
+- **A container that will not parse is re-encoded**, not stored as-is. The
+  walkers also refuse to return a structurally incomplete result — a JPEG
+  with no scan, a PNG with no IHDR or IDAT, a WebP with no image chunk —
+  because an early version happily emitted a 2-byte "JPEG" and `ingest.ts`
+  stored and served it.
+
+  The cost of that strictness, stated so it is not discovered later: a JPEG
+  missing its final EOI is now re-encoded rather than stored verbatim, and a
+  JPEG truncated mid-scan is not retained at all (the receipt, its renders
+  and its extraction are unaffected). Both files are malformed; sharp cannot
+  read the truncated one either. Accepting them would mean accepting whatever
+  metadata the walk could not account for, which is the thing this exists to
+  prevent.
+
+If neither path can handle a file, the original is **not retained** and the
+reason is logged. The receipt, its renders and its extraction are unaffected;
+storing an un-strippable file would reintroduce exactly the defect this
+closes.
+
 ---
 
 ## D-10 — PDF receipts: first page only in v1. **Settled.**
@@ -1011,13 +1066,39 @@ people who already share projects.
 **Consequence.** categories: `list`/`create` for any onboarded user;
 `update`/`delete` for the row's `created_by` or the instance owner; `is_system`
 rows for nobody, ever. `users.list` returns every onboarded user's id, name and
-email to any caller holding `manage` on at least one project — **an accepted
-disclosure, recorded here rather than left implicit.** It returns no `role`,
-`cf_access_sub`, `theme` or `last_seen_at`. Its gate reads the caller's role
-live from the database and also admits the instance owner outright, because
-`scopedProjects` is empty on an instance with no projects yet — a pure
-"do you manage anything" gate would hand the owner an empty picker at exactly
-the moment they are setting the instance up.
+email. It returns no `role`, `cf_access_sub`, `theme` or `last_seen_at`.
+
+**AMENDED, Phase 10a (finding F-15).** This entry used to say the directory
+went "to any caller holding `manage` on at least one project", and described a
+gate that read the caller's role live and also admitted the instance owner
+outright. That gate existed in code and did nothing.
+
+`scopedProjects(user, "manage")` qualifies a project's **owner** at every
+level, and `projects.create` is a plain `protectedProcedure` with no quota. So
+the qualifying condition was one call away for anybody:
+
+```
+users.list            -> FORBIDDEN
+projects.create({..}) -> ok, the caller now owns a project
+users.list            -> every onboarded user on the instance
+projects.delete({..}) -> tidy up
+```
+
+The permission test asserted the refusal and never made the second call, so it
+passed for the whole of Phases 7-9 while the control it named did not hold.
+
+No gate on this procedure can be meaningful while project creation is
+unrestricted, and restricting project creation to protect a member picker
+would be the tail wagging the dog. The gate has therefore been **removed**
+rather than left standing: a control anyone can satisfy is worse than none,
+because it stops the next reviewer looking. The disclosure is unchanged in
+practice — what changed is that this entry now describes it accurately.
+
+What actually bounds the disclosure is Cloudflare Access: every caller is an
+identity the instance owner deliberately admitted. If that ceases to be true,
+the fix is an owner-only directory with non-owner managers adding members by
+exact email address — which tells the caller nothing they did not already
+know.
 
 ---
 

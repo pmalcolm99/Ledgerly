@@ -28,7 +28,32 @@ import { canonicalizeMoneySign, formatMoney, parseMoney } from "@ledgerly/shared
  * that must hold REGARDLESS of what the schema says, because the whole point
  * of this file is to not trust the model's output shape. A missing field is
  * the same fact as a null one: no value. Both become null.
+ *
+ * ## Phase 10a finding F-24: the parameter type is now `unknown`
+ *
+ * `string | null | undefined` was a promise the compiler could not keep.
+ * These are fed straight from parsed JSON, so a model returning
+ * `"total": 12.34` as a NUMBER rather than a string type-checked fine and
+ * then threw `raw.replace is not a function` at runtime -- the exact
+ * failure the paragraph above describes, one rung further up. Worse, the
+ * scrub layer already anticipates numeric model output (`scrubNumber` in
+ * shared/scrub.ts passes a non-redacted number through unchanged), so it
+ * genuinely reaches here.
+ *
+ * Taking `unknown` and rejecting a non-string internally makes the guard
+ * unskippable at every call site, present and future, instead of relying on
+ * each caller to remember a `typeof` check. A non-string is not a parse
+ * failure to be flagged differently -- it is simply no usable value, which
+ * is what null already means here.
  */
+
+/**
+ * The one place a non-string model field becomes null. Every exported
+ * normalizer below funnels through this first.
+ */
+function asModelString(raw: unknown): string | null {
+  return typeof raw === "string" ? raw : null;
+}
 
 /** `numeric(12,2)` money field: strips stray `$`/`,`/whitespace a model
  * might emit despite instructions, translates accounting sign notation
@@ -41,8 +66,9 @@ import { canonicalizeMoneySign, formatMoney, parseMoney } from "@ledgerly/shared
  * reach it as `(12.34)`, and it shares `canonicalizeMoneySign` with the
  * hand-edit path in `api/src/inputs.ts` — a credit must mean the same thing
  * whether the model read it or a person typed it. */
-export function normalizeMoney(raw: string | null | undefined): string | null {
-  if (raw === null || raw === undefined) return null;
+export function normalizeMoney(input: unknown): string | null {
+  const raw = asModelString(input);
+  if (raw === null) return null;
   const cleaned = canonicalizeMoneySign(raw.replace(/[$,\s]/g, ""));
   try {
     return formatMoney(parseMoney(cleaned));
@@ -60,8 +86,9 @@ const QUANTITY_MAX_MAGNITUDE = 999_999_999.999;
 /** `numeric(12,3)` quantity: one more fractional digit than `parseMoney`
  * accepts (not a money column), so this is a plain decimal-string
  * validator with its own magnitude bound, not routed through money.ts. */
-export function normalizeQuantity(raw: string | null | undefined): string | null {
-  if (raw === null || raw === undefined) return null;
+export function normalizeQuantity(input: unknown): string | null {
+  const raw = asModelString(input);
+  if (raw === null) return null;
   const cleaned = raw.trim();
   if (!/^-?\d+(\.\d{1,3})?$/.test(cleaned)) return null;
   return Math.abs(Number(cleaned)) <= QUANTITY_MAX_MAGNITUDE ? cleaned : null;
@@ -74,8 +101,9 @@ export function normalizeQuantity(raw: string | null | undefined): string | null
  * at write time. Round-trips through `Date.UTC` and rejects anything that
  * doesn't come back exactly (catches Feb 30, month 13, etc.).
  */
-export function normalizeDate(raw: string | null | undefined): string | null {
-  if (raw === null || raw === undefined) return null;
+export function normalizeDate(input: unknown): string | null {
+  const raw = asModelString(input);
+  if (raw === null) return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
   if (!match) return null;
   const [, y, m, d] = match as unknown as [string, string, string, string];
@@ -93,8 +121,9 @@ export function normalizeDate(raw: string | null | undefined): string | null {
  * `\d{2}:\d{2}` regex but `receipts.transaction_time` is a real `time`
  * column that would reject it.
  */
-export function normalizeTime(raw: string | null | undefined): string | null {
-  if (raw === null || raw === undefined) return null;
+export function normalizeTime(input: unknown): string | null {
+  const raw = asModelString(input);
+  if (raw === null) return null;
   const match = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
   if (!match) return null;
   const [, h, mi, s] = match as unknown as [string, string, string, string | undefined];

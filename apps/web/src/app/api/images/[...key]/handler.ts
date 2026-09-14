@@ -10,38 +10,28 @@ import { scopedProjects } from "@ledgerly/api/scope";
 import { fileSizeBytes, receiptFilePath, receiptFileReadStream } from "@ledgerly/api/storage";
 
 /**
- * apps/web/src/app/api/images/[...key]/handler.ts — authenticated image
- * serving (task 5.8, D-23).
+ * `original` is the retained upload. Since Phase 10a (F-10) it is the
+ * original PIXELS, not the original BYTES: EXIF -- including the GPS tag a
+ * phone stamps onto a receipt photo -- is stripped before the file is
+ * stored. For JPEG, PNG and WebP the image data is bit-identical to the
+ * upload; a HEIC that cannot be re-encoded in its own format is stored as a
+ * quality-100 JPEG and `original_key` records `jpg` to match.
  *
- * Split out of route.ts because Next.js's route type-checker rejects any
- * named export from a route.ts file besides the recognized HTTP-method/
- * config exports -- `handleImageGet` can't live there once it needs to be
- * exported for tests to call directly.
+ * It is still the most sensitive of the three renditions -- full resolution,
+ * and the only one a person would think to exfiltrate -- so it keeps the
+ * tighter gate below (uploader or a `manage`-level member) and the
+ * no-store/attachment headers, rather than being served like a thumbnail.
  *
- * URL shape: `/api/images/<receiptId>/<kind>`, `kind` one of
- * display/thumb/original. Those segments are used ONLY to look up a
- * receipt row and pick which DB column to read -- the actual filesystem
- * path is always re-derived server-side from that row's own `projectId`/
- * `id` (storage.ts's `receiptFilePath`), never from the URL directly. This
- * is the concrete mechanism behind "path traversal is unrepresentable by
- * construction" (D-23) -- nothing here ever passes a URL segment to `fs`.
+ * Path traversal is impossible by construction (D-23), and that is worth
+ * stating because the route takes `[...key]`: the URL segments only ever
+ * select a receipt id and a rendition NAME, and the filesystem path is
+ * re-derived from the DB row's own `projectId`/`id` UUIDs. No segment
+ * reaches `path.join`.
  *
- * Failure shape, resolved deliberately with the user before writing this
- * file: **403 for no valid identity at all** (matches the app-wide D-24
- * byte-identical-403 convention -- this isn't a receipt-existence
- * question), **404 for every other failure** -- unonboarded, malformed
- * key, nonexistent receipt, wrong project, no membership, or a render
- * column that's still null (not yet processed / not retained). All of
- * those are indistinguishable on purpose: this endpoint must never be an
- * existence oracle for another user's receipts.
- *
- * `original` is additionally restricted to the uploader or a `manage`-level
- * member (full/project owner/instance owner) — review finding M-3.
- * `display`/`thumb` strip EXIF (GPS included) by construction
- * (render.ts), but `original` is D-09's deliberately "untouched bytes",
- * which means a retained original can carry the uploader's GPS
- * coordinates. `display`/`thumb` stay at the general `read` floor;
- * `original` does not.
+ * The logic lives here rather than in `route.ts` because Next.js's route
+ * type-checker rejects any named export from a `route.ts` besides the
+ * recognised HTTP-method/config exports, and tests need to call this
+ * directly.
  */
 
 const KIND_TO_COLUMN = {
@@ -87,7 +77,10 @@ export async function handleImageGet(
     throw error;
   }
 
-  // Deliberately 404, not the app-wide 403 -- see the module comment.
+  // Deliberately 404, not the app-wide 403. An un-onboarded caller is
+  // authenticated but has no business knowing whether a given receipt id
+  // exists, and 403 would tell them -- the same not-found-means-not-yours
+  // convention every project-scoped read in this app uses.
   if (!isOnboarded(user)) return notFound();
 
   if (key.length !== 2) return notFound();
@@ -158,9 +151,11 @@ export async function handleImageGet(
       // opened as a top-level navigation rather than via <img src>.
       "x-content-type-options": "nosniff",
       "content-security-policy": "default-src 'none'; sandbox",
-      // `original` is the untouched upload (D-09) -- less frequently
-      // viewed than display/thumb and more sensitive (M-3), so it's
-      // offered as a download rather than rendered inline.
+      // `original` is the retained upload -- full resolution, less
+      // frequently viewed than display/thumb and more sensitive (M-3), so
+      // it's offered as a download rather than rendered inline. Its EXIF,
+      // GPS included, is stripped before storage (F-10); it is the original
+      // PIXELS, not the original bytes.
       "content-disposition":
         kindParam === "original"
           ? `attachment; filename="receipt.${ext}"`

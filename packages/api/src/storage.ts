@@ -90,9 +90,16 @@ export async function deleteReceiptFile(filePath: string): Promise<void> {
   await fs.rm(filePath, { force: true });
 }
 
-/** Same-filesystem rename — used to promote a `staging.<ext>` upload into a
- * permanent `original.<ext>` when `RETAIN_ORIGINALS=true` (cheap, atomic on
- * a single volume; both live under the same receipt directory). */
+/**
+ * Same-filesystem rename.
+ *
+ * No longer used to promote a staged upload: since Phase 10a (F-10) the
+ * retain path in `queue/src/pipeline/ingest.ts` writes STRIPPED bytes with
+ * `writeReceiptFile` and then deletes staging, because the bytes being
+ * stored are no longer the bytes on disk. Kept as a general helper (and
+ * exercised by `storage.test.ts`); the atomicity note below still applies to
+ * any future caller.
+ */
 export async function renameReceiptFile(from: string, to: string): Promise<void> {
   await fs.rename(from, to);
 }

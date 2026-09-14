@@ -293,9 +293,18 @@ async function runPass(params: {
  * crashed on a null item, which the "drops a malformed item" test caught.
  */
 function pricedItems(input: RecordReceiptInput): { lineTotal: string | null }[] {
-  return (Array.isArray(input.items) ? input.items : [])
-    .filter((item): item is NonNullable<(typeof input.items)[number]> => item != null)
-    .map((item) => ({ lineTotal: item.line_total ?? null }));
+  return (
+    (Array.isArray(input.items) ? input.items : [])
+      .filter((item): item is NonNullable<(typeof input.items)[number]> => item != null)
+      // F-24, second pass. `?? null` passes a JSON number straight through to
+      // `parseMoney`, which calls `.trim()` on it and throws -- and
+      // `retryIfItemsDoNotReconcile` calls this OUTSIDE its own try block, in
+      // a function whose docblock promises it never throws. A numeric
+      // `line_total` is the single most likely non-string the model emits, and
+      // `mapItems` five lines away already guards it. `normalizeMoney` takes
+      // `unknown` and is the one place that decision should live.
+      .map((item) => ({ lineTotal: normalizeMoney(item.line_total) }))
+  );
 }
 
 /**
@@ -327,7 +336,7 @@ async function retryIfItemsDoNotReconcile(params: {
     params;
 
   const check = itemsReconcile({
-    subtotal: previous.input.subtotal ?? null,
+    subtotal: normalizeMoney(previous.input.subtotal),
     items: pricedItems(previous.input),
   });
   if (!check || check.reconciles) return previous;
@@ -357,7 +366,7 @@ async function retryIfItemsDoNotReconcile(params: {
     });
 
     const after = itemsReconcile({
-      subtotal: retry.input.subtotal ?? null,
+      subtotal: normalizeMoney(retry.input.subtotal),
       items: pricedItems(retry.input),
     });
     await logStep(db, params.verboseLogging ?? false, {
@@ -503,6 +512,16 @@ type MappedItem = {
  * TypeError mid-map and crash the whole job). Each surviving item's own
  * fields still go through the same total, never-throw normalizers as the
  * receipt-level fields. */
+/**
+ * A model-returned field that is written straight to a `text` column, with
+ * no normalizer in between. Anything that is not a string is no usable
+ * value (F-24) -- see normalize.ts's `asModelString`, which does the same
+ * job for the fields that DO have a normalizer.
+ */
+function asModelText(raw: unknown): string | null {
+  return typeof raw === "string" ? raw : null;
+}
+
 function mapItems(rawItems: unknown[], categoryIdBySlug: Map<string, string>): MappedItem[] {
   const mapped: MappedItem[] = [];
   for (const raw of rawItems) {
@@ -844,9 +863,16 @@ export async function processReceiptExtraction(
   // A field the model omitted and a field it returned as null are the same
   // fact. See normalize.ts's header for the failure this class of hole
   // actually caused.
-  const merchantName = input.merchant_name ?? null;
-  const merchantAddress = input.merchant_address ?? null;
-  const merchantPhone = input.merchant_phone ?? null;
+  // F-24: `?? null` passes a non-string through untouched -- an object or
+  // an array returned for one of these reaches a `text` column write and
+  // aborts the whole extraction transaction, which is the one thing
+  // ARCHITECTURE.md §6.3 says must never happen. `asModelText` is the same
+  // discipline `mapItems` already applies to item fields; these three were
+  // simply missed. A non-string is no value, so it becomes null and shows up
+  // in `missing_fields` like any other unread field.
+  const merchantName = asModelText(input.merchant_name);
+  const merchantAddress = asModelText(input.merchant_address);
+  const merchantPhone = asModelText(input.merchant_phone);
   let transactionDate = normalizeDate(input.transaction_date);
   const transactionTime = normalizeTime(input.transaction_time);
   const subtotal = normalizeMoney(input.subtotal);
@@ -869,7 +895,7 @@ export async function processReceiptExtraction(
   const taxIncluded = input.tax_included_in_prices === true;
   const salesTax = taxIncluded ? "0.00" : normalizeMoney(input.sales_tax);
   const cardLast4 = normalizeCardLast4(input.card_last4);
-  const paymentMethod = input.payment_method ?? null;
+  const paymentMethod = asModelText(input.payment_method);
   const confidence = normalizeConfidence(input.confidence);
 
   // `Array.isArray`, not a truthiness check: `items` is the one field the

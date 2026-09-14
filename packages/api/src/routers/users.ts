@@ -1,80 +1,60 @@
 import "server-only";
 
-import { asc, eq, exists, inArray, isNotNull, sql } from "drizzle-orm";
-import { TRPCError } from "@trpc/server";
-import { projects, users } from "@ledgerly/db/schema";
+import { asc, isNotNull, sql } from "drizzle-orm";
+import { users } from "@ledgerly/db/schema";
 import { displayNameOf } from "@ledgerly/shared/personName";
 
-import { scopedProjects } from "../scope";
 import { protectedProcedure, router } from "../trpc";
 
 /**
- * packages/api/src/routers/users.ts — the member picker's directory
+ * packages/api/src/routers/users.ts -- the member picker's directory
  * (Phase 7).
  *
  * `members.add` takes a raw `userId`, and until now nothing could turn a
  * person into one: there was no way to enumerate users at all, so member
  * management was unreachable from a UI.
  *
- * ACCEPTED TRADE, recorded as D-33: this enumerates every onboarded user on
- * the instance to any caller who can manage members of any project. On a
- * self-hosted family instance that is the intended trade — a picker is worth
- * more than directory secrecy among people who already share projects — but
- * it is a real disclosure and is written down rather than left implicit.
+ * ACCEPTED TRADE, recorded as D-33 and REVISED in Phase 10a: this
+ * enumerates every onboarded user on the instance -- id, display name and
+ * email -- to EVERY onboarded caller.
+ *
+ * It used to claim less than that. The procedure was gated on holding
+ * `manage` somewhere, and D-33 described the disclosure as limited to
+ * "any caller who can manage members of any project". Phase 10a finding
+ * F-15 showed that gate was inert: `scopedProjects(user, "manage")`
+ * qualifies a project's OWNER at every level (scope.ts, `ownerBranch`),
+ * `projects.create` is a plain `protectedProcedure` with no quota, and so
+ * any caller could satisfy the gate on demand --
+ *
+ *     users.list            -> FORBIDDEN
+ *     projects.create({..}) -> ok, caller is now an owner
+ *     users.list            -> every user on the instance
+ *     projects.delete({..}) -> tidy up
+ *
+ * -- and the test that was supposed to prove the control passed anyway,
+ * because it only ever tried the first call.
+ *
+ * No gate here can be meaningful while project creation is unrestricted,
+ * and restricting project creation to close a member-picker hole would be
+ * the tail wagging the dog. So the gate is gone rather than left standing
+ * as decoration: a control that anyone can satisfy is worse than no
+ * control, because it makes a reviewer stop looking.
+ *
+ * What actually bounds this is Cloudflare Access -- every caller is already
+ * an identity the instance owner deliberately let in. If that ever stops
+ * being true, the fix is to make the directory owner-only and have
+ * non-owner managers add members by exact email address, which discloses
+ * nothing to someone who does not already know who they are inviting.
  */
 
 export const usersRouter = router({
   /**
-   * Gated on holding `manage` (floor `full`) somewhere, OR being the instance
-   * owner — and both halves are read from the database in one statement, not
-   * from `ctx.user`.
-   *
-   * The role is re-read live because `ctx.user.role` came from the JWT at
-   * request entry and is stale if this caller was demoted since (the M-5
-   * discipline used throughout this package).
-   *
-   * The `role = 'owner'` disjunct is not redundant, and the reason is a real
-   * trap: `scopedProjects` short-circuits the instance owner to *every live
-   * project*, but on a fresh instance there are none, so that subquery is
-   * empty. A pure "do you manage anything" gate would therefore hand the
-   * instance owner an empty picker at exactly the moment they are setting the
-   * instance up and have no projects yet.
+   * Deliberately ungated beyond `protectedProcedure` (an authenticated,
+   * onboarded caller). See the module docblock: the gate that used to be
+   * here could be satisfied by any caller in two calls, so it described a
+   * restriction that did not exist.
    */
   list: protectedProcedure.query(async ({ ctx }) => {
-    // The live role first, in its own statement. `scopedProjects` SHORT-
-    // CIRCUITS on `user.role === "owner"`, so computing `hasManage` from
-    // `ctx.user` — whose role came from the JWT at request entry — would let a
-    // demoted instance owner keep the directory. The scope below is composed
-    // against a user object carrying the role as the database has it now.
-    const [liveRole] = await ctx.db
-      .select({ role: users.role })
-      .from(users)
-      .where(eq(users.id, ctx.user.id))
-      .limit(1);
-    if (!liveRole) throw new TRPCError({ code: "FORBIDDEN" });
-    const liveUser = { ...ctx.user, role: liveRole.role };
-
-    const [caller] = await ctx.db
-      .select({
-        role: users.role,
-        hasManage: exists(
-          ctx.db
-            .select({ one: sql`1` })
-            .from(projects)
-            .where(inArray(projects.id, scopedProjects(liveUser, "manage"))),
-        ),
-      })
-      .from(users)
-      .where(eq(users.id, ctx.user.id))
-      .limit(1);
-
-    if (!caller || (caller.role !== "owner" && caller.hasManage !== true)) {
-      // FORBIDDEN, not NOT_FOUND: there is no entity here whose existence
-      // could leak, and FORBIDDEN is in CLIENT_SAFE_CODES so the UI can tell
-      // "you may not" from "something broke".
-      throw new TRPCError({ code: "FORBIDDEN" });
-    }
-
     const rows = await ctx.db
       .select({
         id: users.id,

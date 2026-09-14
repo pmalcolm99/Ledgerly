@@ -6,6 +6,7 @@ import { getEnv } from "@ledgerly/config/env";
 import { getDb } from "@ledgerly/db/client";
 import { receipts } from "@ledgerly/db/schema";
 import type { Database } from "@ledgerly/db";
+import { deleteReceiptFile, receiptFilePath } from "@ledgerly/api/storage";
 
 import { getRedisConnection } from "./redis";
 import { RECEIPT_INGEST_QUEUE_NAME, getReceiptExtractQueue, getReceiptIngestQueue } from "./queue";
@@ -116,6 +117,29 @@ export async function startIngestWorker(redisUrl: string): Promise<Worker<Ingest
       if (job.attemptsMade < attempts) return; // still has retries left -- not final yet
 
       const reason = error instanceof IngestError ? error.reason : "INGEST_FAILED";
+
+      // Read the project in its own statement, BEFORE the status write.
+      //
+      // Taking it from the UPDATE's RETURNING made the cleanup below
+      // conditional on that write succeeding, so a connection blip left the
+      // raw upload on disk with nothing to come back for it. These are two
+      // independent obligations -- record the failure, and discard the
+      // staged bytes -- and they should fail independently.
+      let projectId: string | null = null;
+      try {
+        const [row] = await db
+          .select({ projectId: receipts.projectId })
+          .from(receipts)
+          .where(eq(receipts.id, job.data.receiptId))
+          .limit(1);
+        projectId = row?.projectId ?? null;
+      } catch (lookupError) {
+        console.error(
+          `[ledgerly] receipt ${job.data.receiptId}: could not read the project for staging cleanup:`,
+          lookupError,
+        );
+      }
+
       try {
         await db
           .update(receipts)
@@ -123,14 +147,50 @@ export async function startIngestWorker(redisUrl: string): Promise<Worker<Ingest
           .where(eq(receipts.id, job.data.receiptId));
       } catch (dbError) {
         // Never let a failure to record the failure escape as an
-        // unhandled rejection out of a BullMQ event handler. The staged
-        // upload is untouched regardless -- CLAUDE.md's "never silently
-        // drop an upload" holds even if this particular write fails; an
-        // operator reading logs can still recover the receipt by hand.
+        // unhandled rejection out of a BullMQ event handler. An operator
+        // reading logs can still recover the receipt by hand.
         console.error(
           `[ledgerly] failed to record ingest failure for receipt ${job.data.receiptId}:`,
           dbError,
         );
+      }
+
+      // Phase 10a finding F-8: discard the staged upload now that this
+      // receipt is terminally failed.
+      //
+      // `staging.bin` is the upload EXACTLY as it arrived -- full EXIF,
+      // including the GPS tag a phone writes, which for a receipt photo is
+      // usually the user's home or workplace. It is consumed on the success
+      // path (renamed to `original.<ext>` or deleted, ingest.ts), but the
+      // failure path used to leave it, and nothing ever came back for it:
+      // `reconcilePendingReceipts` below only re-enqueues rows still
+      // `pending`, so a row already marked `failed` is never revisited. The
+      // file was immortal, and `BACKUP_INCLUDE_IMAGES` would carry it into
+      // every archive thereafter.
+      //
+      // This does not weaken CLAUDE.md's "never silently drop an upload":
+      // the receipt row survives, `extraction_status='failed'` and
+      // `extraction_error` record exactly what happened, and the user sees
+      // it in the review queue. What is dropped is an unreadable blob that
+      // no code path could ever have used again -- and it is not silent,
+      // because the log line below says so.
+      if (projectId !== null) {
+        try {
+          await deleteReceiptFile(
+            receiptFilePath(env.UPLOADS_DIR, projectId, job.data.receiptId, "staging", "bin"),
+          );
+          console.warn(
+            `[ledgerly] receipt ${job.data.receiptId}: ingest failed (${reason}); staged upload discarded`,
+          );
+        } catch (unlinkError) {
+          // A leftover file is a disk-space and privacy leak, not a
+          // correctness bug -- the same reasoning ingest.ts uses for its
+          // own cleanup. Log it and move on.
+          console.error(
+            `[ledgerly] receipt ${job.data.receiptId}: failed to discard staged upload:`,
+            unlinkError,
+          );
+        }
       }
     })();
   });

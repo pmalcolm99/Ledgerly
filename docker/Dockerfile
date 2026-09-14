@@ -1,10 +1,21 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build: deps -> builder -> runner (ARCHITECTURE.md §8.1).
+#
+# Base images are pinned BY DIGEST, not by tag (Phase 10a, F-32). `node:22-
+# alpine` is a moving target: it is repointed on every upstream patch, so
+# two builds of the same commit could produce different images and there was
+# no way to state which bytes were running. The tag is kept alongside the
+# digest purely as a human-readable label -- the digest is what Docker
+# resolves.
+#
+# To update: `docker manifest inspect -v node:22-alpine` and take
+# `.Descriptor.digest` (the multi-arch index digest, so it stays correct on
+# both arm64 and amd64). Do that deliberately, as its own commit.
 
 # =============================================================================
 # deps — install once, cached by lockfile + workspace manifests
 # =============================================================================
-FROM node:22-alpine AS deps
+FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS deps
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@11.0.9 --activate
@@ -28,7 +39,7 @@ RUN pnpm install --frozen-lockfile
 # =============================================================================
 # builder — full source, Next.js standalone output + bundled migrate/seed
 # =============================================================================
-FROM node:22-alpine AS builder
+FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS builder
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@11.0.9 --activate
@@ -73,7 +84,7 @@ RUN pnpm exec esbuild packages/db/src/seed.cli.ts \
 # =============================================================================
 # runner — minimal production image
 # =============================================================================
-FROM node:22-alpine AS runner
+FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS runner
 WORKDIR /app
 
 ARG GIT_SHA=dev
@@ -103,6 +114,28 @@ RUN chmod 755 /entrypoint.sh \
     && chown -R node:node /app/uploads /app/backups
 
 EXPOSE 3000
+
+# F-31: declare the runtime user in the IMAGE, not only in the entrypoint.
+#
+# The privilege drop was correct for the CMD path -- entrypoint.sh execs
+# `su-exec node:node` -- but the image's declared user was still root, so
+# anything that did NOT traverse the entrypoint ran as uid 0: `docker
+# compose exec`, the compose healthcheck, `docker run --entrypoint ...`.
+# Only /app/uploads and /app/backups are chowned, so the rest of /app was
+# root-writable, including server.js and the migrator.
+#
+# entrypoint.sh still works unchanged: its `id -u` check now takes the
+# already-unprivileged branch and execs straight through (that branch exists
+# because Forkd took a production 502 calling su-exec unconditionally --
+# task 2.10 tests both paths).
+#
+# The runtime chown that branch skips is not needed for the named volumes in
+# docker-compose.yml: Docker seeds a fresh named volume with the ownership
+# of the image directory it is mounted over, and the chown above sets that
+# to node:node at build time. An operator using a BIND mount instead must
+# chown the host directory to uid/gid 1000 themselves -- DEPLOYMENT.md says
+# so.
+USER node
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sh", "-c", "node migrate.cjs && node seed.cjs && node apps/web/server.js"]

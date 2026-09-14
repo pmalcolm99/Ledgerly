@@ -133,6 +133,39 @@ export const membersRouter = router({
    * finding M-6 — there was previously no way to read a project's
    * membership through the API at all).
    */
+  /**
+   * Can THIS caller manage THIS project's members?
+   *
+   * Exists because `MemberManager` used to answer that question by calling
+   * `users.list` and treating a FORBIDDEN as "no" -- the directory and the
+   * member mutations happened to sit behind the same gate, so it worked.
+   * Phase 10a finding F-15 removed that gate (it was satisfiable by any
+   * caller in two calls, so it was never a real control), which left the
+   * probe returning success for everyone and every read-only member looking
+   * at member-management controls that would be refused on click.
+   *
+   * A capability probe should ask its own question rather than borrow
+   * another endpoint's error code. This composes the same
+   * `scopedProjects(user, "manage")` the mutations gate on, so the answer
+   * cannot drift from what they will actually allow.
+   *
+   * Still only a courtesy: hiding a control is UI, the mutations refusing it
+   * is the security.
+   */
+  canManage: protectedProcedure.input(listInput).query(async ({ ctx, input }) => {
+    const [project] = await ctx.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.id, input.projectId),
+          inArray(projects.id, scopedProjects(ctx.user, "manage")),
+        ),
+      )
+      .limit(1);
+    return project !== undefined;
+  }),
+
   list: protectedProcedure.input(listInput).query(async ({ ctx, input }) => {
     const [project] = await ctx.db
       .select({ id: projects.id })

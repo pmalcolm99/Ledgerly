@@ -282,6 +282,16 @@ describe("runBackup", () => {
     expect(sidecar).toContain(path.basename(result.archivePath));
     expect(result.archiveSha256).toBe(await sha256Of(result.archivePath));
 
+    // Phase 10a finding F-33. `manifest.json` was written 0600 while the
+    // archive containing it inherited the process umask -- usually 0644.
+    // The archive is a full pg_dump: every user, every email, every receipt,
+    // every card_last4. Masked to the permission bits so a platform's
+    // higher file-type bits do not make this brittle.
+    const archiveMode = (await fs.stat(result.archivePath)).mode & 0o777;
+    expect(archiveMode).toBe(0o600);
+    const sidecarMode = (await fs.stat(`${result.archivePath}.sha256`)).mode & 0o777;
+    expect(sidecarMode).toBe(0o600);
+
     // The manifest describes what is in the archive.
     const manifest = result.manifest;
     expect(manifest.manifestVersion).toBe(1);

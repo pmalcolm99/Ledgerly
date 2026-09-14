@@ -555,6 +555,30 @@ export async function runBackup(deps: BackupDeps, data: BackupJobData): Promise<
     }
     await fs.rename(partPath, archivePath);
 
+    // Phase 10a finding F-33: 0600 on the archive itself.
+    //
+    // `manifest.json` was deliberately written 0600 further up, but the
+    // .tgz that CONTAINS it was left at whatever the process umask gave --
+    // typically 0644. The archive is the whole instance in cleartext: a
+    // full pg_dump with every user, every email address, every receipt and
+    // every card_last4, plus every receipt image when
+    // BACKUP_INCLUDE_IMAGES is on. Protecting the manifest and not the
+    // archive around it protected nothing.
+    //
+    // chmod after the rename, not before: the rename is what makes the file
+    // visible under its final name, and a mode set on `.part` does survive
+    // it, but doing it here keeps the two facts in one place.
+    //
+    // This is file permissions, not encryption. An archive copied off the
+    // host -- downloaded through the admin UI, synced to cloud storage --
+    // carries no protection with it. Encrypting at rest needs a key that is
+    // deliberately NOT MASTER_KEY (a backup you cannot decrypt without the
+    // key that was lost with the machine is not a backup) and a restore
+    // path that can find it; that is an operator decision, and DEPLOYMENT.md
+    // states the current position plainly rather than implying more safety
+    // than exists.
+    await fs.chmod(archivePath, 0o600);
+
     const sizeBytes = await fileBytes(archivePath);
     const archiveSha256 = await sha256File(archivePath);
     // A sidecar rather than a line in the manifest, because the manifest is
@@ -565,6 +589,10 @@ export async function runBackup(deps: BackupDeps, data: BackupJobData): Promise<
     await fs.writeFile(
       `${archivePath}.sha256`,
       `${archiveSha256}  ${path.basename(archivePath)}\n`,
+      // Same reasoning as the archive's own mode above (F-33). The sidecar
+      // leaks far less, but there is no reason for it to be the one
+      // world-readable file in the directory.
+      { mode: 0o600 },
     );
 
     await deps.db

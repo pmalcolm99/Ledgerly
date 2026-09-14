@@ -8,11 +8,11 @@ import {
   deleteReceiptFile,
   readReceiptFile,
   receiptFilePath,
-  renameReceiptFile,
   writeReceiptFile,
 } from "@ledgerly/api/storage";
 
 import { rasterizePdfFirstPage, renderDisplayAndThumb } from "./render";
+import { stripMetadataForOriginal } from "./stripMetadata";
 
 /**
  * packages/queue/src/pipeline/ingest.ts — the `receipt-ingest` per-job
@@ -154,7 +154,31 @@ export async function processReceiptIngest(
     throw new IngestError("RENDER_WRITE_FAILED");
   }
 
-  const originalExt = retainOriginals ? extensionForType(sniffedType) : null;
+  // F-10: strip EXIF/GPS from the retained original BEFORE the DB write,
+  // because stripping can legitimately change the format (a HEIC that has
+  // to be re-encoded comes back as JPEG) and `originalKey` must record the
+  // extension the file will actually have.
+  //
+  // This used to be a bare `rename` of `staging.bin` further down -- the
+  // upload's untouched bytes, EXIF and all. D-09 wanted fidelity; what it
+  // got was the user's home GPS coordinates stored and servable. The
+  // lossless paths keep the pixel data bit-identical, so D-09's intent
+  // survives for every format a phone actually produces.
+  let strippedOriginal: Awaited<ReturnType<typeof stripMetadataForOriginal>> | null = null;
+  if (retainOriginals) {
+    strippedOriginal = await stripMetadataForOriginal(stagedBytes, sniffedType);
+    if (strippedOriginal.method === "passthrough" && sniffedType !== "pdf") {
+      // Neither the container walk nor sharp could handle it. Storing it
+      // would mean storing unstripped metadata, which is the defect this
+      // exists to close, so the original is dropped -- the receipt, its
+      // renders and its extraction are all unaffected.
+      console.error(
+        `[ledgerly] receipt ${receiptId}: could not strip metadata from a ${sniffedType} original; not retaining it`,
+      );
+      strippedOriginal = null;
+    }
+  }
+  const originalExt = strippedOriginal ? extensionForType(strippedOriginal.type) : null;
 
   // The DB write happens BEFORE staging is touched (H-3) -- `staging.bin`
   // stays valid for a retry until the row itself proves the run finished.
@@ -190,14 +214,15 @@ export async function processReceiptIngest(
   // already succeeded and is recorded as such; a lingering `staging.bin`
   // is a disk-space leak, not a lost receipt.
   try {
-    if (retainOriginals && originalExt) {
-      await renameReceiptFile(
-        stagingPath,
+    if (strippedOriginal && originalExt) {
+      // Write the STRIPPED bytes, then discard staging. Not a rename any
+      // more: the bytes being stored are no longer the bytes on disk.
+      await writeReceiptFile(
         receiptFilePath(uploadsDir, projectId, receiptId, "original", originalExt),
+        Buffer.from(strippedOriginal.bytes),
       );
-    } else {
-      await deleteReceiptFile(stagingPath);
     }
+    await deleteReceiptFile(stagingPath);
   } catch (error) {
     console.error(`[ledgerly] receipt ${receiptId}: failed to consume staged upload:`, error);
   }
