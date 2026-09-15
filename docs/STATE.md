@@ -276,6 +276,89 @@ original code.** The pattern across all of them is the same: a change that
 closes the finding it was aimed at, while carrying an assumption that was only
 ever true of the case in front of the author.
 
+## Phase 10b follow-up — the digest pin was amd64-only, and nothing failed
+
+Found by the **BuildKit linter in Docker Desktop**, not by CI, the test suite,
+or either fix review:
+
+```
+InvalidBaseImagePlatform: Base image node:22-alpine@sha256:76789712...
+  was pulled with platform "linux/amd64", expected "linux/arm64"
+```
+
+Three times, once per stage. F-32's digests came from
+`docker manifest inspect -v … | [0].Descriptor.digest` — which is the **first
+platform's manifest**, not the multi-arch index. `docker manifest inspect -v`
+returns an ARRAY of per-platform manifests; there is no index digest in
+element zero. The pinned value was
+`application/vnd.oci.image.manifest.v1+json`, single-platform, where it should
+have been `…image.index.v1+json`.
+
+**Consequence: every build on this Apple Silicon host ran the entire stack
+under QEMU emulation.** Silently. `apk` was fetching
+`x86_64/APKINDEX.tar.gz`, and `next build` took 55 s instead of 18 s. A full
+`--no-cache` docker build exited 0, the tests passed, and both fix reviews
+went by — the second one explicitly noted it _could not verify_ the digests
+were index digests, and it went in anyway.
+
+Corrected via `docker buildx imagetools inspect --format
+'{{json .Manifest.Digest}}'`, with the media type checked before pinning. The
+image now reports `linux/arm64`, the container runs as `uid=1000(node)` with
+both volumes writable, health returns 200 and an unauthenticated request
+returns 403. `docker build --check` reports **no warnings** where it
+previously reported four.
+
+Also cleared, in the same pass: `SecretsUsedInArgOrEnv` on the builder's
+`MASTER_KEY` and `ANTHROPIC_API_KEY` placeholders. They were never leaked —
+throwaway values in a stage that is discarded and never pushed — but an `ENV`
+persists in that stage's metadata for no reason, so they are passed inline on
+the build command instead, which is both honest and quiet.
+
+`DEPLOYMENT.md §2.5` now carries the correct command, an explicit warning
+against the obvious-but-wrong one, and the two sanity checks
+(`docker build --check`, and inspecting `.Os/.Architecture`).
+
+### And the local build trap
+
+`pnpm build` failed outright with `NODE_ENV=development` — which is what
+sourcing the repo's own `.env` gives you:
+
+```
+Error: <Html> should not be imported outside of pages/_document
+Error occurred prerendering page "/404" … exiting the build
+```
+
+Never reached CI (which leaves `NODE_ENV` unset) or Docker (whose builder
+sets `production`), so nothing shipped from it — but the documented local
+command failed against the documented local config. The root `build` script
+now pins `NODE_ENV=production`, which is what `next build` means regardless.
+
+Separately, `NODE_ENV` was **not in turbo's build hash** — `envMode: "loose"`
+passes the environment through without keying on it. Verified:
+`NODE_ENV=production` and NODE_ENV unset both hashed to `2c6b4b8a363bb1e4`,
+and the second was a cache hit. Benign only because the development build
+_fails_ rather than producing a different valid artifact, which is a
+coincidence and not a cache-correctness argument. `"env": ["NODE_ENV"]` added
+to the build task; the hash is now `60d59d6808472ad2`.
+
+### The two build warnings that remain, and why they stay
+
+- **`jose` / Edge Runtime** (×2, every build). `cloudflareAccess.ts` barrel-
+  imports `jose`, which drags JWE decryption and its `CompressionStream` use
+  into the middleware's module graph. We never call JWE — only `jwtVerify`
+  and `createRemoteJWKSet`. Verified in the **emitted** Edge bundle
+  (`.next/server/src/middleware.js`, identified by its `cdn-cgi/access/certs`
+  string): `CompressionStream=0`, `DecompressionStream=0`, `deflate=0`.
+  Webpack warns on the module graph and then tree-shakes it out. jose 6 does
+  expose `./jwt/*` and `./jwks/*` subpaths, so this _could_ be silenced — but
+  that edits the JWT verification path, and a cosmetic warning is not worth
+  touching the most security-critical file in the repo.
+- **`The Next.js plugin was not detected in your ESLint configuration`.**
+  False. `eslint --print-config` resolves **22 `@next/next` rules, all
+  enabled**, and a deliberate `<img>` violation is reported as
+  `@next/next/no-img-element`. Next's detector does not understand a flat
+  config where the plugin is registered under a `files:` scope. The rules run.
+
 ## Phase 10b — documentation
 
 `SETUP.md` rewritten for someone who has never used Cloudflare Tunnel, Access

@@ -13,6 +13,22 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
+      // NODE_ENV in the task hash, deliberately.
+      //
+      // "loose" above passes the shell's environment through, but it does
+      // NOT put it in the cache key — so a build produced under one NODE_ENV
+      // could be replayed under another. Verified: `NODE_ENV=production` and
+      // NODE_ENV unset both hashed to 2c6b4b8a363bb1e4, and the second run
+      // was a cache hit.
+      //
+      // That is benign today only because `next build` under
+      // NODE_ENV=development FAILS outright (it tries to prerender /404 and
+      // /500 from the pages-router error component and dies on
+      // `<Html> should not be imported outside of pages/_document`) rather
+      // than producing a different-but-valid artifact. Relying on a
+      // coincidence like that is not a cache-correctness argument, so the
+      // var goes in the key.
+      "env": ["NODE_ENV"],
       "outputs": [".next/**", "!.next/cache/**", "dist/**"]
     },
     "dev": {

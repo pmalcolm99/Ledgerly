@@ -8,14 +8,28 @@
 # digest purely as a human-readable label -- the digest is what Docker
 # resolves.
 #
-# To update: `docker manifest inspect -v node:22-alpine` and take
-# `.Descriptor.digest` (the multi-arch index digest, so it stays correct on
-# both arm64 and amd64). Do that deliberately, as its own commit.
+# To update, use buildx and take the INDEX digest:
+#
+#   docker buildx imagetools inspect node:22-alpine \
+#     --format '{{json .Manifest.Digest}}'
+#
+# Verify it is an index before pinning it -- `.Manifest.MediaType` must be
+# `application/vnd.oci.image.index.v1+json`, NOT `...image.manifest.v1+json`.
+#
+# NOT `docker manifest inspect -v`. That returns an ARRAY of per-platform
+# manifests, and taking `[0].Descriptor.digest` from it yields the FIRST
+# PLATFORM's manifest (amd64), not the index. Pinning that forces amd64 on
+# every host: BuildKit reports `InvalidBaseImagePlatform`, an arm64 machine
+# silently builds and runs the whole stack under emulation, and the apk
+# output gives it away by fetching `x86_64/APKINDEX.tar.gz`. That is exactly
+# what the first version of this pin did.
+#
+# Do the update deliberately, as its own commit.
 
 # =============================================================================
 # deps — install once, cached by lockfile + workspace manifests
 # =============================================================================
-FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS deps
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS deps
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@11.0.9 --activate
@@ -39,7 +53,7 @@ RUN pnpm install --frozen-lockfile
 # =============================================================================
 # builder — full source, Next.js standalone output + bundled migrate/seed
 # =============================================================================
-FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS builder
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS builder
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@11.0.9 --activate
@@ -60,13 +74,28 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # notes. These are never the values the running container uses; real values
 # come from docker-compose's env_file / environment at runtime.
 ENV NODE_ENV=production
-ENV DATABASE_URL="postgres://build:build@localhost:5432/build_placeholder"
-ENV MASTER_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-ENV ANTHROPIC_API_KEY="build-placeholder"
-ENV CF_ACCESS_AUD="0000000000000000000000000000000000000000000000000000000000000000"
-ENV CF_ACCESS_TEAM_DOMAIN="build-placeholder.cloudflareaccess.com"
 
-RUN pnpm exec turbo run build --filter=@ledgerly/web
+# Passed INLINE on the build command rather than declared as ENV.
+#
+# BuildKit's linter flags `ENV MASTER_KEY=...` and `ENV ANTHROPIC_API_KEY=...`
+# as SecretsUsedInArgOrEnv, and it is right to: an ENV persists in that
+# stage's image metadata, so anyone with the image can read it back. Nothing
+# was ever actually leaked here -- these are throwaway placeholders, the
+# builder stage is discarded and never pushed, and the real values come from
+# docker-compose's env_file at runtime -- but there is no reason for them to
+# sit in metadata at all when the command that needs them can carry them for
+# exactly as long as it runs.
+#
+# They exist because `packages/config/src/env.ts` parses and validates the
+# environment at startup (D-14), and `next build` triggers that parse while
+# collecting page data. The values are structurally valid and deliberately
+# useless.
+RUN DATABASE_URL="postgres://build:build@localhost:5432/build_placeholder" \
+    MASTER_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" \
+    ANTHROPIC_API_KEY="build-placeholder" \
+    CF_ACCESS_AUD="0000000000000000000000000000000000000000000000000000000000000000" \
+    CF_ACCESS_TEAM_DOMAIN="build-placeholder.cloudflareaccess.com" \
+    pnpm exec turbo run build --filter=@ledgerly/web
 
 # Bundle the migration and seed scripts to self-contained CommonJS —
 # drizzle-orm and pg inlined, so the runner stage needs no dev dependencies
@@ -84,7 +113,7 @@ RUN pnpm exec esbuild packages/db/src/seed.cli.ts \
 # =============================================================================
 # runner — minimal production image
 # =============================================================================
-FROM node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS runner
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS runner
 WORKDIR /app
 
 ARG GIT_SHA=dev

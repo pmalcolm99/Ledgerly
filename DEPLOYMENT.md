@@ -160,12 +160,34 @@ Base images are pinned by digest in `docker/Dockerfile` and
 cannot change your image underneath you. Updating them is a deliberate act:
 
 ```bash
-docker manifest inspect -v node:22-alpine | grep -m1 '"digest"'
+docker buildx imagetools inspect node:22-alpine \
+  --format '{{json .Manifest.Digest}}'
+
+# Confirm it is an INDEX before pinning it:
+docker buildx imagetools inspect node:22-alpine \
+  --format '{{json .Manifest.MediaType}}'
+# must print application/vnd.oci.image.index.v1+json
 ```
 
-Take the **`.Descriptor.digest`** — the multi-arch index digest, so it stays
-correct on both arm64 and amd64 — update the `FROM` line, and commit it on its
-own. Do the same for `postgres:17-alpine` and `redis:8-alpine`.
+Update the `FROM` line and commit it on its own. Do the same for
+`postgres:17-alpine` and `redis:8-alpine` in `docker-compose.yml`.
+
+> **Use `buildx imagetools`, not `docker manifest inspect -v`.** The latter
+> returns an **array of per-platform manifests**, and taking
+> `[0].Descriptor.digest` from it gives you the **first platform's** manifest
+> digest — amd64 — not the index. Pinning that forces amd64 everywhere:
+> BuildKit reports `InvalidBaseImagePlatform`, and an arm64 machine builds
+> and runs the entire stack under QEMU emulation without failing. The tell is
+> in the build output — `apk` fetching `x86_64/APKINDEX.tar.gz` on an Apple
+> Silicon host, and a `next build` that takes three times as long as it
+> should. The first version of this pin did exactly that.
+>
+> Sanity check after any digest change:
+>
+> ```bash
+> docker build --check -f docker/Dockerfile .        # expect: no warnings
+> docker image inspect <image> --format '{{.Os}}/{{.Architecture}}'
+> ```
 
 Pin the app image too if you want a fully reproducible stack; `IMAGE_LOCATION`
 accepts a digest as readily as a tag.
