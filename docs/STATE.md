@@ -359,6 +359,71 @@ to the build task; the hash is now `60d59d6808472ad2`.
   `@next/next/no-img-element`. Next's detector does not understand a flat
   config where the plugin is registered under a `files:` scope. The rules run.
 
+## Phase 10b follow-up — CI caught a leak, and the scanner had a hole
+
+The first push of the platform fix **failed CI on the gitleaks job**, which
+blocked the image publish. The finding:
+
+```
+RuleID:  generic-api-key   Entropy: 3.546594
+File:    apps/web/src/app/api/receipts/upload/route.test.ts:372
+Finding: "cf-access-jwt-assertion": "sub-owner-f7a"
+```
+
+A fake Access subject in a test I added for F-7. The stub resolver maps the
+whole header value to a test user, so it is an identifier, never a JWT. It
+tripped `generic-api-key`'s entropy heuristic at 3.55 where the
+identical-in-kind `sub-owner11` on line 319 passed at just under the 3.5
+threshold — a distinction with no meaning, since both are fake.
+
+Renamed to match the file's existing convention (`sub-owner13`,
+`sub-owner14`) and routed through the `authHeaders` helper the rest of the
+file already uses, so the literal header appears once rather than three
+times. The history entry at 38eaab6 is immutable, so a `.gitleaks.toml`
+allowlists that one value shape — `regexTarget = "line"`, because an
+allowlist regex matches the **captured secret** by default and a line-shaped
+pattern would have silently matched nothing.
+
+Deliberately NOT scoped by path: `paths` and `regexes` in one allowlist are
+OR-ed, so adding `paths = ['.*\.test\.ts$']` would have allowlisted every
+finding in every test file, including a real key pasted into one.
+
+### The hole the exercise exposed
+
+Testing the config meant planting real-shaped credentials, and that turned up
+something worse than the false positive:
+
+**Neither gitleaks 8.24's default ruleset nor secretlint's preset-recommend
+detects an Anthropic API key.** Both were given a realistically-shaped
+`sk-ant-api03-` + 95 chars + `AA` and reported nothing. So the single most
+sensitive credential in this repo — the one CLAUDE.md has a hard rule about —
+was the one credential the pre-commit hook and the CI gate would both have
+waved straight through.
+
+`.gitleaks.toml` now carries an `anthropic-api-key` rule. Its 80-character
+floor is deliberate: it matches a real key while leaving the repo's
+short, obviously-fake fixtures alone (`sk-ant-api03-aaaa…`,
+`sk-ant-do-not-leak-me-…`), which exist so the scrub and key-handling tests
+have something to assert on. Flagging those would train everyone to ignore
+the rule.
+
+### And a guard on the guard
+
+`scripts/test-gitleaks-config.sh` plants credentials and asserts they are
+caught. It exists because a gitleaks config with no rules of its own
+**replaces** the default ruleset unless it carries `[extend] useDefault =
+true` — drop that one line and every scan reports "no leaks found" while
+checking nothing. The script asserts two NAMED rules fire (`github-pat`,
+`anthropic-api-key`) rather than counting findings, and asserts the benign
+fixture is still allowlisted.
+
+Writing it found two traps worth recording. `AKIAIOSFODNN7EXAMPLE` is AWS's
+canonical documentation key and sits in gitleaks' own stopword list, so it is
+correctly ignored — using it as a planted secret made the script fail against
+a config that was fine. And a stub-length `sk-ant-` value passes the rule's
+length floor test while proving nothing, so the planted key is full length on
+purpose.
+
 ## Phase 10b — documentation
 
 `SETUP.md` rewritten for someone who has never used Cloudflare Tunnel, Access

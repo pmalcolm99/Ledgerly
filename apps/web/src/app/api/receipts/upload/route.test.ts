@@ -342,7 +342,7 @@ describe("POST /api/receipts/upload -- request-size guards (H-1)", () => {
    */
   it("bounds a body that declares no Content-Length at all", async () => {
     const { project } = await createTestProjectWithMembers(db, {
-      ownerKey: "owner-f7a",
+      ownerKey: "owner13",
       members: [],
     });
 
@@ -368,10 +368,11 @@ describe("POST /api/receipts/upload -- request-size guards (H-1)", () => {
 
     const request = new Request("http://localhost/api/receipts/upload", {
       method: "POST",
-      headers: new Headers({
-        "cf-access-jwt-assertion": "sub-owner-f7a",
-        "content-type": `multipart/form-data; boundary=${boundary}`,
-      }),
+      headers: (() => {
+        const h = authHeaders("sub-owner13");
+        h.set("content-type", `multipart/form-data; boundary=${boundary}`);
+        return h;
+      })(),
       body: stream,
       duplex: "half",
     } as RequestInit & { duplex: "half" });
@@ -392,7 +393,7 @@ describe("POST /api/receipts/upload -- request-size guards (H-1)", () => {
 
   it("still accepts a normal chunked body that is within the ceiling", async () => {
     const { project } = await createTestProjectWithMembers(db, {
-      ownerKey: "owner-f7b",
+      ownerKey: "owner14",
       members: [],
     });
     const formData = new FormData();
@@ -403,10 +404,11 @@ describe("POST /api/receipts/upload -- request-size guards (H-1)", () => {
     const framed = new Request("http://localhost/x", { method: "POST", body: formData });
     const request = new Request("http://localhost/api/receipts/upload", {
       method: "POST",
-      headers: new Headers({
-        "cf-access-jwt-assertion": "sub-owner-f7b",
-        "content-type": framed.headers.get("content-type") ?? "",
-      }),
+      headers: (() => {
+        const h = authHeaders("sub-owner14");
+        h.set("content-type", framed.headers.get("content-type") ?? "");
+        return h;
+      })(),
       body: framed.body,
       duplex: "half",
     } as RequestInit & { duplex: "half" });

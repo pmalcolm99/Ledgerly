@@ -1,0 +1,63 @@
+# gitleaks configuration.
+#
+# CRITICAL: `useDefault = true` is load-bearing. Without an [extend] block a
+# config file REPLACES the default ruleset rather than adding to it, so a
+# file like this one -- which defines no rules of its own -- would silently
+# disable every secret rule while still reporting a clean scan. That is the
+# precise failure mode Phase 10's review kept turning up: a control that
+# reports success while doing nothing. `scripts/test-gitleaks-config.sh`
+# plants a fake AWS key and asserts it is still caught.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-benign test fixture: the fake Cloudflare Access subject."
+
+# The upload and auth tests identify their actor with a fake Access subject.
+# The stub resolver maps the whole header value to a test user, so it is a
+# plain identifier like "sub-owner11" -- never a JWT. A real Access assertion
+# is a three-part `eyJ...` token and cannot match the shape below.
+#
+# gitleaks' `generic-api-key` rule is an entropy heuristic, and it fired on
+# `sub-owner-f7a` (entropy 3.55) while the identical-in-kind `sub-owner11`
+# passed, being fractionally below the 3.5 threshold. The distinction is
+# meaningless -- both are fake -- so the SHAPE is allowlisted rather than
+# left to whichever arbitrary string the next test author happens to pick.
+#
+# Deliberately NOT scoped by path. `paths` and `regexes` in one allowlist are
+# OR-ed, so adding `paths = ['.*\.test\.ts$']` would have allowlisted every
+# finding in every test file, including a real `sk-ant-` key pasted into one.
+# This regex alone is tighter: it matches one header with one value shape, and
+# every genuinely secret-shaped string is still matched by its own rule.
+# `regexTarget = "line"` because an allowlist regex is matched against the
+# CAPTURED SECRET by default, not the source line -- so a line-shaped pattern
+# silently matches nothing, and the allowlist looks present while the finding
+# still fires. Matching the line is what lets the header name carry the
+# specificity.
+regexTarget = "line"
+regexes = ['''"cf-access-jwt-assertion":\s*"sub-[A-Za-z0-9-]{1,32}"''']
+
+# ---------------------------------------------------------------------------
+# Custom rules
+# ---------------------------------------------------------------------------
+
+# Anthropic API key.
+#
+# Neither gitleaks 8.24's default ruleset nor secretlint's
+# preset-recommend detects these -- both were tested against a
+# realistically-shaped key and reported nothing. That made the single most
+# sensitive credential in this repo (CLAUDE.md: "The Anthropic API key is
+# server-side only") the one credential the pre-commit hook and the CI gate
+# would both have waved through.
+#
+# The length floor of 80 is deliberate: it matches a real key
+# (`sk-ant-api03-` + 95 chars + `AA`) while leaving the repo's short,
+# obviously-fake test fixtures alone -- `sk-ant-api03-aaaa...` (32 chars),
+# `sk-ant-do-not-leak-me-0123456789`, `sk-ant-env-key-000000000000`. Those
+# exist precisely so the scrub and key-handling tests have something to
+# assert on, and flagging them would train everyone to ignore this rule.
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-(?:api|admin|sid)[0-9]{2}-[A-Za-z0-9_\-]{80,140}'''
+keywords = ["sk-ant-"]
